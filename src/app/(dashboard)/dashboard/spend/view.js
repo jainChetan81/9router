@@ -4,7 +4,9 @@
 export const SHORT = {
   "claude-opus-5-5": "opus-5-5", "claude-haiku-5-5": "haiku-5-5", "claude-sonnet-5-5": "sonnet-5-5", "claude-fable-5-1": "fable-5-1",
   "gpt-6-luna": "luna", "gpt-6.1-terra": "terra", "gpt-6.1-sol": "sol", "gpt-6-astra": "astra",
-  "muse-spark-1.3-contributor": "muse-spark", "z-ai/glm-5.3-flash": "or·glm-5.3-flash", "deepseek/deepseek-v4.1-flash": "or·deepseek-v4.1-flash",
+  "muse-spark-1.3-contributor": "muse-spark", "z-ai/glm-5.3-flash": "or·glm-flash", "deepseek/deepseek-v4.1-flash": "or·deepseek-flash",
+  "gemini-3.8-flash": "gemini-flash", "gemini-3.8-flash-high": "gemini-flash-hi", "gemini-3.8-flash-medium": "gemini-flash-med", "gemini-3.8-flash-low": "gemini-flash-lo",
+  "glm-5.3-flash": "glm-flash", "qwen3.8-flash": "qwen-flash", "kimi-k3.1-pro": "kimi-k3.1", "deepseek-v4.1-flash": "deepseek-flash",
 };
 const MC = {
   "claude-opus-5-5": "#7273ee", "claude-haiku-5-5": "#a9aaf7", "gpt-6-luna": "#22a892", "gpt-6.1-terra": "#4fbfa9", "gpt-6.1-sol": "#7fd1c1",
@@ -37,26 +39,6 @@ const seg = (on) => ({ border: 0, height: 26, padding: "0 10px", borderRadius: 7
 const durF = (ms) => { const m = Math.max(1, Math.round(ms / 60000)); return m < 60 ? m + " min" : Math.floor(m / 60) + " h " + (m % 60) + " min"; };
 const realF = (v) => (v >= 0.005 ? usd(v, 1) : v > 0 ? "<$0.01" : "—");
 const short = (m) => SHORT[m] || m;
-const resetIn = (iso) => {
-  const ms = Date.parse(iso || "") - Date.now();
-  if (!Number.isFinite(ms) || ms <= 0) return "—";
-  const m = Math.round(ms / 60000), d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60);
-  return d ? `${d}d ${h}h` : h ? `${h}h ${m % 60}m` : `${m}m`;
-};
-
-// Worst (highest used %) capped window per provider, from /api/usage/{id}.
-function worstWindow(entries = []) {
-  let best = null;
-  for (const e of entries) {
-    for (const [name, q] of Object.entries(e.quotas || {})) {
-      if (!q || q.unlimited || q.isCreditBalance || !(q.total > 0)) continue;
-      const used = Math.round((q.used / q.total) * 100);
-      if (!best || used > best.used) best = { name, used, resetAt: q.resetAt };
-    }
-  }
-  return best;
-}
-const prettyWin = (n) => n.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 
 export function buildView({ data, quota, ui, set, fit, range, feeRefs, saveFees }) {
   const { totals, bars, groups: G, fees, subsMeta } = data;
@@ -146,15 +128,6 @@ export function buildView({ data, quota, ui, set, fit, range, feeRefs, saveFees 
     runway: !dsUsd ? "—" : dsRate30 <= 0 ? "No spend" : dsUsd.total / dsRate30 > 120 ? "10+ years" : "~" + Math.round(dsUsd.total / dsRate30) + " months",
   };
 
-  // Allowance
-  const col = (u) => (u > 90 ? "var(--red)" : u >= 70 ? "var(--amber)" : "var(--green)");
-  const CONN = { claude: "claude", codex: "codex", antigravity: "antigravity", ocgo: "opencode-go", muse: "muse" };
-  const allowance = subsMeta.map((s) => {
-    const w = worstWindow(quota[CONN[s.k]]);
-    return w ? { name: s.name, win: prettyWin(w.name), w: w.used + "%", c: col(w.used), usedLabel: w.used + "% used", reset: resetIn(w.resetAt) }
-      : { name: s.name, win: quota[CONN[s.k]] ? "No capped window" : "Not connected", w: "0%", c: "var(--tx3)", usedLabel: "—", reset: "—" };
-  });
-
   // Subscription value table
   const draft = ui.draft || fees;
   const subs = subsMeta.map((s) => {
@@ -211,7 +184,7 @@ export function buildView({ data, quota, ui, set, fit, range, feeRefs, saveFees 
     const open = ui.agOpen === x.id;
     return {
       id: "s·" + x.id, client: x.client, role: x.role, roleBg: RCo(x.role)[0], roleC: RCo(x.role)[1],
-      chips: x.models.slice(0, 3).map((m) => ({ short: short(m.m), full: m.m })), more: x.models.length > 3 ? "+" + (x.models.length - 3) : "",
+      chips: x.models.slice(0, 2).map((m) => ({ short: short(m.m), full: m.m })), more: x.models.length > 2 ? "+" + (x.models.length - 2) : "",
       moreTip: x.models.slice(3).map((m) => short(m.m)).join(", "), req: x.req.toLocaleString("en-US"), dur: durF(x.end - x.start),
       started: (x.isToday ? "Today" : x.startDay) + ", " + x.startTime, real: realF(x.real), realC: x.real > 0 ? "var(--acc)" : "var(--tx3)", value: usd(x.v),
       share: Math.min(100, (x.v / LL) * 100).toFixed(1) + "%", shareL: ((x.v / LL) * 100).toFixed(1) + "%",
@@ -262,7 +235,7 @@ export function buildView({ data, quota, ui, set, fit, range, feeRefs, saveFees 
     k: { realSrc: totals.realEst > 0.005 ? "PARTLY ESTIMATED" : "FROM PROVIDER", realEstTip: totals.realEst > 0.005 ? `${usd(totals.realEst, 1)} is estimated from list price: the provider did not report a cost for those calls.` : "", real: usd(totals.real, 1), or: usd(totals.realOr, 1), ds: usd(totals.realDs, 1), value: usd(totals.value), ratio: ratio ? ratio.toFixed(1) + "×" : "—",
       ratioSub: usd(valueFeed) + " value ÷ " + usd(feesPro) + " fees for " + dayCount + (dayCount === 1 ? " day" : " days") + (unset.length ? ". Excludes " + unset.join(", ") + " (no fee set)." : ""),
       feesPro: usd(feesPro) },
-    or, ds, trend, chart, readout, allowance, subs, dayCount,
+    or, ds, trend, chart, readout, subs, dayCount,
     editing: ui.editing, notEditing: !ui.editing,
     startEdit: () => set({ editing: true, draft: { ...fees } }), cancelEdit: () => set({ editing: false, draft: null }), saveEdit: saveFees,
     groups, groupHead, rows, rankBtns, outliers: outl, noOutliers: outl.length === 0, topDays, topDaysTitle: hourly ? "TOP 5 HOURS" : "TOP 5 DAYS", ag,
