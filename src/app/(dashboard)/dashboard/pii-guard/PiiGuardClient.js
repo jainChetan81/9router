@@ -103,9 +103,9 @@ export default function PiiGuardClient() {
     fetchEvents(evCursor, ctl.signal).then(({ rows, next }) => { setRawEvents(rows); setEvNext(next); setEvBusy(false); }).catch(() => { if (!ctl.signal.aborted) setEvBusy(false); });
     return () => { ctl.abort(); setEvBusy(false); };
   }, [ui.tab, ui.view, evTick, evCursor, fetchEvents]);
-  const loadOlder = evNext && !evBusy ? () => setEvPage((p) => [...p, { cursor: evNext }]) : null;
-  const loadNewer = !evNewest && !evBusy ? () => setEvPage((p) => p.slice(0, -1)) : null;
-  const loadNewest = !evNewest && !evBusy ? () => setEvPage([]) : null;
+  const loadOlder = evNext && !evBusy ? () => { setEvPage((p) => [...p, { cursor: evNext }]); set({ sel: {} }); } : null;
+  const loadNewer = !evNewest && !evBusy ? () => { setEvPage((p) => p.slice(0, -1)); set({ sel: {} }); } : null;
+  const loadNewest = !evNewest && !evBusy ? () => { setEvPage([]); set({ sel: {} }); } : null;
 
   useEffect(() => { call("/api/pii-guard?samples=1").then((s) => setSamples(Array.isArray(s) ? s : [])).catch(() => {}); }, []);
 
@@ -466,7 +466,7 @@ export default function PiiGuardClient() {
               {(loadOlder) && (<button onClick={loadOlder} style={moreBtn}>Older 50</button>)}
             </div>
           </>)}
-          {(isPrompts) && <Prompts q={dq0} session={ui.session} range={range} clearSession={() => set({ session: "" })} setSession={(id) => set({ session: id, q: "" })} />}</div>
+          {(isPrompts) && <Prompts q={dq0} session={ui.session} range={range} tick={data} clearSession={() => set({ session: "" })} setSession={(id) => set({ session: id, q: "" })} />}</div>
         </div>
       </>)}
 
@@ -643,7 +643,7 @@ function PromptPeek({ query, mark }) {
     <span style={{ fontSize: "11px", color: "var(--tx3)" }}>Detected values are masked. Text the rules miss, like names, is stored as is.</span></>;
 }
 // Prompts view: server search, 300 ms after typing stops; a newer search cancels the older one.
-function Prompts({ q, session, range, clearSession, setSession }) {
+function Prompts({ q, session, range, tick, clearSession, setSession }) {
   const [state, setState] = useState({ rows: [], next: null, busy: true, error: "" });
   const [open, setOpen] = useState(null);
   // Page cursors belong to one filter; a new filter starts on the newest page.
@@ -651,7 +651,7 @@ function Prompts({ q, session, range, clearSession, setSession }) {
   const [pageState, setPageState] = useState({ fkey, list: [] });
   const pages = pageState.fkey === fkey ? pageState.list : [];
   const setPages = (f) => setPageState({ fkey, list: f(pages) });
-  const cursor = pages.at(-1) ?? null;
+  const cursor = pages.at(-1) ?? null, pollTick = cursor ? null : tick;
   useEffect(() => {
     const ctl = new AbortController();
     const t = setTimeout(() => {
@@ -662,7 +662,7 @@ function Prompts({ q, session, range, clearSession, setSession }) {
         .catch((e) => { if (!ctl.signal.aborted) setState({ rows: [], next: null, busy: false, error: e.message }); });
     }, 300);
     return () => { clearTimeout(t); ctl.abort(); };
-  }, [q, session, range, cursor]);
+  }, [q, session, range, cursor, pollTick]);
   return <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
     {session && <div style={{ display: "flex", gap: "8px", alignItems: "center", fontSize: "12px", color: "var(--tx2)", padding: "4px 0" }}>Conversation <span style={{ fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: "0" }}>{session}</span><button onClick={clearSession} style={btn}>Show all</button></div>}
     {state.error && <div style={{ padding: "16px 0", color: "var(--tx3)", textAlign: "center" }}>{state.error}</div>}

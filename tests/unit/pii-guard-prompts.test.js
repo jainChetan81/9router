@@ -123,6 +123,15 @@ describe("prompt store", () => {
       expect(P.stats.unsafe).toBeGreaterThan(0); // unsafe nodes are dropped and counted, never stored
     } finally { delete process.env.PII_GUARD_MODULE; delete process.env.PII_GUARD_KNOWN; }
   });
+  it("retries a digest after the first database write fails", async () => {
+    const good = process.env.PII_GUARD_PROMPTS;
+    process.env.PII_GUARD_PROMPTS = "/dev/null/prompts.db";
+    await run({ messages: [{ role: "user", content: "retry this prompt" }] });
+    P._reset();
+    process.env.PII_GUARD_PROMPTS = good;
+    await run({ messages: [{ role: "user", content: "retry this prompt" }] });
+    expect(P.search({ q: "retry" }).rows).toHaveLength(1);
+  });
   it("deletes rows older than 14 days", async () => {
     await run({ messages: [{ role: "user", content: "old" }] });
     expect(P.sweep(Date.now() + 15 * 864e5)).toBe(1);

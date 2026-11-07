@@ -9,12 +9,12 @@ import { dirname, join } from "node:path";
 
 export const PROMPT_CAP = 1024 * 1024, TOOL_CAP = 128 * 1024, REQUEST_CAP = 4 * 1024 * 1024;
 // Queue bound is bytes; the message count only stops pathological bodies of tiny strings.
-const TTL_MS = 14 * 864e5, QUEUE_MAX = 5000, QUEUE_BYTES = 64 * 1024 * 1024, SEEN_MAX = 200_000;
+const TTL_MS = 14 * 864e5, QUEUE_MAX = 5000, QUEUE_BYTES = 64 * 1024 * 1024, SEEN_MAX = 200_000, SEEN_SESSIONS = 10_000, STORE_BYTES = 200 * 1024 * 1024;
 let sweepTimer = null, db = null, dbFile = null, failed = false, queue = [], queued = 0, draining = false, lastSweep = 0;
 export const stats = { stored: 0, dropped: 0, unsafe: 0, errors: 0 };
 // Per-session message digests already stored, so a resent conversation stores only what is new.
 // A session missing here (new, or after a restart) is seeded from the DB once.
-const seen = new Map();
+const seen = new Map(), pending = new Map();
 
 // Next to a custom events file (tests, other installs); otherwise in ~/.cache, outside backups.
 export function promptsFile() {
@@ -33,8 +33,9 @@ function open(file = promptsFile()) {
     // Loaded lazily so the module stays importable where node:sqlite is missing.
     const { DatabaseSync } = process.getBuiltinModule("node:sqlite");
     db = new DatabaseSync(file);
-    db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA secure_delete=ON; PRAGMA busy_timeout=0;
-      CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, request_id TEXT NOT NULL, session_id TEXT,
+    db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA secure_delete=ON; PRAGMA busy_timeout=0;");
+    if (db.prepare("PRAGMA auto_vacuum").get().auto_vacuum !== 2) { db.exec("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;"); }
+    db.exec(`CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, request_id TEXT NOT NULL, session_id TEXT,
         model TEXT, client TEXT, role TEXT, kind TEXT, path TEXT, text TEXT NOT NULL, cut INTEGER NOT NULL DEFAULT 0, hashes TEXT NOT NULL DEFAULT '', digest TEXT);
       CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);
       CREATE INDEX IF NOT EXISTS messages_request ON messages(request_id);
@@ -104,28 +105,29 @@ export function pick(nodes, sessionId, file) {
     const d = open(file);
     try { if (d) remember(sessionId, d.prepare("SELECT digest FROM messages WHERE session_id = ? AND digest IS NOT NULL").all(sessionId).map((x) => x.digest)); } catch { stats.errors++; }
   }
-  const known = sessionId ? seen.get(sessionId) : null;
-  const out = [];
+  const known = sessionId ? seen.get(sessionId) : null, waiting = sessionId ? pending.get(sessionId) : null;
+  const out = [], selected = new Set();
   let bytes = 0;
   nodes.forEach((n, i) => {
     if (!n.text || n.text.length < 2 || bytes >= REQUEST_CAP) return;
     const d = digest(`${n.role}\0${n.kind}\0${n.text}`);
     // No session: nothing to dedupe against, so keep only the latest message and messages with findings.
-    if (sessionId ? known?.has(d) : !n.findings.length && i !== nodes.length - 1) return;
+    if (sessionId ? known?.has(d) || waiting?.has(d) || selected.has(d) : !n.findings.length && i !== nodes.length - 1) return;
+    selected.add(d);
     out.push({ ...n, digest: d });
     bytes += Math.min(n.text.length, PROMPT_CAP);
   });
   return out;
 }
 function remember(sessionId, digests) {
-  if (!sessionId) return;
+  if (!sessionId || !digests.length) return;
   let set = seen.get(sessionId);
   if (!set) { set = new Set(); seen.set(sessionId, set); }
   seen.delete(sessionId); seen.set(sessionId, set); // most recent last
   for (const d of digests) set.add(d);
   let total = 0;
   for (const s of seen.values()) total += s.size;
-  for (const [k, s] of seen) { if (total <= SEEN_MAX) break; total -= s.size; seen.delete(k); }
+  for (const [k, s] of seen) { if (total <= SEEN_MAX && seen.size <= SEEN_SESSIONS) break; total -= s.size; seen.delete(k); }
 }
 
 /** Queues masked records; never blocks the request. Masking and the rescan happen here (sync, small);
@@ -150,7 +152,6 @@ function store({ nodes, bodyFindings = [], requestId, sessionId, model, client, 
     n.unsafe = [...need].some(([h, c]) => (have.get(h) || 0) < c);
   }
   const chosen = pick(nodes, sessionId, file);
-  remember(sessionId, chosen.map((n) => n.digest));
   const ts = Date.now();
   for (const n of chosen) {
     if (n.unsafe) { stats.unsafe++; continue; }
@@ -163,6 +164,7 @@ function store({ nodes, bodyFindings = [], requestId, sessionId, model, client, 
     } catch { stats.errors++; continue; }
     if (queue.length >= QUEUE_MAX || queued + masked.text.length > QUEUE_BYTES) { stats.dropped++; continue; }
     queue.push(masked); queued += masked.text.length;
+    if (sessionId) { let set = pending.get(sessionId); if (!set) pending.set(sessionId, set = new Set()); set.add(n.digest); }
   }
   if (!draining && queue.length) { draining = true; setImmediate(drain); }
 }
@@ -173,20 +175,38 @@ function drain() {
 }
 function write(file, rows) {
   const d = open(file);
-  if (!d) { stats.dropped += rows.length; return; }
+  if (!d) { stats.dropped += rows.length; releasePending(rows); return; }
   try {
     const ins = d.prepare("INSERT INTO messages (ts, request_id, session_id, model, client, role, kind, path, text, cut, hashes, digest) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
     d.exec("BEGIN");
     for (const r of rows) ins.run(r.ts, r.requestId, r.sessionId, r.model, r.client, r.role, r.kind, r.path, r.text, r.cut, r.hashes, r.digest);
     d.exec("COMMIT");
     stats.stored += rows.length;
-  } catch { try { d.exec("ROLLBACK"); } catch {} stats.errors++; }
+    releasePending(rows);
+    for (const r of rows) remember(r.sessionId, [r.digest]);
+  } catch { try { d.exec("ROLLBACK"); } catch {} stats.errors++; stats.dropped += rows.length; releasePending(rows); }
+}
+function releasePending(rows) {
+  for (const r of rows) {
+    if (!r.sessionId) continue;
+    const set = pending.get(r.sessionId);
+    set?.delete(r.digest);
+    if (set && !set.size) pending.delete(r.sessionId);
+  }
 }
 export function sweep(now = Date.now()) {
   lastSweep = now;
   const d = db;
   if (!d) return 0;
-  try { return Number(d.prepare("DELETE FROM messages WHERE ts < ?").run(now - TTL_MS).changes); } catch { stats.errors++; return 0; }
+  try {
+    const expired = Number(d.prepare("DELETE FROM messages WHERE ts < ?").run(now - TTL_MS).changes);
+    const capped = Number(d.prepare(`WITH sizes AS (
+      SELECT id, SUM(length(CAST(text AS BLOB))) OVER (ORDER BY ts DESC, id DESC) AS newest_bytes FROM messages
+    ) DELETE FROM messages WHERE id IN (SELECT id FROM sizes WHERE newest_bytes > ?)`)
+      .run(STORE_BYTES).changes);
+    if (expired || capped) d.exec(`PRAGMA incremental_vacuum(${d.prepare("PRAGMA freelist_count").get().freelist_count})`);
+    return expired + capped;
+  } catch { stats.errors++; return 0; }
 }
 /** Test helper: write the queue now. */
 export function flush() { if (queue.length) drain(); }
@@ -224,4 +244,4 @@ export function message(id) {
 /** Test helper. */
 /** Test helper: forget in-memory dedupe, as a restart does. */
 export function _forget() { seen.clear(); }
-export function _reset() { clearInterval(sweepTimer); sweepTimer = null; try { db?.close(); } catch {} db = null; failed = false; queue = []; queued = 0; draining = false; seen.clear(); Object.assign(stats, { stored: 0, dropped: 0, unsafe: 0, errors: 0 }); }
+export function _reset() { clearInterval(sweepTimer); sweepTimer = null; try { db?.close(); } catch {} db = null; failed = false; queue = []; queued = 0; draining = false; seen.clear(); pending.clear(); Object.assign(stats, { stored: 0, dropped: 0, unsafe: 0, errors: 0 }); }
