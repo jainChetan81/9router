@@ -182,19 +182,9 @@ function write(file, rows) {
     for (const r of rows) ins.run(r.ts, r.requestId, r.sessionId, r.model, r.client, r.role, r.kind, r.path, r.text, r.cut, r.hashes, r.digest);
     d.exec("COMMIT");
     stats.stored += rows.length;
-    const written = rows.filter((r) => r.sessionId);
     releasePending(rows);
-    for (const [sessionId, group] of groupBySession(written)) remember(sessionId, group.map((r) => r.digest));
-  } catch {
-    try { d.exec("ROLLBACK"); } catch {}
-    stats.errors++;
-    for (const r of rows) {
-      const set = pending.get(r.sessionId);
-      set?.delete(r.digest);
-      if (set && !set.size) pending.delete(r.sessionId);
-      stats.dropped++;
-    }
-  }
+    for (const r of rows) remember(r.sessionId, [r.digest]);
+  } catch { try { d.exec("ROLLBACK"); } catch {} stats.errors++; stats.dropped += rows.length; releasePending(rows); }
 }
 function releasePending(rows) {
   for (const r of rows) {
@@ -203,11 +193,6 @@ function releasePending(rows) {
     set?.delete(r.digest);
     if (set && !set.size) pending.delete(r.sessionId);
   }
-}
-function groupBySession(rows) {
-  const groups = new Map();
-  for (const r of rows) { if (!groups.has(r.sessionId)) groups.set(r.sessionId, []); groups.get(r.sessionId).push(r); }
-  return groups;
 }
 export function sweep(now = Date.now()) {
   lastSweep = now;
