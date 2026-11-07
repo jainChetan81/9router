@@ -56,11 +56,11 @@ export default function SpendClient() {
     return () => clearTimeout(t);
   }, [load]);
 
-  // Allowance and provider balances come from the Quota Tracker endpoints.
+  // Provider balances come from the Quota Tracker endpoints.
   useEffect(() => {
     let off = false;
     getJson("/api/providers").then(async ({ connections = [] }) => {
-      const want = ["claude", "codex", "antigravity", "opencode-go", "muse", "openrouter", "deepseek"];
+      const want = ["openrouter", "deepseek"];
       const list = connections.filter((c) => want.includes(c.provider) && c.isActive !== false);
       const out = {};
       await Promise.all(list.map(async (c) => {
@@ -107,11 +107,11 @@ export default function SpendClient() {
   const openConsole = () => router.push("/dashboard/console-log");
   const emptyText = `9Router logged no calls in this range (${data?.range?.first ?? ""} – ${data?.range?.last ?? ""} IST). Real spend is $0.00. Allowance and fees still apply.`;
   const ready = mode === "ready" && v;
-  const s = { range: true, top: ready, real: ready, time: ready, allowance: (ready || isEmpty) && !!v, subvalue: (ready || isEmpty) && !!v, breakdown: ready, agents: ready, outliers: ready };
+  const s = { range: true, top: ready, real: ready, time: ready, subvalue: (ready || isEmpty) && !!v, breakdown: ready, agents: ready, outliers: ready };
   const minH = "100%";
   const rangeTitle = v?.rangeTitle ?? "";
   const rangeSub = v?.rangeSub ?? "";
-  const { k, or, ds, trend, chart, readout, allowance, subs, dayCount, editing, notEditing, startEdit, cancelEdit, saveEdit, groups, groupHead, rows, rankBtns, outliers, noOutliers, topDays, topDaysTitle, ag, aWpx, detCols, maskA, maskR, bdNote, outNote, loggedNote, nrTip, skel } = v || { skel: [] };
+  const { k, or, ds, trend, chart, readout, subs, dayCount, editing, notEditing, startEdit, cancelEdit, saveEdit, groups, groupHead, rows, rankBtns, outliers, noOutliers, topDays, topDaysTitle, ag, aWpx, detCols, maskA, maskR, bdNote, outNote, loggedNote, nrTip, skel } = v || { skel: [] };
 
   return (
     <div data-r9={theme} style={{ display: "flex", flexDirection: "column", minHeight: minH, backgroundColor: "var(--bg)", backgroundImage: "linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px)", backgroundSize: "44px 44px", color: "var(--tx)", fontFamily: "system-ui,-apple-system,'Segoe UI',sans-serif", fontSize: "13px", lineHeight: "1.4" }}>
@@ -251,22 +251,6 @@ export default function SpendClient() {
           </>)}
 
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(min(100%,440px),1fr))", gap: "16px", alignItems: "start" }}>
-            {(s.allowance) && (<>
-              <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: "12px", boxShadow: "var(--shadow)", padding: "16px 18px", display: "flex", flexDirection: "column", gap: "4px" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", paddingBottom: "8px" }}><span style={{ fontSize: "11.5px", fontWeight: "600", letterSpacing: ".05em", color: "var(--tx2)" }}>ALLOWANCE LEFT <span style={{ fontWeight: "400", letterSpacing: "0", color: "var(--tx3)" }}>· right now, worst window</span></span><a href="/dashboard/quota" style={{ fontSize: "12px" }}>Details in Quota Tracker →</a></div>
-                {(allowance).map((a, _i) => (<Fragment key={_i}>
-                  <div style={{ display: "grid", gridTemplateColumns: "150px 1fr 96px", gap: "14px", alignItems: "center", padding: "9px 0", borderTop: "1px solid var(--line)" }}>
-                    <div style={{ display: "flex", flexDirection: "column", gap: "1px", minWidth: "0" }}><span style={{ fontWeight: "600" }}>{a.name}</span><span style={{ fontSize: "11.5px", color: "var(--tx3)" }}>{a.win}</span></div>
-                    <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-                      <div style={{ height: "8px", borderRadius: "4px", background: "var(--seg)", overflow: "hidden" }}><div style={{ height: "100%", width: a.w, background: a.c, borderRadius: "4px" }}></div></div>
-                      <span style={{ fontSize: "11.5px", color: a.c, fontWeight: "600" }}>{a.usedLabel}</span>
-                    </div>
-                    <div style={{ textAlign: "right", fontSize: "12px", color: "var(--tx2)" }}>resets in<br /><b style={{ color: "var(--tx)", fontVariantNumeric: "tabular-nums" }}>{a.reset}</b></div>
-                  </div>
-                </Fragment>))}
-                <div style={{ display: "flex", gap: "14px", fontSize: "11px", color: "var(--tx3)", paddingTop: "6px" }}><span style={{ display: "flex", gap: "5px", alignItems: "center" }}><span style={{ width: "8px", height: "8px", borderRadius: "2px", background: "var(--green)" }}></span>under 70%</span><span style={{ display: "flex", gap: "5px", alignItems: "center" }}><span style={{ width: "8px", height: "8px", borderRadius: "2px", background: "var(--amber)" }}></span>70–90%</span><span style={{ display: "flex", gap: "5px", alignItems: "center" }}><span style={{ width: "8px", height: "8px", borderRadius: "2px", background: "var(--red)" }}></span>over 90%</span></div>
-              </div>
-            </>)}
             {(s.subvalue) && (<>
               <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: "12px", boxShadow: "var(--shadow)", padding: "16px 18px", display: "flex", flexDirection: "column", gap: "4px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", paddingBottom: "8px" }}><span style={{ fontSize: "11.5px", fontWeight: "600", letterSpacing: ".05em", color: "var(--tx2)", display: "flex", gap: "8px", alignItems: "center" }}>SUBSCRIPTION VALUE<span style={{ fontSize: "10px", fontWeight: "600", padding: "1px 6px", borderRadius: "4px", background: "var(--violetbg)", color: "var(--violet)" }}>ESTIMATE</span></span>
@@ -334,14 +318,14 @@ export default function SpendClient() {
               </>)}
               {(ag.showSessions) && (<>
                 <div ref={aRef} onScroll={checkFade} style={{ overflowX: "auto", WebkitMaskImage: maskA, maskImage: maskA }}>
-                  <div style={{ display: "grid", gridTemplateColumns: "76px 90px 92px minmax(230px,1.6fr) 56px 76px 96px 54px 66px minmax(90px,1fr)", gap: "10px", fontSize: "11px", fontWeight: "600", color: "var(--tx3)", letterSpacing: ".04em", padding: "4px 0", minWidth: "1060px" }}><span>SESSION</span><span>CLIENT</span><span>ROLE</span><span>MODELS</span><span style={{ textAlign: "right" }}>REQ.</span><span style={{ textAlign: "right" }}>DURATION</span><span>STARTED</span><span style={{ textAlign: "right" }}>REAL</span><span style={{ textAlign: "right" }}>VALUE</span><span>SHARE</span></div>
+                  <div style={{ display: "grid", gridTemplateColumns: "112px 96px 132px minmax(200px,1.4fr) 52px 80px 104px 54px 66px minmax(90px,1fr)", gap: "10px", fontSize: "11px", fontWeight: "600", color: "var(--tx3)", letterSpacing: ".04em", padding: "4px 0", minWidth: "1140px" }}><span>SESSION</span><span>CLIENT</span><span>ROLE</span><span>MODELS</span><span style={{ textAlign: "right" }}>REQ.</span><span style={{ textAlign: "right" }}>DURATION</span><span>STARTED</span><span style={{ textAlign: "right" }}>REAL</span><span style={{ textAlign: "right" }}>VALUE</span><span>SHARE</span></div>
                   {(ag.sessions).map((x, _i) => (<Fragment key={_i}>
-                    <div style={{ borderTop: "1px solid var(--line)", minWidth: "1060px" }}>
-                      <div onClick={x.toggle} role="button" tabIndex={0} aria-expanded={x.open} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); x.toggle(); } }} style={{ display: "grid", gridTemplateColumns: "76px 90px 92px minmax(230px,1.6fr) 56px 76px 96px 54px 66px minmax(90px,1fr)", gap: "10px", alignItems: "center", padding: "7px 0", fontSize: "12px", fontVariantNumeric: "tabular-nums", cursor: "pointer", background: x.bg }}>
-                        <span style={{ display: "flex", alignItems: "center", gap: "3px", fontFamily: "var(--mono)", fontSize: "11.5px", color: "var(--tx)" }}><span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: "15px", color: "var(--tx3)" }}>{x.chev}</span>{x.id}</span>
+                    <div style={{ borderTop: "1px solid var(--line)", minWidth: "1140px" }}>
+                      <div onClick={x.toggle} role="button" tabIndex={0} aria-expanded={x.open} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); x.toggle(); } }} style={{ display: "grid", gridTemplateColumns: "112px 96px 132px minmax(200px,1.4fr) 52px 80px 104px 54px 66px minmax(90px,1fr)", gap: "10px", alignItems: "center", padding: "7px 0", fontSize: "12px", fontVariantNumeric: "tabular-nums", cursor: "pointer", background: x.bg }}>
+                        <span title={x.id} style={{ display: "flex", alignItems: "center", gap: "3px", minWidth: "0", fontFamily: "var(--mono)", fontSize: "11.5px", color: "var(--tx)" }}><span style={{ flex: "none", fontFamily: "'Material Symbols Outlined'", fontSize: "15px", color: "var(--tx3)" }}>{x.chev}</span><span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{x.id}</span></span>
                         <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{x.client}</span>
-                        <span><span style={{ fontSize: "10.5px", fontWeight: "600", padding: "2px 7px", borderRadius: "5px", background: x.roleBg, color: x.roleC }}>{x.role}</span></span>
-                        <span style={{ display: "flex", gap: "4px", alignItems: "center", minWidth: "0", overflow: "hidden" }}>{(x.chips).map((c, _i) => (<Fragment key={_i}><span title={c.full} style={{ flex: "none", fontFamily: "var(--mono)", fontSize: "10.5px", padding: "1px 6px", borderRadius: "4px", background: "var(--seg)", color: "var(--tx2)", whiteSpace: "nowrap" }}>{c.short}</span></Fragment>))}{(x.more) && (<><span title={x.moreTip} style={{ flex: "none", fontSize: "10.5px", fontWeight: "600", color: "var(--tx3)" }}>{x.more}</span></>)}</span>
+                        <span style={{ minWidth: "0", display: "flex" }}><span title={x.role} style={{ fontSize: "10.5px", fontWeight: "600", padding: "2px 7px", borderRadius: "5px", background: x.roleBg, color: x.roleC, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{x.role}</span></span>
+                        <span style={{ display: "flex", gap: "4px", alignItems: "center", minWidth: "0", overflow: "hidden" }}>{(x.chips).map((c, _i) => (<Fragment key={_i}><span title={c.full} style={{ flex: "0 1 auto", minWidth: "0", overflow: "hidden", textOverflow: "ellipsis", fontFamily: "var(--mono)", fontSize: "10.5px", padding: "1px 6px", borderRadius: "4px", background: "var(--seg)", color: "var(--tx2)", whiteSpace: "nowrap" }}>{c.short}</span></Fragment>))}{(x.more) && (<><span title={x.moreTip} style={{ flex: "none", fontSize: "10.5px", fontWeight: "600", color: "var(--tx3)" }}>{x.more}</span></>)}</span>
                         <span style={{ textAlign: "right" }}>{x.req}</span>
                         <span style={{ textAlign: "right", color: "var(--tx2)" }}>{x.dur}</span>
                         <span style={{ color: "var(--tx2)", whiteSpace: "nowrap" }}>{x.started}</span>
