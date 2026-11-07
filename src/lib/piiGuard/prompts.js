@@ -13,8 +13,7 @@ const TTL_MS = 14 * 864e5, QUEUE_MAX = 5000, QUEUE_BYTES = 64 * 1024 * 1024, SEE
 let sweepTimer = null, db = null, dbFile = null, failed = false, queue = [], queued = 0, draining = false, lastSweep = 0;
 export const stats = { stored: 0, dropped: 0, unsafe: 0, errors: 0 };
 // Per-session message digests already stored, so a resent conversation stores only what is new.
-// ponytail: in memory only; after a restart the first request of a running session stores its history again
-// (up to REQUEST_CAP). Seed from the DB if that duplication shows up in disk use.
+// A session missing here (new, or after a restart) is seeded from the DB once.
 const seen = new Map();
 
 // Next to a custom events file (tests, other installs); otherwise in ~/.cache, outside backups.
@@ -36,7 +35,7 @@ function open(file = promptsFile()) {
     db = new DatabaseSync(file);
     db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA secure_delete=ON; PRAGMA busy_timeout=0;
       CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, request_id TEXT NOT NULL, session_id TEXT,
-        model TEXT, client TEXT, role TEXT, kind TEXT, path TEXT, text TEXT NOT NULL, cut INTEGER NOT NULL DEFAULT 0, hashes TEXT NOT NULL DEFAULT '');
+        model TEXT, client TEXT, role TEXT, kind TEXT, path TEXT, text TEXT NOT NULL, cut INTEGER NOT NULL DEFAULT 0, hashes TEXT NOT NULL DEFAULT '', digest TEXT);
       CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);
       CREATE INDEX IF NOT EXISTS messages_request ON messages(request_id);
       CREATE INDEX IF NOT EXISTS messages_session ON messages(session_id, ts);
@@ -100,7 +99,11 @@ export function collect(body) {
 /** Picks the strings to store: every string not stored before in this session. Without a session: the latest
  *  string and any string with a finding.
  *  `nodes`: [{ text, role, kind, path, findings }] in request order; texts are originals (before redaction). */
-export function pick(nodes, sessionId) {
+export function pick(nodes, sessionId, file) {
+  if (sessionId && !seen.has(sessionId)) {
+    const d = open(file);
+    try { if (d) remember(sessionId, d.prepare("SELECT digest FROM messages WHERE session_id = ? AND digest IS NOT NULL").all(sessionId).map((x) => x.digest)); } catch { stats.errors++; }
+  }
   const known = sessionId ? seen.get(sessionId) : null;
   const out = [];
   let bytes = 0;
@@ -146,7 +149,7 @@ function store({ nodes, bodyFindings = [], requestId, sessionId, model, client, 
     for (const f of n.findings) have.set(f.hash, (have.get(f.hash) || 0) + 1);
     n.unsafe = [...need].some(([h, c]) => (have.get(h) || 0) < c);
   }
-  const chosen = pick(nodes, sessionId);
+  const chosen = pick(nodes, sessionId, file);
   remember(sessionId, chosen.map((n) => n.digest));
   const ts = Date.now();
   for (const n of chosen) {
@@ -156,7 +159,7 @@ function store({ nodes, bodyFindings = [], requestId, sessionId, model, client, 
       const [text, cut] = cap(library.maskText(n.text, n.findings), n.kind);
       // Fail closed: anything still detected after masking means a span was missed.
       if (detector.scan(text).length) { stats.unsafe++; continue; }
-      masked = { file, ts, requestId, sessionId: sessionId || null, model: model || null, client: client || null, role: n.role, kind: n.kind, path: n.path, text, cut, hashes: [...new Set(n.findings.map((f) => f.hash))].join(" ") };
+      masked = { file, ts, requestId, sessionId: sessionId || null, model: model || null, client: client || null, role: n.role, kind: n.kind, path: n.path, digest: n.digest, text, cut, hashes: [...new Set(n.findings.map((f) => f.hash))].join(" ") };
     } catch { stats.errors++; continue; }
     if (queue.length >= QUEUE_MAX || queued + masked.text.length > QUEUE_BYTES) { stats.dropped++; continue; }
     queue.push(masked); queued += masked.text.length;
@@ -172,9 +175,9 @@ function write(file, rows) {
   const d = open(file);
   if (!d) { stats.dropped += rows.length; return; }
   try {
-    const ins = d.prepare("INSERT INTO messages (ts, request_id, session_id, model, client, role, kind, path, text, cut, hashes) VALUES (?,?,?,?,?,?,?,?,?,?,?)");
+    const ins = d.prepare("INSERT INTO messages (ts, request_id, session_id, model, client, role, kind, path, text, cut, hashes, digest) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
     d.exec("BEGIN");
-    for (const r of rows) ins.run(r.ts, r.requestId, r.sessionId, r.model, r.client, r.role, r.kind, r.path, r.text, r.cut, r.hashes);
+    for (const r of rows) ins.run(r.ts, r.requestId, r.sessionId, r.model, r.client, r.role, r.kind, r.path, r.text, r.cut, r.hashes, r.digest);
     d.exec("COMMIT");
     stats.stored += rows.length;
   } catch { try { d.exec("ROLLBACK"); } catch {} stats.errors++; }
@@ -219,4 +222,6 @@ export function message(id) {
   return d.prepare(`SELECT ${COLS}, m.text FROM messages m WHERE m.id = ? AND m.ts >= ?`).get(id, Date.now() - TTL_MS) || null;
 }
 /** Test helper. */
+/** Test helper: forget in-memory dedupe, as a restart does. */
+export function _forget() { seen.clear(); }
 export function _reset() { clearInterval(sweepTimer); sweepTimer = null; try { db?.close(); } catch {} db = null; failed = false; queue = []; queued = 0; draining = false; seen.clear(); Object.assign(stats, { stored: 0, dropped: 0, unsafe: 0, errors: 0 }); }

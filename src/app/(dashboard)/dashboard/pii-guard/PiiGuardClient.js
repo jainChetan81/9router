@@ -248,7 +248,7 @@ export default function PiiGuardClient() {
                   <button onClick={l.view} title="Open details and the stored prompt" style={btn}>View</button>
                   <button onClick={l.dismiss} title="Hide this row. It comes back if the value shows up somewhere new." style={btn}>Dismiss</button>
                   <button onClick={l.allow} title="This one value is never redacted or blocked again" style={btn}>Mark as safe</button>
-                  <span style={{ fontSize: "11.5px", color: "var(--tx3)" }}>Every {l.ruleName}:</span>
+                  <span style={{ fontSize: "11.5px", color: "var(--tx3)" }}>All {l.ruleName}:</span>
                   <div style={segWrap}>{l.ruleBtns.map((b) => <button key={b.label} onClick={b.on} style={b.style}>{b.label}</button>)}</div>
                 </div>
               </div>
@@ -302,7 +302,7 @@ export default function PiiGuardClient() {
 
       {(s.bygroup && byGroup.length > 0) && (<>
         <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: "12px", boxShadow: "var(--shadow)", padding: "16px 18px", display: "flex", flexDirection: "column", gap: "8px", minWidth: "0" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}><span style={{ fontWeight: "600", fontSize: "14px" }}>By rule group</span><span style={{ fontSize: "11.5px", color: "var(--tx3)" }}>Unique values · click a count to open Findings</span></div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}><span style={{ fontWeight: "600", fontSize: "14px" }}>By rule group</span><span style={{ fontSize: "11.5px", color: "var(--tx3)" }}>Unique values per group. Click a number to see those values.</span></div>
           <div style={{ overflowX: "auto" }}>
             <div style={{ display: "grid", gridTemplateColumns: "minmax(140px,1.2fr) minmax(120px,1fr) repeat(4,72px) 64px", gap: "8px 12px", alignItems: "center", minWidth: "640px", fontSize: "12.5px" }}>
               {["Group", "Split", "Redacted", "Observed", "Blocked", "Couldn't redact", "Total"].map((h, i) => <span key={i} style={{ fontSize: "11px", fontWeight: "600", color: "var(--tx3)", letterSpacing: ".04em", textAlign: i > 1 ? "right" : "left", textTransform: "uppercase" }}>{h}</span>)}
@@ -328,9 +328,9 @@ export default function PiiGuardClient() {
             </div>
           </Fragment>))}
           <div style={{ display: "flex", flexDirection: "column", gap: "8px", borderTop: "1px solid var(--line)", paddingTop: "12px", marginTop: "4px" }}>
-            <div style={{ display: "grid", gridTemplateColumns: "minmax(100px,150px) 1fr 80px 64px", gap: "14px", fontSize: "11px", fontWeight: "600", letterSpacing: ".05em", color: "var(--tx3)" }}><span>BY CLIENT</span><span></span><span style={{ textAlign: "right" }}>VALUES</span><span style={{ textAlign: "right" }}>LEAKS</span></div>
+            <div style={{ display: "grid", gridTemplateColumns: "minmax(100px,150px) 1fr 80px 104px", gap: "14px", fontSize: "11px", fontWeight: "600", letterSpacing: ".05em", color: "var(--tx3)" }}><span>BY CLIENT</span><span></span><span style={{ textAlign: "right" }}>VALUES</span><span style={{ textAlign: "right" }} title="Values the rule said to redact that could not be changed">NOT REDACTED</span></div>
             {(byClient).map((c, _i) => (<Fragment key={_i}>
-              <div style={{ display: "grid", gridTemplateColumns: "minmax(100px,150px) 1fr 80px 64px", gap: "14px", alignItems: "center", fontSize: "12.5px" }}>
+              <div style={{ display: "grid", gridTemplateColumns: "minmax(100px,150px) 1fr 80px 104px", gap: "14px", alignItems: "center", fontSize: "12.5px" }}>
                 <span style={{ display: "flex", flexDirection: "column", minWidth: "0" }}><span>{c.name}</span><span style={{ fontSize: "11px", color: "var(--tx3)" }}>{c.sub}</span></span>
                 <div style={{ height: "6px", borderRadius: "3px", background: "var(--seg)", overflow: "hidden" }}><div style={{ height: "100%", width: c.w, background: "var(--tx3)", borderRadius: "3px", opacity: ".6" }}></div></div>
                 <span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{c.values}</span>
@@ -358,7 +358,7 @@ export default function PiiGuardClient() {
 
       {(s.mode) && (<>
         <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: "12px", boxShadow: "var(--shadow)", padding: "16px 18px", display: "flex", flexDirection: "column", gap: "4px" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: "8px", paddingBottom: "8px" }}><span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: "19px", color: "var(--tx2)" }}>image_search</span><span style={{ fontWeight: "600", fontSize: "14px" }}>Images (OCR)</span><span style={{ fontSize: "12px", color: "var(--tx3)" }}>Text in images can only be observed, never redacted</span></div>
+          <div style={{ display: "flex", alignItems: "center", gap: "8px", paddingBottom: "8px" }}><span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: "19px", color: "var(--tx2)" }}>image_search</span><span style={{ fontWeight: "600", fontSize: "14px" }}>Images (OCR)</span><span style={{ fontSize: "12px", color: "var(--tx3)" }}>Text inside images is logged only. Images are never changed.</span></div>
           {(ocrRows).map((o, _i) => (<Fragment key={_i}>
             <div style={{ display: "grid", gridTemplateColumns: "140px auto 1fr", gap: "16px", alignItems: "center", padding: "10px 0", borderTop: "1px solid var(--line)" }}>
               <span style={{ fontWeight: "600", fontSize: "12.5px" }}>{o.label}</span>
@@ -408,11 +408,11 @@ export default function PiiGuardClient() {
           <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
             <div style={{ flex: "1 1 220px", minWidth: "0", display: "flex", alignItems: "center", gap: "6px", height: "32px", padding: "0 8px", border: "1px solid var(--line2)", borderRadius: "8px", background: "var(--card)" }}><span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: "17px", color: "var(--tx3)" }}>search</span><input value={q} onChange={onQ} placeholder={isPrompts ? "Words in the prompt, e.g. repeat this" : "Rule, masked value, model, client or hash"} style={{ border: "0", outline: "none", background: "transparent", color: "var(--tx)", font: "inherit", flex: "1", minWidth: "0" }} /></div>
             <select value={fGroup} onChange={onGroup} style={selSt}><option value="">All groups</option>{groupOpts.map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select>
-            <select value={fAction} onChange={onAction} style={selSt}><option value="">All actions</option><option value="redact">Redacted</option><option value="observe">Observed</option><option value="block">Blocked</option><option value="leaked">Couldn&apos;t redact</option><option value="allowed">Allowed</option></select>
+            <select value={fAction} onChange={onAction} style={selSt}><option value="">All actions</option><option value="redact">Redacted</option><option value="observe">Observed</option><option value="block">Blocked</option><option value="leaked">Couldn&apos;t redact</option><option value="allowed">Marked safe</option></select>
             <select value={fSource} onChange={onSource} style={selSt}><option value="">All sources</option><option value="text">Text</option><option value="ocr">OCR</option></select>
             <select value={fClient} onChange={onClient} style={selSt}><option value="">All clients</option>{clientOpts.map((o) => <option key={o}>{o}</option>)}</select>
             <select value={fModel} onChange={onModel} style={selSt}><option value="">All models</option>{modelOpts.map((o) => <option key={o}>{o}</option>)}</select>
-            {(isEvents) && <label style={{ display: "flex", gap: "6px", alignItems: "center", fontSize: "12px", color: "var(--tx2)", whiteSpace: "nowrap" }}><input type="checkbox" checked={ui.tests} onChange={onTests} />Include tests</label>}
+            {(isEvents) && <label style={{ display: "flex", gap: "6px", alignItems: "center", fontSize: "12px", color: "var(--tx2)", whiteSpace: "nowrap" }}><input type="checkbox" checked={ui.tests} onChange={onTests} />Include Test tab runs</label>}
           </div>
           {(hasSel) && (<div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", padding: "8px", borderRadius: "8px", background: "var(--tx)", color: "var(--bg)" }}>
             <span style={{ fontWeight: "600", fontSize: "12.5px", padding: "0 8px" }}>{selCount} selected</span>
@@ -478,8 +478,8 @@ export default function PiiGuardClient() {
             <textarea value={testText} onChange={onTest} style={{ minHeight: "180px", resize: "vertical", border: "1px solid var(--line2)", borderRadius: "9px", padding: "12px", background: "var(--bg)", color: "var(--tx)", fontFamily: "var(--mono)", fontSize: "12.5px", lineHeight: "1.6", outline: "0" }}></textarea>
             <div style={{ display: "flex", gap: "6px", alignItems: "center", flexWrap: "wrap" }}><span style={{ fontSize: "12px", color: "var(--tx3)" }}>Try an example</span>{(sampleBtns).map((x, _i) => (<Fragment key={_i}><button onClick={x.on} style={{ height: "26px", padding: "0 10px", borderRadius: "13px", border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: "11.5px", cursor: "pointer" }}>{x.label}</button></Fragment>))}</div>
             <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
-              <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "11.5px", color: "var(--tx2)" }}>Test with<select value={testMode} onChange={onTestMode} style={{ height: "32px", flex: "none", border: "1px solid var(--line2)", borderRadius: "8px", background: "var(--card)", color: "var(--tx)", font: "inherit", padding: "0 8px", minWidth: "170px" }}><option value="current">Current rules</option><option value="redact">Everything on Redact</option></select></label>
-              <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "11.5px", color: "var(--tx2)" }}>Where<select value={testWhere} onChange={onTestWhere} style={{ height: "32px", flex: "none", border: "1px solid var(--line2)", borderRadius: "8px", background: "var(--card)", color: "var(--tx)", font: "inherit", padding: "0 8px", minWidth: "170px" }}><option value="user">User · text</option><option value="tool_result">User · tool result</option><option value="assistant">Assistant · text</option><option value="system">System</option><option value="thinking">Signed thinking</option></select></label>
+              <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "11.5px", color: "var(--tx2)" }}>Test with<select value={testMode} onChange={onTestMode} style={{ height: "32px", flex: "none", border: "1px solid var(--line2)", borderRadius: "8px", background: "var(--card)", color: "var(--tx)", font: "inherit", padding: "0 8px", minWidth: "170px" }}><option value="current">Current rules</option><option value="redact">Every rule on Redact</option></select></label>
+              <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "11.5px", color: "var(--tx2)" }}>Where<select value={testWhere} onChange={onTestWhere} style={{ height: "32px", flex: "none", border: "1px solid var(--line2)", borderRadius: "8px", background: "var(--card)", color: "var(--tx)", font: "inherit", padding: "0 8px", minWidth: "170px" }}><option value="user">User · text</option><option value="tool_result">User · tool result</option><option value="assistant">Assistant · text</option><option value="system">System</option><option value="thinking">Model reasoning (signed)</option></select></label>
             </div>
             </>)}
             {(isImage) && (<>
@@ -489,7 +489,7 @@ export default function PiiGuardClient() {
                 <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap", justifyContent: "center", fontSize: "12px", color: "var(--tx2)" }}><span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: "18px" }}>add_photo_alternate</span>Drop or paste (⌘V) an image here, or<button type="button" onClick={() => fileRef.current?.click()} style={{ border: "0", padding: "0", background: "transparent", color: "var(--acc)", font: "inherit", fontWeight: "600", cursor: "pointer" }}>choose a file</button><input ref={fileRef} type="file" accept="image/*" onChange={onFile} hidden /></div>
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(6,minmax(0,1fr))", gap: "6px" }}>{(thumbs).map((t, _i) => (<Fragment key={_i}><button onClick={t.on} title={t.name} style={t.style}>{t.short}</button></Fragment>))}</div>
-              <div style={{ fontSize: "11.5px", color: "var(--tx3)", display: "flex", gap: "6px", alignItems: "center" }}><span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: "15px" }}>visibility</span>Images are observe only. Findings are logged; the image is sent unchanged.</div>
+              <div style={{ fontSize: "11.5px", color: "var(--tx3)", display: "flex", gap: "6px", alignItems: "center" }}><span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: "15px" }}>visibility</span>Images are never changed. What OCR finds is logged only.</div>
             </>)}
           </div>
           <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: "12px", boxShadow: "var(--shadow)", padding: "16px 18px", display: "flex", flexDirection: "column", gap: "12px" }}>
@@ -532,7 +532,7 @@ export default function PiiGuardClient() {
             </Fragment>))}
           </div>
           <div style={{ display: "flex", flexDirection: "column" }}>
-            <span style={{ fontSize: "11.5px", fontWeight: "600", letterSpacing: ".05em", color: "var(--tx2)", paddingBottom: "6px" }}>RECENT IMAGES · GROUPED</span>
+            <span style={{ fontSize: "11.5px", fontWeight: "600", letterSpacing: ".05em", color: "var(--tx2)", paddingBottom: "6px" }}>RECENT IMAGES</span>
             {(imgGroups).map((g, _i) => (<Fragment key={_i}>
               <div style={{ display: "grid", gridTemplateColumns: "minmax(0,1fr) 72px minmax(0,1.4fr)", gap: "12px", alignItems: "center", padding: "8px 0", borderTop: "1px solid var(--line)", fontSize: "12px" }}>
                 <span style={{ display: "flex", flexDirection: "column", gap: "1px", minWidth: "0" }}><span style={{ fontFamily: "var(--mono)", overflowWrap: "anywhere" }}>{g.model}</span><span style={{ color: "var(--tx3)", fontSize: "11px" }}>{g.when}</span></span>
@@ -572,7 +572,7 @@ function Confirm({ p }) {
     <div role="alertdialog" style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap", padding: "8px 12px", borderRadius: "8px", background: "var(--amberbg)", fontSize: "12px", color: "var(--tx)" }}>
       <span style={{ flex: "1 1 240px" }}>{p.text}</span>
       <button onClick={p.cancel} style={btn}>Cancel</button>
-      <button onClick={p.ok} style={{ ...btn, border: "0", background: "var(--acc)", color: "#fff", fontWeight: "600" }}>Change rule</button>
+      <button onClick={p.ok} style={{ ...btn, border: "0", background: "var(--acc)", color: "#fff", fontWeight: "600" }}>Rule for every value of this type</button>
     </div>
   );
 }
@@ -591,7 +591,7 @@ function RowMenu({ v, close }) {
     <div ref={ref} role="menu" style={{ position: "absolute", right: "0", top: "100%", zIndex: 40, width: "220px", background: "var(--card)", border: "1px solid var(--line2)", borderRadius: "10px", boxShadow: "0 12px 32px rgba(40,20,10,.16)", padding: "4px", display: "flex", flexDirection: "column" }}>
       <button role="menuitem" style={item} onClick={() => { close(); v.view(); }}>View details</button>
       <button role="menuitem" style={item} onClick={() => { close(); v.allow(); }}>{v.allowLabel}</button>
-      <span style={{ padding: "6px 10px 2px", fontSize: "11px", color: "var(--tx3)" }}>Every {v.name} value:</span>
+      <span style={{ padding: "6px 10px 2px", fontSize: "11px", color: "var(--tx3)" }}>All {v.name}:</span>
       <div style={{ ...segWrap, margin: "2px 6px 6px" }}>{v.ruleBtns.map((b) => <button key={b.label} role="menuitem" onClick={() => { close(); b.on(); }} style={b.style}>{b.label}</button>)}</div>
     </div>
   );
@@ -719,7 +719,7 @@ function Drawer({ d }) {
         </div>
         <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap", padding: "16px", borderTop: "1px solid var(--line)" }}>
           <button onClick={d.allow} style={btn}>{d.allowLabel}</button>
-          <span style={{ marginLeft: "auto", fontSize: "11.5px", color: "var(--tx3)" }}>Every {d.rule}:</span>
+          <span style={{ marginLeft: "auto", fontSize: "11.5px", color: "var(--tx3)" }}>All {d.rule}:</span>
           <div style={segWrap}>{d.ruleBtns.map((b) => <button key={b.label} onClick={b.on} style={b.style}>{b.label}</button>)}</div>
         </div>
       </aside>

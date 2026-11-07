@@ -26,7 +26,7 @@ export function place(src) {
 
 const seg = (on, c) => ({ border: 0, height: 26, padding: "0 10px", borderRadius: 7, font: "inherit", fontSize: 12, cursor: "pointer", whiteSpace: "nowrap", background: on ? "var(--segon)" : "transparent", color: on ? c || "var(--tx)" : "var(--tx2)", fontWeight: on ? 600 : 400, boxShadow: on ? "0 1px 2px rgba(0,0,0,.08)" : "none" });
 const AC = { off: ["var(--seg)", "var(--tx2)"], observe: ["var(--bluebg)", "var(--blue)"], redact: ["var(--acc2)", "var(--acc)"], block: ["var(--violetbg)", "var(--violet)"], leaked: ["var(--redbg)", "var(--red)"], ignored: ["var(--seg)", "var(--tx3)"], allowed: ["var(--seg)", "var(--tx3)"] };
-const ALABEL = { observe: "Observed", redact: "Redacted", block: "Blocked", leaked: "Couldn't redact", ignored: "Allowed", allowed: "Allowed", off: "Off" };
+const ALABEL = { observe: "Observed", redact: "Redacted", block: "Blocked", leaked: "Couldn't redact", ignored: "Marked safe", allowed: "Marked safe", off: "Off" };
 export const ACTIONS = ["redact", "observe", "block", "leaked", "allowed"];
 export const placeholder = (rule, hash) => (rule === "known" ? `{{vault:#${String(hash).slice(0, 6)}}}` : `{{pii:${rule}#${String(hash).slice(0, 6)}}}`);
 const WHY = { redact: "Replaced with a placeholder before the request left this server.", observe: "Logged only. The request was sent unchanged.", block: "The request was stopped with HTTP 400 and never reached the model. The message tells you to /rewind.", leaked: "The rule says Redact, but the value sits where it cannot be changed, so it was sent as is. See the reason above.", allowed: "You marked this value as safe. It is never redacted or blocked.", ignored: "You marked this value as safe. It is never redacted or blocked." };
@@ -141,11 +141,11 @@ export function buildView({ data, ui, set, act, range, fit, test, events, sample
   // Health problems, also counted on the Health tab dot.
   const ocr = h.ocr || {}, so = sm.ocr || {}, un = h.unscanned || {};
   const problems = [];
-  if (sm.truncated) problems.push({ icon: "warning", title: "Range is cut short", desc: "The event log is longer than the read cap, so the oldest events in this range are not counted.", cta: null, bg: "var(--amberbg)", c: "var(--amber)" });
+  if (sm.truncated) problems.push({ icon: "warning", title: "Range is cut short", desc: "The log for this range is too large to read in full, so the oldest events are not counted. Pick a shorter range.", cta: null, bg: "var(--amberbg)", c: "var(--amber)" });
   if (!h.module) problems.push({ icon: "power_off", title: "PII_GUARD_MODULE is not set", desc: "Set it in the service drop-in and restart 9Router.", cta: null, bg: "var(--seg)", c: "var(--tx2)" });
   else if (!okScanner) problems.push({ icon: "error", title: "Scanner not loaded", desc: "Requests still go through, but nothing is scanned. Check the Console Log.", cta: null, bg: "var(--redbg)", c: "var(--red)" });
   if (h.errors > 0) problems.push({ icon: "error", title: `${fmt(h.errors)} scanner errors`, desc: `Last: ${h.lastError || "unknown"}. Requests fail open and are never blocked by an error.`, cta: null, bg: "var(--redbg)", c: "var(--red)" });
-  if ((so.status?.partial || 0) > 0) problems.push({ icon: "image_not_supported", title: `${fmt(so.status.partial)} images only partly read`, desc: "Low-resolution screenshots. Enhanced quality reads more of them, at about 3× the time.", cta: ocr.quality === "basic" ? "Try Enhanced" : null, onCta: () => act({ ocr: { quality: "enhanced" } }), bg: "var(--amberbg)", c: "var(--amber)" });
+  if ((so.status?.partial || 0) > 0) problems.push({ icon: "image_not_supported", title: `${fmt(so.status.partial)} images only partly read`, desc: "Mostly small or blurry screenshots. Enhanced quality reads more of them but takes about 3× as long.", cta: ocr.quality === "basic" ? "Try Enhanced" : null, onCta: () => act({ ocr: { quality: "enhanced" } }), bg: "var(--amberbg)", c: "var(--amber)" });
   if (so.reasons?.queue_full) problems.push({ icon: "warning", title: `OCR queue overflowed ${fmt(so.reasons.queue_full)} times`, desc: "Those images were sent without being scanned; they count in “Images not scanned”. Cached and repeated images no longer use queue space.", cta: null, bg: "var(--amberbg)", c: "var(--amber)" });
   const issues = problems.length;
   const health = issues ? { text: `Scanner: ${issues} ${issues === 1 ? "issue" : "issues"}`, c: !okScanner ? "var(--red)" : "var(--amber)", bg: !okScanner ? "var(--redbg)" : "var(--amberbg)" } : { text: "Scanner OK", c: "var(--green)", bg: "var(--greenbg)" };
@@ -168,7 +168,7 @@ export function buildView({ data, ui, set, act, range, fit, test, events, sample
   const ah = sm.actionHits || {};
   const allReq = sm.requests || 0;
   const goFind = (gid, action) => () => set({ tab: "findings", view: "value", fGroup: gid || "", fAction: action || "", page: 0, sel: {} });
-  const cards = [["Found", null, "var(--tx)"], ["Redacted", "redact", "var(--acc)"], ["Observed", "observe", "var(--blue)"], ["Blocked", "block", "var(--violet)"], ["Couldn't redact", "leaked", "var(--red)"], ["Allowed", "allowed", "var(--tx3)"]]
+  const cards = [["Found", null, "var(--tx)"], ["Redacted", "redact", "var(--acc)"], ["Observed", "observe", "var(--blue)"], ["Blocked", "block", "var(--violet)"], ["Couldn't redact", "leaked", "var(--red)"], ["Marked safe", "allowed", "var(--tx3)"]]
     .map(([label, a, c]) => {
       const values = a ? ba.values[a] || 0 : sm.unique24h || 0;
       const req = a ? ba.requests[a === "allowed" ? "ignored" : a] || 0 : allReq;
@@ -222,7 +222,7 @@ export function buildView({ data, ui, set, act, range, fit, test, events, sample
     const open = ui.openGroup === g.id;
     return {
       name: g.label, ruleCount: rs.length, total: fmt(sp.total), bar: sp.bar, open, chev: open ? "expand_more" : "chevron_right",
-      differs: cur !== "Default", badge: cur ? `Overrides default (${cap(mode)})` : "Mixed rule actions",
+      differs: cur !== "Default", badge: cur ? `${cur} instead of the default (${cap(mode)})` : "Rules in this group differ",
       toggle: () => set((u) => ({ openGroup: u.openGroup === g.id ? null : g.id })),
       rules: rs.map((r) => { const x = split([r.id]); return { name: r.label, total: fmt(x.total), bar: x.bar }; }),
       btns: ["Default", "Off", "Observe", "Redact", "Block"].map((a) => ({ label: a, style: seg(cur === a, ACOL[a]), on: () => confirmBlock(a) && act({ rules: Object.fromEntries(rs.map((r) => [r.id, a.toLowerCase()])) }) })),
@@ -306,9 +306,9 @@ export function buildView({ data, ui, set, act, range, fit, test, events, sample
   // Health
   const p95 = h.p95ScanMs ? `p95 ${fmt(h.p95ScanMs)} ms` : "—";
   const up = (() => { const s = (Date.now() - Date.parse(h.since)) / 1e3; return !Number.isFinite(s) ? "—" : s < 3600 ? `${Math.floor(s / 60)} min` : s < 86400 ? `${Math.floor(s / 3600)} h` : `${Math.floor(s / 86400)} d`; })();
-  const metrics = [["Scanner errors", fmt(h.errors), "fails open, never blocks", h.errors ? "var(--red)" : null], ["Requests scanned", fmt(h.requests), `${fmt(h.withFindings)} with findings`], ["Scan latency", p95, h.maxScanMs ? `max ${fmt(h.maxScanMs)} ms` : ""],
-    ["Known values", fmt(h.knownCount), h.knownUpdated ? `updated ${age(h.knownUpdated)}` : ""], ["Images not scanned", fmt(un.images), ocr.enabled ? "queue full or unreadable" : "OCR off", un.images ? "var(--amber)" : null], ["Files not scanned", fmt(un.files), ""],
-    ["Encrypted reasoning skipped", fmt(un.opaque), "cannot be read"], ["Uptime", up, `${fmt(h.seen)} values seen`]]
+  const metrics = [["Scanner errors", fmt(h.errors), "on error, the request still goes through", h.errors ? "var(--red)" : null], ["Requests scanned", fmt(h.requests), `${fmt(h.withFindings)} with findings`], ["Scan latency", p95, h.maxScanMs ? `max ${fmt(h.maxScanMs)} ms` : ""],
+    ["Vault values", fmt(h.knownCount), h.knownUpdated ? `updated ${age(h.knownUpdated)}` : ""], ["Images not scanned", fmt(un.images), ocr.enabled ? "queue was full or the file was unreadable" : "image OCR is off", un.images ? "var(--amber)" : null], ["Files not scanned", fmt(un.files), ""],
+    ["Encrypted reasoning skipped", fmt(un.opaque), "providers encrypt it, so it cannot be scanned"], ["Uptime", up, `${fmt(h.seen)} values seen`]]
     .map(([label, value, sub, c]) => ({ label, value, sub, c: c || "var(--tx)" }));
   const st = so.status || {};
   const ocrStats = [["Images scanned", fmt(so.totalImages), `${fmt(so.imagesWithHits)} with hits`], ["Read OK", fmt(st.scanned), `${fmt(st.partial)} partial · ${fmt(st.empty)} empty · ${fmt(st.skipped)} skipped`],

@@ -43,6 +43,13 @@ describe("prompt store", () => {
     await run({ system: "sys", messages: [...turn1, { role: "user", content: `second ${pan}` }, { role: "user", content: "third" }] }, "s1", "r3");
     expect(P.search({ requestId: "r3" }).rows.map((r) => P.message(r.id).text)).toEqual(["third"]);
   });
+  it("after a restart, a running session does not store its history again", async () => {
+    const turn1 = [{ role: "user", content: "first question" }];
+    await run({ messages: turn1 }, "s9", "a1");
+    P._forget();
+    await run({ messages: [...turn1, { role: "user", content: "second question" }] }, "s9", "a2");
+    expect(P.search({ requestId: "a2" }).rows.map((r) => P.message(r.id).text)).toEqual(["second question"]);
+  });
   it("without a session keeps the latest message only", async () => {
     await run({ messages: [{ role: "user", content: "old turn" }, { role: "user", content: "new turn" }] }, null);
     expect(P.search({}).rows.map((r) => P.message(r.id).text)).toEqual(["new turn"]);
