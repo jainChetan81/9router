@@ -210,14 +210,17 @@ export function setStickyComboModel(comboName, sessionId, model) {
  *
  * @param {string} comboName - Combo name
  * @param {string|null} [sessionId] - Specific session ID; omit to clear all for combo
+ * @param {string|null} [expectedModel] - Only clear if the session still points to this model
  */
-export function clearStickyComboSession(comboName, sessionId = null) {
+export function clearStickyComboSession(comboName, sessionId = null, expectedModel = null) {
   if (!comboName) {
     comboSessionModelStore.clear();
     return;
   }
   if (sessionId) {
-    comboSessionModelStore.delete(`${comboName}:${sessionId}`);
+    const key = `${comboName}:${sessionId}`;
+    if (expectedModel !== null && expectedModel !== undefined && comboSessionModelStore.get(key)?.model !== expectedModel) return;
+    comboSessionModelStore.delete(key);
     return;
   }
   // Clear all for this combo
