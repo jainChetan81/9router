@@ -26,6 +26,7 @@ export function getDefaultModel(aliasOrId) {
 // For these, we tolerate clients sending dashes ("claude-sonnet-4-5") by normalizing
 // digit-hyphen-digit to digit-dot-digit before lookup. Other providers are left untouched.
 const DOT_VERSION_PROVIDERS = new Set(["kr", "kiro"]);
+const THINKING_TIER_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 // Find a registry entry by id. For Kiro models, tolerates dash/dot version separators
 // ("claude-sonnet-4-5" ~= "claude-sonnet-4.5"). Other providers use exact match only.
@@ -40,6 +41,26 @@ function findModel(models, modelId, aliasOrId) {
   const normalized = normalizeModelId(baseModelId);
   if (normalized === baseModelId) return undefined;
   return models.find(m => m.id === normalized);
+}
+
+function nearestRegisteredThinkingTier(models, baseId, requestedTier, aliasOrId) {
+  if (typeof requestedTier !== "string" || !requestedTier) return requestedTier;
+  const normalizedRequest = requestedTier === "off" ? "none"
+    : requestedTier === "auto" ? "high"
+      : requestedTier;
+  const requestIndex = THINKING_TIER_ORDER.indexOf(normalizedRequest);
+  if (requestIndex < 0) return requestedTier;
+
+  const registeredTiers = THINKING_TIER_ORDER.filter((tier) =>
+    findModel(models, `${baseId}-${tier}`, aliasOrId)
+  );
+  if (!registeredTiers.length) return requestedTier;
+
+  return registeredTiers.reduce((closest, tier) => {
+    const distance = Math.abs(THINKING_TIER_ORDER.indexOf(tier) - requestIndex);
+    const closestDistance = Math.abs(THINKING_TIER_ORDER.indexOf(closest) - requestIndex);
+    return distance < closestDistance ? tier : closest;
+  }, registeredTiers[0]);
 }
 
 export function isValidModel(aliasOrId, modelId, passthroughProviders = new Set()) {
@@ -135,23 +156,40 @@ export function getModelUpstreamId(aliasOrId, modelId, clientBody = null, effort
   const rawSuffix = fixedLevel || (typeof effortOverride === "string" && effortOverride
     ? effortOverride.toLowerCase()
     : suffix ? suffix.slice(1, -1).trim().toLowerCase() : "");
-  let tier = rawSuffix === "xhigh" || rawSuffix === "max" ? "high" : rawSuffix === "minimal" ? "low" : rawSuffix;
+  let tier = rawSuffix;
   if (!tier && clientBody && typeof clientBody === "object") {
     const rawEffort = clientBody.reasoning_effort || clientBody.output_config?.effort || (typeof clientBody.reasoning === "object" ? clientBody.reasoning?.effort : null);
     if (typeof rawEffort === "string" && rawEffort) {
       const v = rawEffort.toLowerCase().trim();
-      tier = v === "xhigh" || v === "max" ? "high" : v === "minimal" ? "low" : v;
-    } else if (clientBody.thinking && typeof clientBody.thinking === "object") {
-      const b = Number(clientBody.thinking.budget_tokens);
-      if (Number.isFinite(b) && b > 0) {
-        tier = b > 16384 ? "high" : b <= 4096 ? "low" : "medium";
+      tier = v;
+    } else {
+      const geminiThinking = clientBody.thinkingConfig
+        || clientBody.generationConfig?.thinkingConfig
+        || clientBody.request?.generationConfig?.thinkingConfig;
+      if (typeof geminiThinking?.thinkingLevel === "string") {
+        tier = geminiThinking.thinkingLevel.toLowerCase().trim();
+      } else {
+        const thinking = clientBody.thinking;
+        const budget = geminiThinking?.thinkingBudget ?? thinking?.budget_tokens;
+        const b = Number(budget);
+        if (thinking?.type === "disabled" || b === 0) {
+          tier = "none";
+        } else if (thinking?.type === "adaptive" || (thinking?.type === "enabled" && !Number.isFinite(b)) || b < 0) {
+          tier = "auto";
+        } else if (Number.isFinite(b) && b > 0) {
+          tier = b > 16384 ? "high" : b <= 4096 ? "low" : "medium";
+        }
       }
     }
   }
+  // Select the closest registered variant when an effort has no exact model
+  // tier. This also canonicalizes the suffix to the tier the variant supports.
+  if (!fixedLevel) tier = nearestRegisteredThinkingTier(models, baseId, tier, aliasOrId);
 
   // Look for tiered variant first if a tier was requested (e.g. gemini-3.8-flash-high)
   const tieredId = tier ? `${baseId}-${tier}` : null;
-  const found = (tieredId && findModel(models, tieredId, aliasOrId)) || findModel(models, baseId, aliasOrId);
+  const tieredModel = tieredId && findModel(models, tieredId, aliasOrId);
+  const found = tieredModel || findModel(models, baseId, aliasOrId);
   const resolvedId = found?.upstreamModelId || found?.id;
   if (resolvedId) {
     const presetMatch = resolvedId.match(/\([^()]+\)\s*$/);
@@ -159,7 +197,9 @@ export function getModelUpstreamId(aliasOrId, modelId, clientBody = null, effort
     const resolvedBase = presetSuffix ? resolvedId.slice(0, presetMatch.index).trim() : resolvedId;
     const resolvedSuffix = fixedLevel
       ? `(${fixedLevel})`
-      : requestedSuffix || (presetSuffix && tier ? `(${tier})` : presetSuffix);
+      : tieredModel
+        ? (presetSuffix || `(${tier})`)
+        : requestedSuffix || (presetSuffix && tier ? `(${tier})` : presetSuffix);
     return resolvedBase + resolvedSuffix;
   }
   if (aliasOrId === "cx" && typeof baseId === "string" && baseId.endsWith(CODEX_REVIEW_SUFFIX)) {

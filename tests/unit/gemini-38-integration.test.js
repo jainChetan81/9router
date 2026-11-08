@@ -65,6 +65,36 @@ describe("Gemini 3.8 Antigravity tiers", () => {
     expect(upstreamModel).toBe(expectedUpstream);
   });
 
+  it.each([
+    ["Gemini thinkingLevel", { request: { generationConfig: { thinkingConfig: { thinkingLevel: "HIGH" } } } }, "gemini-3.8-flash-high(high)"],
+    ["Gemini 4096 thinkingBudget", { generationConfig: { thinkingConfig: { thinkingBudget: 4096 } } }, "gemini-3.8-flash-low(low)"],
+    ["adaptive thinking", { thinking: { type: "adaptive" } }, "gemini-3.8-flash-high(high)"],
+    ["disabled thinking", { thinking: { type: "disabled" } }, "gemini-3.8-flash-low(low)"],
+  ])("routes %s to its requested Gemini 3.8 tier", (_name, body, expectedUpstream) => {
+    expect(getModelUpstreamId("ag", "gemini-3.8-flash", body)).toBe(expectedUpstream);
+  });
+
+  it.each([
+    ["minimal client level", "gemini-3.8-flash", { thinkingConfig: { thinkingLevel: "minimal" } }, "low"],
+    ["explicit none suffix", "gemini-3.8-flash(none)", {}, "low"],
+    ["explicit minimal suffix", "gemini-3.8-flash(minimal)", {}, "low"],
+    ["explicit xhigh suffix", "gemini-3.8-flash(xhigh)", {}, "high"],
+  ])("maps %s to its nearest registered tier and supported thinking level", (_name, model, requestBody, tier) => {
+    const upstreamModel = getModelUpstreamId("ag", model, requestBody);
+    const body = { request: { contents: [], generationConfig: {} } };
+
+    applyThinking(
+      "antigravity",
+      upstreamModel,
+      body,
+      "antigravity",
+      requestBody.reasoning_effort === "none" ? { mode: "none" } : undefined,
+    );
+
+    expect(upstreamModel).toBe(`gemini-3.8-flash-${tier}(${tier})`);
+    expect(body.request.generationConfig.thinkingConfig.thinkingLevel).toBe(tier);
+  });
+
   it("preserves explicit model suffix over body", () => {
     const upstreamModel = getModelUpstreamId("ag", "gemini-3.8-flash(low)", { reasoning_effort: "high" });
     expect(upstreamModel).toBe("gemini-3.8-flash-low(low)");

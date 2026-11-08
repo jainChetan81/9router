@@ -61,7 +61,7 @@ export function resolveModelEffortSetting(modelOverrides, provider, model, onInv
     onInvalid({ key, effort: entry.effort, validChoices: fixed ? ["auto"] : ["auto", ...(levels || [])] });
     return null;
   }
-  return entry.effort;
+  return { effort: entry.effort, locked: entry.locked === true };
 }
 
 export function normalizeThinkingEffort(config) {

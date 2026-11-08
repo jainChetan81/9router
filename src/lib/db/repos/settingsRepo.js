@@ -128,7 +128,7 @@ export async function updateSettings(updates) {
   return mergeWithDefaults(next);
 }
 
-export async function updateModelEffortOverride(key, effort) {
+export async function updateModelEffortOverride(key, effort, locked = false) {
   const db = await getAdapter();
   let next;
   db.transaction(function () {
@@ -136,7 +136,7 @@ export async function updateModelEffortOverride(key, effort) {
     const current = row ? parseJson(row.data, {}) : {};
     const modelOverrides = { ...(current.modelOverrides || {}) };
     if (effort == null) delete modelOverrides[key];
-    else modelOverrides[key] = { effort };
+    else modelOverrides[key] = { effort, locked: locked === true };
     next = { ...current, modelOverrides };
     db.run(
       `INSERT INTO settings(id, data) VALUES(1, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data`,

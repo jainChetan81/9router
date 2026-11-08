@@ -24,7 +24,17 @@ describe("per-model effort resolution", () => {
 
   it("resolves a saved model setting for a Codex hyphen effort suffix", () => {
     const overrides = { "codex/gpt-6-luna": { effort: "low" } };
-    expect(resolveModelEffortSetting(overrides, "cx", "gpt-6-luna-max")).toBe("low");
+    expect(resolveModelEffortSetting(overrides, "cx", "gpt-6-luna-max")).toEqual({ effort: "low", locked: false });
+  });
+
+  it("treats legacy entries without a lock field as saved defaults", () => {
+    expect(resolveModelEffortSetting({ "codex/gpt-6-luna": { effort: "medium" } }, "codex", "gpt-6-luna"))
+      .toEqual({ effort: "medium", locked: false });
+  });
+
+  it("preserves an explicit lock flag", () => {
+    expect(resolveModelEffortSetting({ "codex/gpt-6-luna": { effort: "high", locked: true } }, "codex", "gpt-6-luna"))
+      .toEqual({ effort: "high", locked: true });
   });
 
   it("resolves each target model independently for combo fallbacks", () => {
@@ -33,8 +43,8 @@ describe("per-model effort resolution", () => {
       "openai/gpt-6-luna": { effort: "low" },
     };
 
-    expect(resolveModelEffortSetting(overrides, "cx", "gpt-6-luna")).toBe("high");
-    expect(resolveModelEffortSetting(overrides, "openai", "gpt-6-luna")).toBe("low");
+    expect(resolveModelEffortSetting(overrides, "cx", "gpt-6-luna")).toEqual({ effort: "high", locked: false });
+    expect(resolveModelEffortSetting(overrides, "openai", "gpt-6-luna")).toEqual({ effort: "low", locked: false });
     expect(resolveModelEffortSetting(overrides, "codex", "gpt-6-astra")).toBeNull();
   });
 

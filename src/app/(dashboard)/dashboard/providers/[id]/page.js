@@ -9,6 +9,9 @@ import { Card, Button, Badge, Input, Modal, CardSkeleton, OAuthModal, KiroOAuthW
 import { OAUTH_PROVIDERS, APIKEY_PROVIDERS, FREE_PROVIDERS, FREE_TIER_PROVIDERS, WEB_COOKIE_PROVIDERS, getProviderAlias, isOpenAICompatibleProvider, isAnthropicCompatibleProvider, AI_PROVIDERS } from "@/shared/constants/providers";
 import { getModelsByProviderId, getModelKind } from "@/shared/constants/models";
 import { getThinkingLevels } from "open-sse/providers/thinkingLevels.js";
+import { getModelTargetFormat } from "open-sse/config/providerModels.js";
+import { resolveProviderDefaultEffort } from "open-sse/services/modelEffortDefaults.js";
+import { mergeSavedModelOverride } from "./modelEffortState.js";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 import { useModelCaps } from "@/shared/hooks/useModelCaps";
 import { translate } from "@/i18n/runtime";
@@ -192,6 +195,13 @@ export default function ProviderDetailPage() {
     return levels && levels.includes(thinkingMode) ? thinkingMode : null;
   };
   const providerStorageAlias = isCompatible ? providerId : providerAlias;
+  const providerThinking = thinkingMode === "auto" ? null : { mode: thinkingMode };
+  const getProviderDefaultEffort = (modelId) => resolveProviderDefaultEffort({
+    provider: providerId,
+    model: modelId,
+    providerThinking,
+    targetFormat: getModelTargetFormat(providerId, modelId),
+  });
   // Union of levels across this provider's reasoning models — drives the level picker options.
   // Include custom models too (e.g. manually added gpt-5.6-sol → max).
   const providerThinkingLevels = (() => {
@@ -449,17 +459,17 @@ export default function ProviderDetailPage() {
     }
   };
 
-  const saveModelEffort = async (modelId, effort) => {
+  const saveModelEffort = async (modelId, { effort, locked }) => {
     setModelEffortError("");
     try {
       const res = await fetch("/api/settings/model-effort", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider: providerId, model: modelId, effort }),
+        body: JSON.stringify({ provider: providerId, model: modelId, effort, locked }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed to save model effort");
-      setModelOverrides(data.modelOverrides || {});
+      setModelOverrides((current) => mergeSavedModelOverride(current, data.key, data.modelOverrides));
     } catch (error) {
       setModelEffortError(error.message || "Failed to save model effort");
       throw error;
@@ -1201,6 +1211,7 @@ export default function ProviderDetailPage() {
           connections={connections}
           isAnthropic={isAnthropicCompatible}
           modelOverrides={modelOverrides}
+          getProviderDefaultEffort={getProviderDefaultEffort}
           onModelEffortChange={saveModelEffort}
         />
       );
@@ -1248,7 +1259,7 @@ export default function ProviderDetailPage() {
             isFree={false}
             caps={getCaps(`${providerId}/${model.id}`)}
             thinkingSuffix={resolveThinkingSuffix(model.id)}
-            effortControl={<ModelEffortSelect providerId={providerId} modelId={model.id} modelOverrides={modelOverrides} onChange={saveModelEffort} />}
+            effortControl={<ModelEffortSelect providerId={providerId} modelId={model.id} modelOverrides={modelOverrides} providerDefaultEffort={getProviderDefaultEffort(model.id)} onChange={saveModelEffort} />}
           />
         ))}
 
@@ -1275,7 +1286,7 @@ export default function ProviderDetailPage() {
               onDisable={() => handleDisableModel(model.id)}
               caps={getCaps(`${providerId}/${model.id}`)}
               thinkingSuffix={resolveThinkingSuffix(model.id)}
-              effortControl={<ModelEffortSelect providerId={providerId} modelId={model.id} modelOverrides={modelOverrides} onChange={saveModelEffort} />}
+              effortControl={<ModelEffortSelect providerId={providerId} modelId={model.id} modelOverrides={modelOverrides} providerDefaultEffort={getProviderDefaultEffort(model.id)} onChange={saveModelEffort} />}
             />
           );
         })}
@@ -1813,12 +1824,12 @@ export default function ProviderDetailPage() {
                   className="rounded-md border border-border bg-background px-2 py-1 text-xs focus:border-primary focus:outline-none"
                 >
                   {providerThinkingLevels.map((opt) => (
-                    <option key={opt} value={opt}>{`Thinking: ${opt.charAt(0).toUpperCase() + opt.slice(1)}`}</option>
+                    <option key={opt} value={opt}>{`Thinking: ${opt === "auto" ? "Provider default" : opt.charAt(0).toUpperCase() + opt.slice(1)}`}</option>
                   ))}
                 </select>
               )}
             </div>
-            <p className="text-xs text-text-muted">Auto respects client requests and defaults. A selected level applies to every request for this model.</p>
+            <p className="text-xs text-text-muted">Provider default respects client requests and provider settings. A selected level sets a saved default. Lock overrides client effort and model suffixes.</p>
             {!!modelEffortError && <p className="text-xs text-red-500">{modelEffortError}</p>}
           </div>
           {!isCompatible && (() => {

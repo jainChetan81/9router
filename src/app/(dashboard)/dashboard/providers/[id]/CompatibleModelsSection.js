@@ -5,7 +5,7 @@ import PropTypes from "prop-types";
 import { Button } from "@/shared/components";
 import { getProviderCustomModelRows } from "@/shared/utils/providerCustomModels";
 import ModelEffortSelect from "./ModelEffortSelect";
-function CompatibleModelRow({ providerId, modelId, fullModel, copied, onCopy, onDeleteAlias, onTest, testStatus, isTesting, modelOverrides, onModelEffortChange }) {
+function CompatibleModelRow({ providerId, modelId, fullModel, copied, onCopy, onDeleteAlias, onTest, testStatus, isTesting, modelOverrides, providerDefaultEffort, onModelEffortChange }) {
   const borderColor = testStatus === "ok"
     ? "border-green-500/40"
     : testStatus === "error"
@@ -30,7 +30,7 @@ function CompatibleModelRow({ providerId, modelId, fullModel, copied, onCopy, on
         <p className="text-sm font-medium truncate">{modelId}</p>
         <div className="flex items-center gap-1 mt-1">
           <code className="text-xs text-text-muted font-mono bg-sidebar px-1.5 py-0.5 rounded">{fullModel}</code>
-          <ModelEffortSelect providerId={providerId} modelId={modelId} modelOverrides={modelOverrides} onChange={onModelEffortChange} />
+          <ModelEffortSelect providerId={providerId} modelId={modelId} modelOverrides={modelOverrides} providerDefaultEffort={providerDefaultEffort} onChange={onModelEffortChange} />
           <div className="relative group/btn">
             <button
               onClick={() => onCopy(fullModel, `model-${modelId}`)}
@@ -73,7 +73,7 @@ function CompatibleModelRow({ providerId, modelId, fullModel, copied, onCopy, on
   );
 }
 
-export default function CompatibleModelsSection({ providerId, providerStorageAlias, providerDisplayAlias, modelAliases, customModels, copied, onCopy, onDeleteAlias, onAddCustomModel, onDeleteCustomModel, connections, isAnthropic, modelOverrides, onModelEffortChange }) {
+export default function CompatibleModelsSection({ providerId, providerStorageAlias, providerDisplayAlias, modelAliases, customModels, copied, onCopy, onDeleteAlias, onAddCustomModel, onDeleteCustomModel, connections, isAnthropic, modelOverrides, getProviderDefaultEffort, onModelEffortChange }) {
   const [newModel, setNewModel] = useState("");
   const [adding, setAdding] = useState(false);
   const [importing, setImporting] = useState(false);
@@ -210,6 +210,7 @@ export default function CompatibleModelsSection({ providerId, providerStorageAli
               testStatus={modelTestResults[id]}
               isTesting={testingModelId === id}
               modelOverrides={modelOverrides}
+              providerDefaultEffort={getProviderDefaultEffort(id)}
               onModelEffortChange={onModelEffortChange}
             />
           ))}
@@ -236,5 +237,6 @@ CompatibleModelsSection.propTypes = {
   })).isRequired,
   isAnthropic: PropTypes.bool,
   modelOverrides: PropTypes.object,
+  getProviderDefaultEffort: PropTypes.func.isRequired,
   onModelEffortChange: PropTypes.func.isRequired,
 };

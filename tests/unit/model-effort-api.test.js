@@ -26,6 +26,21 @@ describe("model effort settings API", () => {
 
     expect(response.status).toBe(400);
     expect(data.validChoices).toEqual(["auto", "low", "medium", "high", "xhigh", "max"]);
+    expect(data.error).toContain("Provider default");
+    expect(updateModelEffortOverride).not.toHaveBeenCalled();
+  });
+
+  it.each([null, "true", 1])("rejects a non-boolean lock value before writing: %s", async (locked) => {
+    const response = await PATCH(request({ provider: "cx", model: "gpt-6-luna", effort: "high", locked }));
+
+    expect(response.status).toBe(400);
+    expect(updateModelEffortOverride).not.toHaveBeenCalled();
+  });
+
+  it("requires an effort value or clear sentinel", async () => {
+    const response = await PATCH(request({ provider: "cx", model: "gpt-6-luna" }));
+
+    expect(response.status).toBe(400);
     expect(updateModelEffortOverride).not.toHaveBeenCalled();
   });
 
@@ -55,8 +70,35 @@ describe("model effort settings API", () => {
 
   it("writes a valid setting using the canonical provider key", async () => {
     const response = await PATCH(request({ provider: "cx", model: "gpt-6-luna", effort: "high" }));
+    const data = await response.json();
 
     expect(response.status).toBe(200);
-    expect(updateModelEffortOverride).toHaveBeenCalledWith("codex/gpt-6-luna", "high");
+    expect(updateModelEffortOverride).toHaveBeenCalledWith("codex/gpt-6-luna", "high", false);
+    expect(data).toMatchObject({ key: "codex/gpt-6-luna", effort: "high", locked: false, modelOverrides: {} });
+  });
+
+  it("stores an explicit locked setting", async () => {
+    const response = await PATCH(request({ provider: "cx", model: "gpt-6-luna", effort: "high", locked: true }));
+    const data = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(updateModelEffortOverride).toHaveBeenCalledWith("codex/gpt-6-luna", "high", true);
+    expect(data.locked).toBe(true);
+  });
+
+  it.each([null, "auto"])("clears a saved setting with %s", async (effort) => {
+    const response = await PATCH(request({ provider: "cx", model: "gpt-6-luna", effort }));
+    const data = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(updateModelEffortOverride).toHaveBeenCalledWith("codex/gpt-6-luna", null, false);
+    expect(data).toMatchObject({ key: "codex/gpt-6-luna", effort: "auto", locked: false, modelOverrides: {} });
+  });
+
+  it("rejects locking a cleared setting", async () => {
+    const response = await PATCH(request({ provider: "cx", model: "gpt-6-luna", effort: "auto", locked: true }));
+
+    expect(response.status).toBe(400);
+    expect(updateModelEffortOverride).not.toHaveBeenCalled();
   });
 });

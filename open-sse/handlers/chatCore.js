@@ -29,11 +29,13 @@ import { compressMessages, formatRtkLog } from "../rtk/index.js";
 import { compressWithHeadroom, formatHeadroomLog, formatHeadroomSizeLog, isHeadroomPhantomSavings } from "../rtk/headroom.js";
 import { compressWithPxpipe } from "../rtk/pxpipe.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
+import { getThinkingLevels } from "../providers/thinkingLevels.js";
 import { stripUnsupportedModalities } from "../translator/concerns/modality.js";
 import { getFixedEffortLevel, getModelEffortKey, normalizeThinkingEffort, resolveModelEffortSetting } from "../services/modelEffort.js";
 import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
 import { defaultClaudeToolType, shouldDefaultClaudeToolType } from "../translator/concerns/toolCall.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
+import { parseModelEffortSuffix } from "../utils/modelEffortSuffix.js";
 
 /**
  * Core chat handler - shared between SSE and Worker
@@ -60,6 +62,42 @@ export function stripContinuityFields(body) {
     }
   }
   return body;
+}
+
+function hasValidNativeGeminiThinking(body, provider, model) {
+  const config = body?.thinkingConfig
+    || body?.generationConfig?.thinkingConfig
+    || body?.request?.generationConfig?.thinkingConfig;
+  if (!config || typeof config !== "object") return false;
+
+  // A native config cannot make a non-native effort field safe to forward.
+  if (typeof body.reasoning_effort === "string"
+    || typeof body.reasoning?.effort === "string"
+    || typeof body.output_config?.effort === "string"
+    || (body.thinking && typeof body.thinking === "object")) return false;
+
+  const capabilities = getCapabilitiesForModel(provider, model);
+  if (typeof config.thinkingLevel === "string") {
+    const level = config.thinkingLevel.toLowerCase();
+    if (config.thinkingLevel !== level
+      || capabilities.thinkingFormat !== "gemini-level"
+      || !getThinkingLevels(provider, model)?.includes(level)) return false;
+
+    const selectedModel = getModelUpstreamId(PROVIDER_ID_TO_ALIAS[provider] || provider, model, body);
+    const selectedTier = parseSuffix(selectedModel).override;
+    return selectedTier?.mode !== "level" || selectedTier.level === level;
+  }
+
+  if (!Object.hasOwn(config, "thinkingBudget") || config.thinkingBudget == null) return false;
+  if (capabilities.thinkingFormat !== "gemini-budget") return false;
+
+  const budget = Number(config.thinkingBudget);
+  if (!Number.isFinite(budget) || (budget === 0 && capabilities.thinkingCanDisable === false)) return false;
+  if (budget === -1) return true;
+
+  const range = capabilities.thinkingRange;
+  return (range?.min == null || budget >= range.min)
+    && (range?.max == null || budget <= range.max);
 }
 
 export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, customPromptEnabled, customPrompt, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, providerOverrides, modelOverrides }) {
@@ -124,16 +162,26 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // A fixed preset always pins the translated request, even when the client
   // provides no effort. The executor may select the level from the model ID.
   const fixedEffortApplied = fixedEffort != null;
+  // Capture suffix intent before a saved setting can add its own suffix. This
+  // also normalizes supported Codex hyphen suffixes for precedence checks.
+  const inputSuffixSyntax = parseModelEffortSuffix(model, { allowHyphen: true }).syntax;
+  const explicitSuffixIntent = parseSuffix(model).override
+    || (inputSuffixSyntax === "hyphenated" && !modelMeta
+      ? parseSuffix(getModelUpstreamId(alias, model, null, null)).override
+      : null);
+  const modelEffortSettingWins = Boolean(modelEffortSetting && !fixedEffortApplied && !fixedEffortInModelId && (
+    modelEffortSetting.locked || (!explicitSuffixIntent && !originalThinkingIntent)
+  ));
   const modelEffortOverride = fixedEffortInModelId
     ? null
-    : fixedEffortApplied ? fixedEffort : modelEffortSetting;
-  const modelSuffixModel = getModelUpstreamId(alias, model, null, modelEffortOverride);
-  const modelSuffixIntent = parseSuffix(modelSuffixModel).override;
-
+    : fixedEffortApplied
+      ? fixedEffort
+      : modelEffortSettingWins
+        ? modelEffortSetting.effort
+        : null;
   // Inject provider-level thinking config override when the client has no intent.
   // on/off → extended type (body.thinking), none/low/medium/high → effort type (body.reasoning_effort)
-  const hasClientThinkingIntent = extractThinking(body) !== null;
-  if (providerThinking?.mode && providerThinking.mode !== "auto" && !hasClientThinkingIntent && !modelEffortOverride && !modelSuffixIntent && !fixedEffortInModelId) {
+  if (providerThinking?.mode && providerThinking.mode !== "auto" && !originalThinkingIntent && !modelEffortOverride && !explicitSuffixIntent && !fixedEffortInModelId) {
     const mode = providerThinking.mode;
     providerDefaultApplied = true;
     if (mode === "on") {
@@ -147,17 +195,27 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   }
 
   const upstreamModel = getModelUpstreamId(alias, model, body, modelEffortOverride);
-  const explicitSuffix = parseSuffix(model).override;
   const routedSuffix = parseSuffix(upstreamModel).override;
-  let effortSource = modelEffortSetting
-    ? "model-setting"
-    : explicitSuffix || routedSuffix || fixedEffortApplied
-      ? "suffix"
-      : originalThinkingIntent
-        ? "client"
-        : providerDefaultApplied
-          ? "provider-default"
-          : null;
+  const normalizedModelEffortOverride = modelEffortOverride && routedSuffix?.mode === "level"
+    ? routedSuffix.level
+    : modelEffortOverride;
+  // Intent-selected registered variants carry their normalized tier in the
+  // suffix. Keep it for thinking conversion; strip registry fallback suffixes
+  // when no request or setting selected that tier.
+  const hasSelectedThinkingIntent = fixedEffortApplied || fixedEffortInModelId
+    || modelEffortOverride || explicitSuffixIntent || originalThinkingIntent || providerDefaultApplied;
+  const thinkingModel = hasSelectedThinkingIntent ? upstreamModel : stripThinkingSuffix(upstreamModel);
+  let effortSource = fixedEffortApplied
+    ? "suffix"
+    : modelEffortSettingWins
+      ? modelEffortSetting.locked ? "model-lock" : "model-default"
+      : explicitSuffixIntent
+        ? "suffix"
+        : originalThinkingIntent
+          ? "client"
+          : providerDefaultApplied
+            ? "provider-default"
+            : null;
 
   // Per-request opt-out: client can bypass all token savers via header
   const tokenSaverEnabled = clientRawRequest?.headers?.[TOKEN_SAVER_HEADER]?.toLowerCase() !== "off";
@@ -233,7 +291,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     if (provider === "codex") {
       const normalizedThinking = {};
       const providerDefault = providerDefaultApplied ? extractThinking(translatedBody) : undefined;
-      applyThinking(sourceFormat, upstreamModel, normalizedThinking, provider, providerDefault, modelEffortOverride);
+      applyThinking(sourceFormat, thinkingModel, normalizedThinking, provider, providerDefault ?? originalThinkingIntent, normalizedModelEffortOverride);
       const effort = normalizedThinking.reasoning_effort
         ?? (typeof normalizedThinking.reasoning === "object" ? normalizedThinking.reasoning.effort : null);
       if (typeof effort === "string") {
@@ -244,27 +302,35 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
         };
         delete translatedBody.reasoning_effort;
       }
-    } else if (modelEffortOverride || routedSuffix || providerDefaultApplied) {
-      const priorOutputConfig = translatedBody.output_config && typeof translatedBody.output_config === "object"
-        ? { ...translatedBody.output_config }
-        : null;
-      applyThinking(sourceFormat, upstreamModel, translatedBody, provider, undefined, modelEffortOverride);
-      if (priorOutputConfig) {
-        const normalizedOutputConfig = translatedBody.output_config && typeof translatedBody.output_config === "object"
-          ? translatedBody.output_config
-          : {};
-        const effort = normalizedOutputConfig.effort;
-        delete priorOutputConfig.effort;
-        const outputConfig = { ...priorOutputConfig, ...normalizedOutputConfig };
-        if (effort !== undefined) outputConfig.effort = effort;
-        if (Object.keys(outputConfig).length) translatedBody.output_config = outputConfig;
-        else delete translatedBody.output_config;
+    } else {
+      const nativeGeminiIntentIsValid = originalThinkingIntent
+        && (clientTool === "gemini-cli" || clientTool === "antigravity")
+        && hasValidNativeGeminiThinking(body, provider, model);
+      const shouldNormalizeThinking = modelEffortOverride || fixedEffortInModelId
+        || explicitSuffixIntent || providerDefaultApplied
+        || (!nativeGeminiIntentIsValid && (routedSuffix || originalThinkingIntent));
+      if (shouldNormalizeThinking) {
+        const priorOutputConfig = translatedBody.output_config && typeof translatedBody.output_config === "object"
+          ? { ...translatedBody.output_config }
+          : null;
+        applyThinking(sourceFormat, thinkingModel, translatedBody, provider, originalThinkingIntent, normalizedModelEffortOverride);
+        if (priorOutputConfig) {
+          const normalizedOutputConfig = translatedBody.output_config && typeof translatedBody.output_config === "object"
+            ? translatedBody.output_config
+            : {};
+          const effort = normalizedOutputConfig.effort;
+          delete priorOutputConfig.effort;
+          const outputConfig = { ...priorOutputConfig, ...normalizedOutputConfig };
+          if (effort !== undefined) outputConfig.effort = effort;
+          if (Object.keys(outputConfig).length) translatedBody.output_config = outputConfig;
+          else delete translatedBody.output_config;
+        }
       }
     }
     // Normalize newer Cowork/CC beta shapes (adaptive thinking, mid-conversation system) the API rejects
     if (clientTool === "claude") normalizeClaudePassthrough(translatedBody, translatedBody.model);
   } else {
-    translatedBody = translateRequest(sourceFormat, targetFormat, upstreamModel, body, stream, credentials, provider, reqLogger, stripList, connectionId, clientTool, modelEffortOverride);
+    translatedBody = translateRequest(sourceFormat, targetFormat, upstreamModel, body, stream, credentials, provider, reqLogger, stripList, connectionId, clientTool, normalizedModelEffortOverride, thinkingModel);
     if (!translatedBody) {
       trackPendingRequest(model, provider, connectionId, false, true);
       return createErrorResult(HTTP_STATUS.BAD_REQUEST, `Failed to translate request for ${sourceFormat} → ${targetFormat}`);

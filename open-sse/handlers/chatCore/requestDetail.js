@@ -123,7 +123,7 @@ export function spendMeta(clientRawRequest, tokens) {
   const meta = {
     clientEffort: typeof clientRawRequest?.effort?.clientEffort === "string" ? clientRawRequest.effort.clientEffort : null,
     sentEffort: typeof clientRawRequest?.effort?.sentEffort === "string" ? clientRawRequest.effort.sentEffort : null,
-    effortSource: ["model-setting", "suffix", "client", "provider-default", "executor-default", "none"].includes(clientRawRequest?.effort?.effortSource)
+    effortSource: ["model-setting", "model-lock", "model-default", "suffix", "client", "provider-default", "executor-default", "none"].includes(clientRawRequest?.effort?.effortSource)
       ? clientRawRequest.effort.effortSource
       : "none",
   };
