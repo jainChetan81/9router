@@ -103,10 +103,21 @@ export function getModelUpstreamId(aliasOrId, modelId, clientBody = null, effort
     : suffix;
   const models = PROVIDER_MODELS[aliasOrId];
 
+  // Some tiered model IDs are fixed presets (for example, gemini-3.8-flash-high
+  // maps to an upstream ID ending in (high)). Their registered preset wins over
+  // client effort and saved effort overrides. Plain aliases without a matching
+  // effort suffix remain selectable from client intent below.
+  const registeredModel = findModel(models, baseId, aliasOrId);
+  const presetLevel = registeredModel?.upstreamModelId?.match(/\(([^()]+)\)\s*$/)?.[1]?.toLowerCase();
+  const idLevel = typeof baseId === "string"
+    ? baseId.match(/-(none|minimal|low|medium|high|xhigh|max)$/i)?.[1]?.toLowerCase()
+    : null;
+  const fixedLevel = idLevel && presetLevel === idLevel ? presetLevel : null;
+
   // Resolve requested thinking level from suffix or client request body
-  const rawSuffix = typeof effortOverride === "string" && effortOverride
+  const rawSuffix = fixedLevel || (typeof effortOverride === "string" && effortOverride
     ? effortOverride.toLowerCase()
-    : suffix ? suffix.slice(1, -1).trim().toLowerCase() : "";
+    : suffix ? suffix.slice(1, -1).trim().toLowerCase() : "");
   let tier = rawSuffix === "xhigh" || rawSuffix === "max" ? "high" : rawSuffix === "minimal" ? "low" : rawSuffix;
   if (!tier && clientBody && typeof clientBody === "object") {
     const rawEffort = clientBody.reasoning_effort || clientBody.output_config?.effort || (typeof clientBody.reasoning === "object" ? clientBody.reasoning?.effort : null);
@@ -129,7 +140,9 @@ export function getModelUpstreamId(aliasOrId, modelId, clientBody = null, effort
     const presetMatch = resolvedId.match(/\([^()]+\)\s*$/);
     const presetSuffix = presetMatch?.[0] || "";
     const resolvedBase = presetSuffix ? resolvedId.slice(0, presetMatch.index).trim() : resolvedId;
-    const resolvedSuffix = requestedSuffix || (presetSuffix && tier ? `(${tier})` : presetSuffix);
+    const resolvedSuffix = fixedLevel
+      ? `(${fixedLevel})`
+      : requestedSuffix || (presetSuffix && tier ? `(${tier})` : presetSuffix);
     return resolvedBase + resolvedSuffix;
   }
   if (aliasOrId === "cx" && typeof baseId === "string" && baseId.endsWith(CODEX_REVIEW_SUFFIX)) {
