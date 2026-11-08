@@ -532,8 +532,12 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const sentThinking = extractThinking(sentBody);
   const sentKiroEffort = sentBody?.additionalModelRequestFields?.output_config?.effort
     ?? sentBody?.additionalModelRequestFields?.reasoning?.effort;
+  const sentKiroBudgetEffort = Number.isFinite(sentBody?._kiroThinkingBudget) && sentBody._kiroThinkingBudget > 0
+    ? normalizeThinkingEffort({ mode: "budget", budget: sentBody._kiroThinkingBudget })
+    : null;
   const sentEffort = normalizeThinkingEffort(sentThinking)
     ?? (typeof sentKiroEffort === "string" ? sentKiroEffort.toLowerCase() : null)
+    ?? sentKiroBudgetEffort
     ?? normalizeThinkingEffort(parseSuffix(sentBody?.model).override);
   if (!effortSource) effortSource = sentEffort === null ? "none" : "executor-default";
   if (clientRawRequest) {

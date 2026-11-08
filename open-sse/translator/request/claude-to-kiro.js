@@ -374,6 +374,10 @@ export function claudeToKiroRequest(model, body, stream, credentials, thinkingIn
     value: upstreamModel,
     enumerable: false,
   });
+  Object.defineProperty(payload, "_kiroThinkingBudget", {
+    value: thinkingBudget,
+    enumerable: false,
+  });
 
   // Kiro tool specs get sanitized names (`mcp__a__b` → `mcp_a_b`); keep the
   // reverse map so tool calls stream back under the client's own names.
