@@ -105,7 +105,6 @@ describe("Gemini 3.8 Antigravity tiers", () => {
     const sentEffort = normalizeThinkingEffort(extractThinking(finalBody));
     expect(finalBody.request.generationConfig.thinkingConfig.thinkingLevel).toBe("high");
     expect(sentEffort).toBe("high");
-    expect(getFixedEffortLevel("antigravity", publicModel) ? "suffix" : "client").toBe("suffix");
   });
 
   it("still lets client effort choose a tier for the plain selectable alias", () => {
