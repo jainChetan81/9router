@@ -190,7 +190,7 @@ describe("bare-upstream fixed-effort presets", () => {
     expect(usage.meta).toMatchObject({ clientEffort: "high", sentEffort: "medium", effortSource: "suffix" });
   });
 
-  it("keeps a stale saved setting from overriding a fixed no-thinking preset", async () => {
+  it.each([false, true])("keeps a stale saved setting from overriding a fixed no-thinking preset (locked=%s)", async (locked) => {
     const body = {
       model: "deepseek-v4-pro-none",
       stream: false,
@@ -201,7 +201,7 @@ describe("bare-upstream fixed-effort presets", () => {
       provider: "deepseek",
       model: "deepseek-v4-pro-none",
       body,
-      modelOverrides: { "deepseek/deepseek-v4-pro-none": { effort: "high" } },
+      modelOverrides: { "deepseek/deepseek-v4-pro-none": { effort: "high", locked } },
     });
 
     expect(result.success).toBe(true);

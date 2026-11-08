@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { CodexExecutor } from "../../open-sse/executors/codex.js";
 
 const { executeMock, forcedSSEToJsonMock } = vi.hoisted(() => ({
   executeMock: vi.fn(),
@@ -106,6 +107,40 @@ async function runNativeClaudeRequest(model, outputConfig, modelOverrides = {}, 
   return executeMock.mock.calls.at(-1)[0].body;
 }
 
+async function runNativeGeminiCliRequest(model, bodyFields = {}, modelOverrides = {}) {
+  const body = {
+    model,
+    contents: [{ role: "user", parts: [{ text: "hello" }] }],
+    stream: false,
+    ...bodyFields,
+  };
+
+  await handleChatCore({
+    body,
+    modelInfo: { provider: "gemini-cli", model },
+    credentials: { accessToken: "test-token", providerSpecificData: {} },
+    log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn() },
+    connectionId: "test-connection",
+    rtkEnabled: false,
+    headroomEnabled: false,
+    cavemanEnabled: false,
+    ponytailEnabled: false,
+    pxpipeEnabled: false,
+    sourceFormatOverride: "gemini-cli",
+    modelOverrides,
+    clientRawRequest: {
+      endpoint: "/v1internal:generateContent",
+      body,
+      headers: {
+        accept: "application/json",
+        "user-agent": "gemini-cli/0.34.0",
+      },
+    },
+  });
+
+  return executeMock.mock.calls.at(-1)[0].body;
+}
+
 describe("native Codex passthrough thinking suffixes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -128,6 +163,25 @@ describe("native Codex passthrough thinking suffixes", () => {
     expect(body.reasoning).toEqual({ effort: "ultra" });
   });
 
+  it("forwards Claude output_config effort through the real Codex transform", async () => {
+    const body = await runNativeCodexRequest(
+      "gpt-6-luna",
+      null,
+      { "codex/gpt-6-luna": { effort: "medium" } },
+      null,
+      { output_config: { effort: "high" } },
+    );
+
+    const transformed = new CodexExecutor().transformRequest(
+      "gpt-6-luna",
+      body,
+      false,
+      { connectionId: "test-connection", providerSpecificData: {} },
+    );
+
+    expect(transformed.reasoning.effort).toBe("high");
+  });
+
   it("converts unsupported Luna Ultra to Max without dropping reasoning metadata", async () => {
     const body = await runNativeCodexRequest("gpt-5.6-luna(ultra)", {
       effort: "low",
@@ -140,11 +194,72 @@ describe("native Codex passthrough thinking suffixes", () => {
 
   it("applies the saved model effort to a native passthrough request", async () => {
     const body = await runNativeCodexRequest("gpt-6-luna(high)", { effort: "low" }, {
-      "codex/gpt-6-luna": { effort: "medium" },
+      "codex/gpt-6-luna": { effort: "medium", locked: true },
     });
 
     expect(body.model).toBe("gpt-6-luna");
     expect(body.reasoning.effort).toBe("medium");
+  });
+
+  it("uses an unlocked saved effort when the client has no effort intent", async () => {
+    const body = await runNativeCodexRequest("gpt-6-luna", null, {
+      "codex/gpt-6-luna": { effort: "medium" },
+    });
+
+    expect(body.reasoning.effort).toBe("medium");
+  });
+
+  it("preserves client effort over an unlocked saved effort", async () => {
+    const body = await runNativeCodexRequest("gpt-6-luna", { effort: "low" }, {
+      "codex/gpt-6-luna": { effort: "medium" },
+    });
+
+    expect(body.reasoning.effort).toBe("low");
+  });
+
+  it("converts Gemini CLI reasoning_effort to native thinkingConfig over an unlocked saved default", async () => {
+    const body = await runNativeGeminiCliRequest("gemini-2.5-flash", {
+      reasoning_effort: "high",
+    }, {
+      "gemini-cli/gemini-2.5-flash": { effort: "medium" },
+    });
+
+    expect(body.reasoning_effort).toBeUndefined();
+    expect(body.generationConfig.thinkingConfig).toEqual({
+      thinkingBudget: 24576,
+      includeThoughts: true,
+    });
+  });
+
+  it("clamps native Gemini thinkingBudget zero when the model cannot disable thinking", async () => {
+    const body = await runNativeGeminiCliRequest("gemini-3.1-pro-preview", {
+      generationConfig: { thinkingConfig: { thinkingBudget: 0 } },
+    });
+
+    expect(body.generationConfig.thinkingConfig).toEqual({
+      thinkingLevel: "minimal",
+      includeThoughts: false,
+    });
+  });
+
+  it("leaves a valid native Gemini budget untouched without a winning override", async () => {
+    const nativeThinkingConfig = { thinkingBudget: 8192, includeThoughts: false };
+    const body = await runNativeGeminiCliRequest("gemini-2.5-flash", {
+      generationConfig: { thinkingConfig: nativeThinkingConfig },
+    }, {
+      "gemini-cli/gemini-2.5-flash": { effort: "medium" },
+    });
+
+    expect(body.generationConfig.thinkingConfig).toEqual(nativeThinkingConfig);
+    expect(body.generationConfig).toEqual({ thinkingConfig: nativeThinkingConfig });
+  });
+
+  it("preserves a Codex hyphen suffix over an unlocked saved effort", async () => {
+    const body = await runNativeCodexRequest("gpt-6-luna-max", null, {
+      "codex/gpt-6-luna": { effort: "low" },
+    });
+
+    expect(body.reasoning.effort).toBe("max");
   });
 
   it("lets a Codex hyphen suffix override client effort on native passthrough", async () => {
@@ -162,7 +277,7 @@ describe("native Codex passthrough thinking suffixes", () => {
 
   it("lets a saved effort override a Codex hyphen suffix", async () => {
     const body = await runNativeCodexRequest("gpt-6-luna-max", null, {
-      "codex/gpt-6-luna": { effort: "high" },
+      "codex/gpt-6-luna": { effort: "high", locked: true },
     });
 
     expect(body.reasoning.effort).toBe("high");
@@ -187,7 +302,9 @@ describe("native Codex passthrough thinking suffixes", () => {
   ])("does not override client %s with provider defaults", async (_shape, fields) => {
     const body = await runNativeCodexRequest("gpt-6-luna", null, {}, { mode: "high" }, fields);
 
-    expect(body).toMatchObject(fields);
+    const transformed = new CodexExecutor().transformRequest("gpt-6-luna", body, false, {});
+
+    expect(transformed.reasoning.effort).toBe("low");
   });
 
   it("applies provider defaults when the client has no effort intent", async () => {
@@ -198,7 +315,7 @@ describe("native Codex passthrough thinking suffixes", () => {
 
   it("applies a saved effort to native Claude passthrough requests", async () => {
     const body = await runNativeClaudeRequest("claude-sonnet-5.5(high)", { effort: "high" }, {
-      "claude/claude-sonnet-5.5": { effort: "low" },
+      "claude/claude-sonnet-5.5": { effort: "low", locked: true },
     });
 
     expect(body.model).toBe("claude-sonnet-5.5");
@@ -208,7 +325,7 @@ describe("native Codex passthrough thinking suffixes", () => {
   it("preserves unrelated Claude output config when disabling effort", async () => {
     const format = { type: "json_schema", schema: { type: "object" } };
     const body = await runNativeClaudeRequest("claude-sonnet-5.5", { effort: "high", format }, {
-      "claude/claude-sonnet-5.5": { effort: "none" },
+      "claude/claude-sonnet-5.5": { effort: "none", locked: true },
     });
 
     expect(body.thinking).toEqual({ type: "disabled" });

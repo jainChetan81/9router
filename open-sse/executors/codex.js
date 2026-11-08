@@ -14,6 +14,7 @@ import { dbg } from "../utils/debugLog.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { stripCodexUnsupportedPatterns } from "../utils/codexToolSchema.js";
 import { parseModelEffortSuffix } from "../utils/modelEffortSuffix.js";
+import { getCodexDefaultEffort, isCodexResponsesLiteModel } from "../config/codexEffort.js";
 
 // SSE error patterns inside 200-OK bodies. Some retry same account first; capacity rotates accounts.
 const CODEX_SSE_RETRY_PATTERNS = ["server_is_overloaded", "service_unavailable_error"];
@@ -26,11 +27,6 @@ const CODEX_SSE_USER_OUTPUT_PATTERNS = [
 ];
 const CODEX_SSE_PEEK_BYTES = 256 * 1024;
 const CODEX_MODEL_CAPACITY_MESSAGE = "Selected model is at capacity. Please try a different model.";
-function isCodexResponsesLiteModel(model) {
-  const baseId = String(model || "").replace(/\([^()]+\)\s*$/, "");
-  return getProviderModels("cx").some((entry) => entry.id === baseId && entry.responsesLite === true);
-}
-
 // Server-generated item id prefixes that Codex /responses cannot resolve when store=false
 const SERVER_ID_PATTERN = /^(rs|fc|resp|msg)_/;
 
@@ -525,7 +521,7 @@ export class CodexExecutor extends BaseExecutor {
     // A supported model suffix is the explicit model selection and overrides
     // effort fields carried alongside it by clients or provider defaults.
     if (!body.reasoning) {
-      const effort = normalizeReasoningEffort(body.model, modelEffort || body.reasoning_effort || (responsesLite ? 'medium' : 'low'));
+      const effort = normalizeReasoningEffort(body.model, modelEffort || body.reasoning_effort || getCodexDefaultEffort(responsesLite));
       body.reasoning = responsesLite ? { effort } : { effort, summary: "auto" };
     } else {
       body.reasoning.effort = normalizeReasoningEffort(body.model, modelEffort || body.reasoning.effort || body.reasoning_effort);

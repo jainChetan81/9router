@@ -26,6 +26,10 @@ describe("spend attribution", () => {
     expect(spendMeta(null, {})).toMatchObject({ clientEffort: null, sentEffort: null, effortSource: "none" });
   });
 
+  it.each(["model-lock", "model-default", "model-setting"])("keeps %s effort sources", (effortSource) => {
+    expect(spendMeta({ effort: { effortSource } }, {}).effortSource).toBe(effortSource);
+  });
+
   it("maps user-agents to clients", () => {
     expect(clientOf("claude-cli/2.1.316")).toBe("Claude Code");
     expect(clientOf("codex-tui/0.9")).toBe("Codex");

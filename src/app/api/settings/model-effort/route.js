@@ -14,6 +14,12 @@ export async function PATCH(request) {
     if (typeof body?.provider !== "string" || typeof body?.model !== "string" || !body.model.trim()) {
       return NextResponse.json({ error: "provider and model are required" }, { status: 400 });
     }
+    if (Object.hasOwn(body, "locked") && typeof body.locked !== "boolean") {
+      return NextResponse.json({ error: "locked must be a boolean" }, { status: 400 });
+    }
+    if (!Object.hasOwn(body, "effort")) {
+      return NextResponse.json({ error: "effort is required" }, { status: 400 });
+    }
 
     const provider = resolveProviderAlias(body.provider.trim());
     const model = stripThinkingSuffix(body.model.trim());
@@ -22,14 +28,18 @@ export async function PATCH(request) {
     const levels = getThinkingLevels(provider, model);
     const fixed = getFixedEffortLevel(provider, model);
     const validChoices = fixed ? ["auto"] : ["auto", ...(levels || [])];
+    const locked = body.locked === true;
 
     if (effort == null || effort === "auto") {
-      const settings = await updateModelEffortOverride(key, null);
-      return NextResponse.json({ key, effort: "auto", modelOverrides: settings.modelOverrides });
+      if (locked) {
+        return NextResponse.json({ error: "A cleared effort cannot be locked" }, { status: 400 });
+      }
+      const settings = await updateModelEffortOverride(key, null, false);
+      return NextResponse.json({ key, effort: "auto", locked: false, modelOverrides: settings.modelOverrides });
     }
 
     if (typeof effort !== "string" || !levels?.includes(effort) || fixed) {
-      const choices = validChoices.map((choice) => choice === "auto" ? "Auto" : choice);
+      const choices = validChoices.map((choice) => choice === "auto" ? "Provider default" : choice);
       return NextResponse.json({
         error: fixed
           ? `Effort is fixed at ${fixed}.`
@@ -40,8 +50,8 @@ export async function PATCH(request) {
       }, { status: 400 });
     }
 
-    const settings = await updateModelEffortOverride(key, effort);
-    return NextResponse.json({ key, effort, modelOverrides: settings.modelOverrides });
+    const settings = await updateModelEffortOverride(key, effort, locked);
+    return NextResponse.json({ key, effort, locked, modelOverrides: settings.modelOverrides });
   } catch (error) {
     console.error("Error updating model effort:", error);
     return NextResponse.json({ error: error.message }, { status: 500 });
