@@ -13,7 +13,8 @@ export {
 export {
   getProviderConnections, getProviderConnectionById,
   createProviderConnection, updateProviderConnection,
-  setOpenCodeGoPaidQuotaLock, observeOpenCodeGoPaidQuotaLockIfGeneration,
+  setOpenCodeGoPaidQuotaLockIfCredentialFingerprint,
+  observeOpenCodeGoPaidQuotaLockIfGeneration,
   updateOpenCodeGoPaidQuotaLockIfGeneration,
   clearOpenCodeGoPaidQuotaLockIfGeneration,
   deleteProviderConnection, deleteProviderConnectionsByProvider,

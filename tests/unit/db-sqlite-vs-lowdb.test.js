@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
+import { getOpenCodeGoCredentialFingerprint } from "@/lib/db/credentialFingerprint.js";
 
 const originalDataDir = process.env.DATA_DIR;
 let tempDir;
@@ -151,7 +152,9 @@ describe("DB SQLite layer — public API parity", () => {
       generation: "quota-generation-1",
     };
 
-    await sqliteDb.setOpenCodeGoPaidQuotaLock(c.id, lock, { testStatus: "unavailable" });
+    await sqliteDb.setOpenCodeGoPaidQuotaLockIfCredentialFingerprint(
+      c.id, getOpenCodeGoCredentialFingerprint(c), lock, { testStatus: "unavailable" },
+    );
     await sqliteDb.updateProviderConnection(c.id, { testStatus: "active" });
     expect(await sqliteDb.getProviderConnectionById(c.id)).toMatchObject({
       testStatus: "active",
@@ -184,7 +187,7 @@ describe("DB SQLite layer — public API parity", () => {
       name: "quota-lock-key-replacement",
       apiKey: "old-key",
     });
-    await sqliteDb.setOpenCodeGoPaidQuotaLock(c.id, {
+    const lock = {
       version: 1,
       reason: "GoUsageLimitError",
       limitName: "weekly",
@@ -192,9 +195,18 @@ describe("DB SQLite layer — public API parity", () => {
       retryAt: "2026-11-09T00:00:00.000Z",
       resetAt: null,
       generation: "old-key-generation",
-    });
+    };
+    const dispatchedCredentialFingerprint = getOpenCodeGoCredentialFingerprint(c);
+    await sqliteDb.setOpenCodeGoPaidQuotaLockIfCredentialFingerprint(
+      c.id, dispatchedCredentialFingerprint, lock,
+    );
 
     await sqliteDb.updateProviderConnection(c.id, { apiKey: "new-key" });
+    await expect(sqliteDb.setOpenCodeGoPaidQuotaLockIfCredentialFingerprint(
+      c.id,
+      dispatchedCredentialFingerprint,
+      { ...lock, generation: "stale-observation-generation" },
+    )).resolves.toMatchObject({ updated: false });
     expect(await sqliteDb.getProviderConnectionById(c.id)).toMatchObject({
       apiKey: "new-key",
       quotaLock_opencodeGoPaid: null,

@@ -1,6 +1,7 @@
 import { v4 as uuidv4 } from "uuid";
 import { getAdapter } from "../driver.js";
 import { parseJson, stringifyJson } from "../helpers/jsonCol.js";
+import { getOpenCodeGoCredentialFingerprint } from "../credentialFingerprint.js";
 
 const OPTIONAL_FIELDS = [
   "displayName", "email", "globalPriority", "defaultModel",
@@ -284,21 +285,23 @@ export async function updateProviderConnection(id, data) {
   return result;
 }
 
-/** Persist a new OpenCode Go paid quota observation and its health state atomically. */
-export async function setOpenCodeGoPaidQuotaLock(id, lock, healthPatch = {}) {
+/** Persist a quota observation only if the request used the current API key. */
+export async function setOpenCodeGoPaidQuotaLockIfCredentialFingerprint(id, fingerprint, lock, healthPatch = {}) {
   const db = await getAdapter();
-  let result = null;
+  let result = { updated: false, connection: null };
   db.transaction(() => {
     const row = db.get(`SELECT * FROM providerConnections WHERE id = ?`, [id]);
     if (!row) return;
     const existing = rowToConn(row);
-    result = {
+    if (getOpenCodeGoCredentialFingerprint(existing) !== fingerprint) return;
+    const connection = {
       ...existing,
       ...healthPatch,
       [OPENCODE_GO_PAID_QUOTA_LOCK]: lock,
       updatedAt: new Date().toISOString(),
     };
-    upsert(db, result);
+    upsert(db, connection);
+    result = { updated: true, connection };
   });
   return result;
 }

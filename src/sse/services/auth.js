@@ -1,10 +1,11 @@
 import crypto from "node:crypto";
 import {
   getProviderConnections, validateApiKey, updateProviderConnection, getSettings, getProxyPools,
-  setOpenCodeGoPaidQuotaLock, observeOpenCodeGoPaidQuotaLockIfGeneration,
+  setOpenCodeGoPaidQuotaLockIfCredentialFingerprint, observeOpenCodeGoPaidQuotaLockIfGeneration,
   updateOpenCodeGoPaidQuotaLockIfGeneration,
   clearOpenCodeGoPaidQuotaLockIfGeneration,
 } from "@/lib/localDb";
+import { getOpenCodeGoCredentialFingerprint } from "@/lib/db/credentialFingerprint.js";
 import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/connectionProxy";
 import {
   formatRetryAfter, checkFallbackError, buildModelLockUpdate,
@@ -60,7 +61,8 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     : (excludeConnectionIds ? new Set([excludeConnectionIds]) : new Set());
   const preferredConnectionId = options?.preferredConnectionId || null;
   const requestedModel = options?.requestedModel || model;
-  const quotaProbeByConnection = new Map();
+  const quotaProbeCandidates = new Map();
+  let selectedProbe = null;
   let selectionReturned = false;
   // Acquire mutex to prevent race conditions
   const currentMutex = selectionMutex;
@@ -144,9 +146,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
             continue;
           }
           if (lease) quotaProbeLeases.delete(c.id);
-          const probe = { generation: quotaLock.generation, token: crypto.randomUUID() };
-          quotaProbeLeases.set(c.id, { ...probe, expiresAt: now + OPENCODE_GO_PROBE_LEASE_MS });
-          quotaProbeByConnection.set(c.id, probe);
+          quotaProbeCandidates.set(c.id, quotaLock.generation);
         }
       }
 
@@ -247,6 +247,13 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       connection = availableConnections[0];
     }
 
+    const probeGeneration = quotaProbeCandidates.get(connection.id);
+    if (probeGeneration) {
+      const probe = { generation: probeGeneration, token: crypto.randomUUID() };
+      quotaProbeLeases.set(connection.id, { ...probe, expiresAt: Date.now() + OPENCODE_GO_PROBE_LEASE_MS });
+      selectedProbe = { connectionId: connection.id, probe };
+    }
+
     const resolvedProxy = await resolveConnectionProxyConfig(connection.providerSpecificData || {});
 
     const credentialResult = {
@@ -276,16 +283,20 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       lastError: connection.lastError,
       // Pass full connection for clearAccountError to read modelLock_* keys
       _connection: connection,
-      ...(quotaProbeByConnection.has(connection.id)
-        ? { quotaProbe: quotaProbeByConnection.get(connection.id) }
+      ...(selectedProbe?.connectionId === connection.id
+        ? { quotaProbe: selectedProbe.probe }
+        : {}),
+      ...(isOpenCodeGo
+        ? { quotaCredentialFingerprint: getOpenCodeGoCredentialFingerprint(connection) }
         : {}),
     };
     selectionReturned = true;
     return credentialResult;
   } finally {
     if (!selectionReturned) {
-      for (const [connectionId, probe] of quotaProbeByConnection) {
-        if (quotaProbeLeases.get(connectionId)?.token === probe.token) quotaProbeLeases.delete(connectionId);
+      const lease = selectedProbe && quotaProbeLeases.get(selectedProbe.connectionId);
+      if (selectedProbe && lease?.token === selectedProbe.probe.token) {
+        quotaProbeLeases.delete(selectedProbe.connectionId);
       }
     }
     if (resolveMutex) resolveMutex();
@@ -371,9 +382,10 @@ export async function completeOpenCodeGoQuotaProbe(connectionId, probe, outcome)
  * @param {string|null} model - The specific model that triggered the error
  * @param {object|null} quotaFailure - Optional typed executor classification
  * @param {object|null} quotaProbe - Optional generation identity for a paid probe
+ * @param {string|null} quotaCredentialFingerprint - Opaque API-key fingerprint captured at selection
  * @returns {{ shouldFallback: boolean, cooldownMs: number, quotaLock?: object }}
  */
-export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, resetsAtMs = null, quotaFailure = null, quotaProbe = null) {
+export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, resetsAtMs = null, quotaFailure = null, quotaProbe = null, quotaCredentialFingerprint = null) {
   if (!connectionId || connectionId === "noauth") return { shouldFallback: false, cooldownMs: 0 };
   const providerId = resolveProviderId(provider);
   const connections = await getProviderConnections({ provider: providerId });
@@ -403,8 +415,12 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
     };
     const observation = quotaProbe?.generation
       ? await observeOpenCodeGoPaidQuotaLockIfGeneration(connectionId, quotaProbe.generation, lock, healthPatch)
-      : await setOpenCodeGoPaidQuotaLock(connectionId, lock, healthPatch);
-    if (quotaProbe?.generation && !observation?.updated) {
+      : quotaCredentialFingerprint
+        ? await setOpenCodeGoPaidQuotaLockIfCredentialFingerprint(
+          connectionId, quotaCredentialFingerprint, lock, healthPatch,
+        )
+        : { updated: false, connection: null };
+    if (!observation?.updated) {
       return { shouldFallback: true, cooldownMs: OPENCODE_GO_QUOTA_RECHECK_MS };
     }
     if (conn) void upgradeOpenCodeGoQuotaLockFromUsage(conn, lock, quotaFailure);

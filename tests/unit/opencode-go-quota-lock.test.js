@@ -11,11 +11,13 @@ const mocks = vi.hoisted(() => {
       Object.assign(connection, patch);
       return structuredClone(connection);
     }),
-    setOpenCodeGoPaidQuotaLock: vi.fn(async (id, lock, health) => {
+    setOpenCodeGoPaidQuotaLockIfCredentialFingerprint: vi.fn(async (id, fingerprint, lock, health) => {
       const connection = state.connections.find((item) => item.id === id);
-      if (!connection) return null;
+      if (!connection || mocks.getOpenCodeGoCredentialFingerprint(connection) !== fingerprint) {
+        return { updated: false, connection: null };
+      }
       Object.assign(connection, health, { quotaLock_opencodeGoPaid: lock });
-      return structuredClone(connection);
+      return { updated: true, connection: structuredClone(connection) };
     }),
     observeOpenCodeGoPaidQuotaLockIfGeneration: vi.fn(async (id, generation, nextLock, health) => {
       const connection = state.connections.find((item) => item.id === id);
@@ -50,7 +52,7 @@ const mocks = vi.hoisted(() => {
 vi.mock("@/lib/localDb", () => ({
   getProviderConnections: mocks.getProviderConnections,
   updateProviderConnection: mocks.updateProviderConnection,
-  setOpenCodeGoPaidQuotaLock: mocks.setOpenCodeGoPaidQuotaLock,
+  setOpenCodeGoPaidQuotaLockIfCredentialFingerprint: mocks.setOpenCodeGoPaidQuotaLockIfCredentialFingerprint,
   observeOpenCodeGoPaidQuotaLockIfGeneration: mocks.observeOpenCodeGoPaidQuotaLockIfGeneration,
   updateOpenCodeGoPaidQuotaLockIfGeneration: mocks.updateOpenCodeGoPaidQuotaLockIfGeneration,
   clearOpenCodeGoPaidQuotaLockIfGeneration: mocks.clearOpenCodeGoPaidQuotaLockIfGeneration,
@@ -76,6 +78,8 @@ const {
   markAccountUnavailable,
 } = await import("../../src/sse/services/auth.js");
 const { getModelQuotaScope } = await import("../../open-sse/config/providerModels.js");
+const { getOpenCodeGoCredentialFingerprint } = await import("../../src/lib/db/credentialFingerprint.js");
+mocks.getOpenCodeGoCredentialFingerprint = getOpenCodeGoCredentialFingerprint;
 
 function connection(id, quotaLock = null) {
   return {
@@ -145,6 +149,30 @@ describe("OpenCode Go paid quota lock", () => {
     });
   });
 
+  it("assigns concurrent due probes to separate connections", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-08T12:00:00.000Z"));
+    mocks.state.connections = [
+      connection("go-due-a", lock("2026-11-08T11:59:00.000Z", "generation-a")),
+      { ...connection("go-due-b", lock("2026-11-08T11:59:00.000Z", "generation-b")), priority: 2 },
+    ];
+    try {
+      const [first, second] = await Promise.all([
+        getProviderCredentials("opencode-go", null, "paid-model"),
+        getProviderCredentials("opencode-go", null, "paid-model"),
+      ]);
+
+      expect(first.connectionId).not.toBe(second.connectionId);
+      expect(first.quotaProbe).toEqual(expect.objectContaining({ token: expect.any(String) }));
+      expect(second.quotaProbe).toEqual(expect.objectContaining({ token: expect.any(String) }));
+      await expect(getProviderCredentials("opencode-go", null, "paid-model")).resolves.toMatchObject({
+        allRateLimited: true,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("uses the latest blocker per connection and earliest retry across accounts", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-11-08T12:00:00.000Z"));
@@ -171,12 +199,14 @@ describe("OpenCode Go paid quota lock", () => {
     vi.setSystemTime(new Date("2026-11-08T12:00:00.000Z"));
     mocks.state.connections = [connection("go-observe")];
     try {
+      const credentials = await getProviderCredentials("opencode-go", null, "paid-model");
       await markAccountUnavailable(
         "go-observe", 429, "Go usage limit exceeded", "opencode-go", "paid-model", null,
-        { kind: "opencode-go-paid", limitName: "weekly" },
+        { kind: "opencode-go-paid", limitName: "weekly" }, null, credentials.quotaCredentialFingerprint,
       );
-      expect(mocks.setOpenCodeGoPaidQuotaLock).toHaveBeenCalledWith(
+      expect(mocks.setOpenCodeGoPaidQuotaLockIfCredentialFingerprint).toHaveBeenCalledWith(
         "go-observe",
+        credentials.quotaCredentialFingerprint,
         expect.objectContaining({
           version: 1,
           reason: "GoUsageLimitError",
@@ -198,9 +228,10 @@ describe("OpenCode Go paid quota lock", () => {
     mocks.getOpenCodeGoUsage.mockResolvedValue({
       quotas: { Weekly: { used: 100, resetAt } },
     });
+    const credentials = await getProviderCredentials("opencode-go", null, "paid-model");
     await markAccountUnavailable(
       "go-usage", 429, "Go usage limit exceeded", "opencode-go", "paid-model", null,
-      { kind: "opencode-go-paid", limitName: "weekly" },
+      { kind: "opencode-go-paid", limitName: "weekly" }, null, credentials.quotaCredentialFingerprint,
     );
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(mocks.updateOpenCodeGoPaidQuotaLockIfGeneration).toHaveBeenCalledWith(
@@ -208,6 +239,27 @@ describe("OpenCode Go paid quota lock", () => {
       expect.any(String),
       { retryAt: resetAt, resetAt },
     );
+  });
+
+  it("does not apply an old 429 to a replacement API key", async () => {
+    mocks.state.connections = [connection("go-replaced")];
+    const selected = await getProviderCredentials("opencode-go", null, "paid-model");
+    mocks.state.connections[0].apiKey = "replacement-key";
+
+    await markAccountUnavailable(
+      "go-replaced", 429, "Go usage limit exceeded", "opencode-go", "paid-model", null,
+      { kind: "opencode-go-paid", limitName: "weekly" }, null, selected.quotaCredentialFingerprint,
+    );
+
+    expect(mocks.setOpenCodeGoPaidQuotaLockIfCredentialFingerprint).toHaveBeenCalledWith(
+      "go-replaced",
+      selected.quotaCredentialFingerprint,
+      expect.objectContaining({ reason: "GoUsageLimitError" }),
+      expect.any(Object),
+    );
+    expect(mocks.state.connections[0].apiKey).toBe("replacement-key");
+    expect(mocks.state.connections[0]).not.toHaveProperty("quotaLock_opencodeGoPaid");
+    expect(mocks.getOpenCodeGoUsage).not.toHaveBeenCalled();
   });
 
   it("admits one paid probe and returns its lease expiry to concurrent requests", async () => {
@@ -237,6 +289,7 @@ describe("OpenCode Go paid quota lock", () => {
       await markAccountUnavailable(
         "go-renew", 429, "Go usage limit exceeded", "opencode-go", "paid-model", null,
         { kind: "opencode-go-paid", limitName: "weekly" }, probeCredentials.quotaProbe,
+        probeCredentials.quotaCredentialFingerprint,
       );
       const renewed = mocks.state.connections[0].quotaLock_opencodeGoPaid;
       expect(renewed.generation).not.toBe("old-generation");

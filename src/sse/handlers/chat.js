@@ -400,7 +400,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       ? true
       : await markAccountUnavailable(
           credentials.connectionId, result.status, result.error, provider, model,
-          resetsAtMs, result.quotaFailure, credentials.quotaProbe,
+          resetsAtMs, result.quotaFailure, credentials.quotaProbe, credentials.quotaCredentialFingerprint,
         );
     const shouldFallback = markResult === true || markResult.shouldFallback;
 
