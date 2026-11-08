@@ -75,7 +75,10 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
   // Strip explicit content types (opt-in via strip[] in PROVIDER_MODELS entry)
   stripContentTypes(result, stripList);
 
-  // Normalize thinking config: remove if lastMessage is not user
+  // Capture thinking before normalization drops Claude's thinking block on tool turns.
+  const thinkingIntent = captureThinking(result);
+
+  // Keep the destination-specific cleanup for non-user turns.
   normalizeThinkingConfig(result);
 
   // Always ensure tool_calls have id (some providers require it)
@@ -88,10 +91,6 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
   if (targetFormat !== FORMATS.KIRO) {
     fixMissingToolResponses(result);
   }
-
-  // Capture thinking intent from the original (pre-translation) body, before any
-  // format conversion strips/renames the fields. Applied after translation.
-  const thinkingIntent = captureThinking(result);
 
   // Capture session id from the original body (envelope still intact, e.g. antigravity request.sessionId)
   const clientSessionId = captureSessionId(result, credentials, connectionId, targetFormat);
