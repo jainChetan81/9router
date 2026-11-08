@@ -227,7 +227,10 @@ function parseRetryAfterValue(value, now = Date.now()) {
   }
 
   if (!Number.isFinite(retryAtMs) || retryAtMs <= now) return null;
-  return new Date(retryAtMs).toISOString();
+  const retryAt = new Date(retryAtMs);
+  // Out-of-range values (e.g. "Retry-After: 99999999999999") make an Invalid Date.
+  if (Number.isNaN(retryAt.getTime())) return null;
+  return retryAt.toISOString();
 }
 
 function rotateModelsFromIndex(models, currentIndex) {
@@ -317,6 +320,15 @@ export function getComboModelsFromData(modelStr, combosData) {
  * (e.g. empty assistant message with in_progress/incomplete)
  * so combo fallback can continue to the next model.
  */
+// Finish reason of a non-streaming JSON response, in the OpenAI vocabulary used by isNoRetryFinish.
+function getJsonFinishReason(data) {
+  if (!data || typeof data !== "object") return null;
+  const choiceFinish = Array.isArray(data.choices) ? data.choices[0]?.finish_reason : null;
+  if (choiceFinish) return choiceFinish;
+  if (data.stop_reason === "refusal") return "content_filter";
+  return null;
+}
+
 export function isZeroContentResponse(data) {
   if (!data || typeof data !== "object") return false;
 
@@ -499,6 +511,8 @@ export async function handleComboChat({
   let lastError = null;
   let earliestRetryAfter = null;
   let lastStatus = null;
+  // Empty output is tracked apart from real upstream statuses, so a later 429/5xx keeps its status.
+  let sawEmptyOutput = false;
   let requestScopedResult = null;
 
   for (let i = 0; i < rotatedModels.length; i++) {
@@ -536,6 +550,11 @@ export async function handleComboChat({
           if (contentType.includes("application/json")) {
             try {
               const peekBody = await result.clone().json();
+              // A safety/refusal finish is a legitimate answer: never retry it on another member.
+              if (isNoRetryFinish(getJsonFinishReason(peekBody))) {
+                log.warn("COMBO", `Model ${modelStr} returned a no-retry finish, returning as-is`);
+                return acceptResponse(result, modelStr);
+              }
               if (isZeroContentResponse(peekBody)) {
                 if (isLastModel) {
                   log.warn("COMBO", `Model ${modelStr} returned HTTP 200 with zero usable content as the final candidate, returning as-is`);
@@ -546,7 +565,7 @@ export async function handleComboChat({
                   clearStickyComboSession(comboName, sessionId, modelStr);
                 }
                 lastError = "Zero usable content";
-                if (!lastStatus) lastStatus = 502;
+                sawEmptyOutput = true;
                 continue;
               }
             } catch {
@@ -582,7 +601,7 @@ export async function handleComboChat({
         // Drain/close the discarded stream in the background so its usage logging still runs.
         peeked.response.body?.cancel?.().catch(() => {});
         lastError = `empty generation (${reasonLabel})`;
-        if (!lastStatus) lastStatus = 502;
+        sawEmptyOutput = true;
         continue;
       }
 
@@ -681,7 +700,7 @@ export async function handleComboChat({
   // the request itself is invalid, but here the providers are simply unavailable
   // or have no active credentials. 503 is more accurate and retryable by clients.
   const allDisabled = lastError && lastError.toLowerCase().includes("no credentials");
-  const status = allDisabled ? 503 : (lastStatus || 503);
+  const status = allDisabled ? 503 : (lastStatus || (sawEmptyOutput ? 502 : 503));
   const msg = lastError || "All combo models unavailable";
 
   if (earliestRetryAfter) {

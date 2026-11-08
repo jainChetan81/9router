@@ -67,4 +67,68 @@ describe("combo Retry-After propagation", () => {
 
     expect(result.headers.has("retry-after")).toBe(false);
   });
+
+  it("ignores an out-of-range delta-seconds value instead of throwing", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+
+    const result = await invoke([
+      failure(null, "99999999999999"),
+      failure(null, "30"),
+    ]);
+
+    expect(result.status).toBe(500);
+    expect(result.headers.get("retry-after")).toBe("30");
+  });
+});
+
+function json(payload, status = 200) {
+  return new Response(JSON.stringify(payload), { status, headers: { "content-type": "application/json" } });
+}
+
+describe("combo status after empty output", () => {
+  it("keeps a later real upstream status instead of a synthetic 502", async () => {
+    const result = await invoke([
+      json({ choices: [{ message: { content: "" }, finish_reason: "in_progress" }] }),
+      json({ error: { message: "rate limited" } }, 429),
+    ]);
+    expect(result.status).toBe(429);
+  });
+
+  it("returns the request-scoped member response after empty output", async () => {
+    const result = await handleComboChat({
+      body,
+      models: ["provider/a", "provider/b", "provider/c"],
+      handleSingleModel: async (_b, model) => model === "provider/c"
+        ? new Response(JSON.stringify({ error: { message: "boom" } }), { status: 400, headers: { "content-type": "application/json" } })
+        : json({ choices: [{ message: { content: "" }, finish_reason: "in_progress" }] }),
+      log,
+      comboName: "empty-only",
+      comboStrategy: "fallback",
+      autoSwitch: false,
+    });
+    expect(result.status).toBe(400);
+  });
+});
+
+describe("combo JSON no-retry finishes", () => {
+  it("returns a content-filter JSON response without trying another member", async () => {
+    const calls = [];
+    const result = await handleComboChat({
+      body,
+      models,
+      handleSingleModel: async (_b, model) => {
+        calls.push(model);
+        return model === "provider/a"
+          ? json({ choices: [{ message: { content: "" }, finish_reason: "content_filter" }] })
+          : json({ choices: [{ message: { content: "fallback answer" }, finish_reason: "stop" }] });
+      },
+      log,
+      comboName: "content-filter",
+      comboStrategy: "fallback",
+      autoSwitch: false,
+    });
+    expect(calls).toEqual(["provider/a"]);
+    expect((await result.json()).choices[0].finish_reason).toBe("content_filter");
+  });
 });

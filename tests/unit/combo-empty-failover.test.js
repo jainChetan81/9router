@@ -500,7 +500,23 @@ describe("sticky combo acceptance after empty failover", () => {
     expect(getStickyComboModel("sticky-content-filter", "filter-session", filterModels)).toBe(filterModels[0]);
   });
 
-  it("uses 502 when empty output is followed by errors and every member fails", async () => {
+  it("returns the final empty JSON response as-is when every member is empty", async () => {
+    const result = await handleComboChat({
+      body,
+      models,
+      handleSingleModel: async () => new Response(JSON.stringify({ choices: [{ message: { content: "" }, finish_reason: "in_progress" }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+      log,
+      comboName: "all-empty",
+      comboStrategy: "fallback",
+      autoSwitch: false,
+    });
+    expect(result.status).toBe(200);
+  });
+
+  it("keeps the real upstream status when empty output is followed by errors", async () => {
     const result = await handleComboChat({
       body,
       models,
@@ -522,7 +538,7 @@ describe("sticky combo acceptance after empty failover", () => {
       autoSwitch: false,
     });
 
-    expect(result.status).toBe(502);
+    expect(result.status).toBe(500);
     expect((await result.json()).error.message).toContain("member unavailable");
   });
 });
