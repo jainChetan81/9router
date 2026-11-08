@@ -69,6 +69,11 @@ describe("Gemini 3.8 Antigravity tiers", () => {
     expect(upstreamModel).toBe("gemini-3.8-flash-low(low)");
   });
 
+  it("uses saved model effort before explicit suffix and client effort", () => {
+    const upstreamModel = getModelUpstreamId("ag", "gemini-3.8-flash(low)", { reasoning_effort: "high" }, "medium");
+    expect(upstreamModel).toBe("gemini-3.8-flash-medium(medium)");
+  });
+
   it("preserves direct tiered model IDs", () => {
     const upstreamModel = getModelUpstreamId("ag", "gemini-3.8-flash-high", {});
     expect(upstreamModel).toBe("gemini-3.8-flash-high(high)");

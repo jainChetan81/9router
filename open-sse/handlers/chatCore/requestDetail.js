@@ -119,11 +119,18 @@ export function formatDoneLine({ usage, latency }) {
 
 // Spend page attribution: client app, session hash and combo, from the raw client request.
 export function spendMeta(clientRawRequest, tokens) {
-  if (!clientRawRequest) return {};
-  const h = clientRawRequest.headers || {};
-  const meta = {};
-  const ua = h["user-agent"] || "";
-  meta.ua = ua.slice(0, 80); // always set: marks the row as attributed, even without a user-agent
+  const h = clientRawRequest?.headers || {};
+  const meta = {
+    clientEffort: typeof clientRawRequest?.effort?.clientEffort === "string" ? clientRawRequest.effort.clientEffort : null,
+    sentEffort: typeof clientRawRequest?.effort?.sentEffort === "string" ? clientRawRequest.effort.sentEffort : null,
+    effortSource: ["model-setting", "suffix", "client", "provider-default", "executor-default", "none"].includes(clientRawRequest?.effort?.effortSource)
+      ? clientRawRequest.effort.effortSource
+      : "none",
+  };
+  if (clientRawRequest) {
+    const ua = h["user-agent"] || "";
+    meta.ua = ua.slice(0, 80); // always set: marks the row as attributed, even without a user-agent
+  }
   if (clientRawRequest?.session) meta.session = createHash("sha256").update(String(clientRawRequest.session)).digest("hex").slice(0, 12);
   if (clientRawRequest?.combo) meta.combo = clientRawRequest.combo;
   if (Number.isFinite(tokens?.cost)) meta.realCost = tokens.cost;

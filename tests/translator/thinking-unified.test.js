@@ -8,9 +8,9 @@ import {
 } from "../../open-sse/translator/concerns/thinkingUnified.js";
 import { extractReasoningText } from "../../open-sse/translator/concerns/reasoning.js";
 
-const apply = (targetFormat, model, body, provider) => {
+const apply = (targetFormat, model, body, provider, modelEffortSetting = null) => {
   const b = JSON.parse(JSON.stringify(body));
-  applyThinking(targetFormat, model, b, provider);
+  applyThinking(targetFormat, model, b, provider, undefined, modelEffortSetting);
   return b;
 };
 
@@ -73,6 +73,16 @@ describe("extractThinking", () => {
 });
 
 describe("applyThinking per provider format", () => {
+  it("saved model effort wins over suffix and client intent", () => {
+    const out = apply("openai", "gpt-6-luna(high)", { reasoning_effort: "low" }, "codex", "medium");
+    expect(out.reasoning_effort).toBe("medium");
+  });
+  it("Auto keeps suffix precedence and leaves no-intent defaults to the executor", () => {
+    const suffixed = apply("openai", "gpt-6-luna(high)", { reasoning_effort: "low" }, "codex");
+    const automatic = apply("openai", "gpt-6-luna", { messages: [] }, "codex");
+    expect(suffixed.reasoning_effort).toBe("high");
+    expect(automatic.reasoning_effort).toBeUndefined();
+  });
   it("claude 4.6+ → adaptive thinking + output_config (no budget_tokens)", () => {
     const out = apply("claude", "claude-opus-4.7", { reasoning_effort: "high" }, "claude");
     expect(out.output_config).toEqual({ effort: "high" });

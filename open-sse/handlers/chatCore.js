@@ -1,6 +1,6 @@
 import { detectFormat, getTargetFormat, resolveTransport } from "../services/provider.js";
 import { translateRequest } from "../translator/index.js";
-import { applyThinking, extractThinking, stripThinkingSuffix } from "../translator/concerns/thinkingUnified.js";
+import { applyThinking, extractThinking, parseSuffix, stripThinkingSuffix } from "../translator/concerns/thinkingUnified.js";
 import { FORMATS } from "../translator/formats.js";
 import { normalizeClaudePassthrough, anchorClaudeCache } from "../translator/formats/claude.js";
 import { createStreamController } from "../utils/streamHandler.js";
@@ -30,6 +30,7 @@ import { compressWithHeadroom, formatHeadroomLog, formatHeadroomSizeLog, isHeadr
 import { compressWithPxpipe } from "../rtk/pxpipe.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { stripUnsupportedModalities } from "../translator/concerns/modality.js";
+import { getFixedEffortLevel, normalizeThinkingEffort, resolveModelEffortSetting } from "../services/modelEffort.js";
 import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
 import { defaultClaudeToolType, shouldDefaultClaudeToolType } from "../translator/concerns/toolCall.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
@@ -61,8 +62,14 @@ export function stripContinuityFields(body) {
   return body;
 }
 
-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, customPromptEnabled, customPrompt, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, providerOverrides }) {
+export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, customPromptEnabled, customPrompt, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, providerOverrides, modelOverrides }) {
   const { provider, model } = modelInfo;
+  const originalThinkingIntent = extractThinking(clientRawRequest?.body || body);
+  const clientEffort = normalizeThinkingEffort(originalThinkingIntent);
+  const modelEffortSetting = resolveModelEffortSetting(modelOverrides, provider, model, ({ key, effort, validChoices }) => {
+    log?.warn?.("THINK", `Ignoring invalid saved effort "${effort}" for ${key}; valid choices: ${validChoices.join(", ")}`);
+  });
+  let providerDefaultApplied = false;
   const requestStartTime = Date.now();
   // Stable per-session color so all lines of one CLI conversation share a tag
   const sessionSeed = (() => {
@@ -117,6 +124,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const hasClientThinkingIntent = extractThinking(body) !== null;
   if (providerThinking?.mode && providerThinking.mode !== "auto" && !hasClientThinkingIntent) {
     const mode = providerThinking.mode;
+    providerDefaultApplied = true;
     if (mode === "on") {
       console.log("Injecting provider-level thinking config override: on");
       body = { ...body, thinking: { type: "enabled", budget_tokens: 10000 } };
@@ -127,7 +135,18 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     }
   }
 
-  const upstreamModel = getModelUpstreamId(alias, model, body);
+  const upstreamModel = getModelUpstreamId(alias, model, body, modelEffortSetting);
+  const explicitSuffix = parseSuffix(model).override;
+  const fixedEffort = getFixedEffortLevel(provider, model);
+  let effortSource = modelEffortSetting
+    ? "model-setting"
+    : explicitSuffix || fixedEffort
+      ? "suffix"
+      : originalThinkingIntent
+        ? "client"
+        : providerDefaultApplied || parseSuffix(upstreamModel).override
+          ? "provider-default"
+          : null;
 
   // Per-request opt-out: client can bypass all token savers via header
   const tokenSaverEnabled = clientRawRequest?.headers?.[TOKEN_SAVER_HEADER]?.toLowerCase() !== "off";
@@ -201,21 +220,40 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     log?.debug?.("PASSTHROUGH", `${clientTool} → ${provider} | native lossless`);
     translatedBody = { ...body, model: stripThinkingSuffix(upstreamModel) };
     if (provider === "codex") {
-      const suffixThinking = {};
-      applyThinking(sourceFormat, upstreamModel, suffixThinking, provider);
-      if (suffixThinking.reasoning_effort) {
+      const normalizedThinking = {};
+      const providerDefault = providerDefaultApplied ? extractThinking(translatedBody) : undefined;
+      applyThinking(sourceFormat, upstreamModel, normalizedThinking, provider, providerDefault, modelEffortSetting);
+      const effort = normalizedThinking.reasoning_effort
+        ?? (typeof normalizedThinking.reasoning === "object" ? normalizedThinking.reasoning.effort : null);
+      if (typeof effort === "string") {
         const reasoning = translatedBody.reasoning;
         translatedBody.reasoning = {
           ...(reasoning && typeof reasoning === "object" && !Array.isArray(reasoning) ? reasoning : {}),
-          effort: suffixThinking.reasoning_effort,
+          effort,
         };
         delete translatedBody.reasoning_effort;
+      }
+    } else if (modelEffortSetting || parseSuffix(upstreamModel).override || providerDefaultApplied) {
+      const priorOutputConfig = translatedBody.output_config && typeof translatedBody.output_config === "object"
+        ? { ...translatedBody.output_config }
+        : null;
+      applyThinking(sourceFormat, upstreamModel, translatedBody, provider, undefined, modelEffortSetting);
+      if (priorOutputConfig) {
+        const normalizedOutputConfig = translatedBody.output_config && typeof translatedBody.output_config === "object"
+          ? translatedBody.output_config
+          : {};
+        const effort = normalizedOutputConfig.effort;
+        delete priorOutputConfig.effort;
+        const outputConfig = { ...priorOutputConfig, ...normalizedOutputConfig };
+        if (effort !== undefined) outputConfig.effort = effort;
+        if (Object.keys(outputConfig).length) translatedBody.output_config = outputConfig;
+        else delete translatedBody.output_config;
       }
     }
     // Normalize newer Cowork/CC beta shapes (adaptive thinking, mid-conversation system) the API rejects
     if (clientTool === "claude") normalizeClaudePassthrough(translatedBody, translatedBody.model);
   } else {
-    translatedBody = translateRequest(sourceFormat, targetFormat, upstreamModel, body, stream, credentials, provider, reqLogger, stripList, connectionId, clientTool);
+    translatedBody = translateRequest(sourceFormat, targetFormat, upstreamModel, body, stream, credentials, provider, reqLogger, stripList, connectionId, clientTool, modelEffortSetting);
     if (!translatedBody) {
       trackPendingRequest(model, provider, connectionId, false, true);
       return createErrorResult(HTTP_STATUS.BAD_REQUEST, `Failed to translate request for ${sourceFormat} → ${targetFormat}`);
@@ -478,6 +516,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
           if (retryResult.response.ok) {
             providerResponse = retryResult.response;
             providerUrl = retryResult.url;
+            finalBody = retryResult.transformedBody || finalBody;
             providerResponseFormat = retryResult.responseFormat || targetFormat;
           }
         } catch { log?.warn?.("TOKEN", `${provider.toUpperCase()} | retry after refresh failed`); }
@@ -487,6 +526,21 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     } catch (e) {
       log?.warn?.("TOKEN", `${provider.toUpperCase()} | refresh threw: ${e.message}`);
     }
+  }
+
+  const sentBody = finalBody || translatedBody;
+  const sentThinking = extractThinking(sentBody);
+  const sentKiroEffort = sentBody?.additionalModelRequestFields?.output_config?.effort
+    ?? sentBody?.additionalModelRequestFields?.reasoning?.effort;
+  const sentEffort = normalizeThinkingEffort(sentThinking)
+    ?? (typeof sentKiroEffort === "string" ? sentKiroEffort.toLowerCase() : null)
+    ?? normalizeThinkingEffort(parseSuffix(sentBody?.model).override);
+  if (!effortSource) effortSource = sentEffort === null ? "none" : "executor-default";
+  if (clientRawRequest) {
+    clientRawRequest = {
+      ...clientRawRequest,
+      effort: { clientEffort, sentEffort, effortSource },
+    };
   }
 
   // Provider returned error

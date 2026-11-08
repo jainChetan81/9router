@@ -4,12 +4,18 @@ import { clientOf } from "../../src/lib/spendClient.js";
 
 describe("spend attribution", () => {
   it("hashes the session and keeps combo, ua and real cost", () => {
-    const m = spendMeta({ headers: { "user-agent": "claude-cli/2.1.318" }, session: "claude:abc", combo: "scout" }, { cost: 0.0123 });
+    const m = spendMeta({
+      headers: { "user-agent": "claude-cli/2.1.318" }, session: "claude:abc", combo: "scout",
+      effort: { clientEffort: "low", sentEffort: "high", effortSource: "model-setting" },
+    }, { cost: 0.0123 });
     expect(m.ua).toBe("claude-cli/2.1.318");
     expect(m.session).toMatch(/^[0-9a-f]{12}$/);
     expect(m.session).not.toContain("abc");
     expect(m.combo).toBe("scout");
     expect(m.realCost).toBe(0.0123);
+    expect(m.clientEffort).toBe("low");
+    expect(m.sentEffort).toBe("high");
+    expect(m.effortSource).toBe("model-setting");
   });
 
   it("marks attribution even without a user-agent", () => {
@@ -17,7 +23,7 @@ describe("spend attribution", () => {
   });
 
   it("returns an empty object without a client request", () => {
-    expect(spendMeta(null, {})).toEqual({});
+    expect(spendMeta(null, {})).toMatchObject({ clientEffort: null, sentEffort: null, effortSource: "none" });
   });
 
   it("maps user-agents to clients", () => {

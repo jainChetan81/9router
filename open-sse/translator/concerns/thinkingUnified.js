@@ -436,11 +436,16 @@ function applyFormat(fmt, body, cfg, caps, supportedLevels, display, model = "")
 // Mutates and returns body. No-op when model has no reasoning capability.
 // `intent` is a pre-captured config (from captureThinking on the original body);
 // falls back to extracting from the current body when omitted.
-export function applyThinking(targetFormat, model, body, provider = null, intent = undefined) {
+export function applyThinking(targetFormat, model, body, provider = null, intent = undefined, modelEffortSetting = null) {
   if (!body || typeof body !== "object") return body;
 
   const { cleanModel, override } = parseSuffix(model);
-  const cfg = override || intent || extractThinking(body);
+  const settingConfig = modelEffortSetting === "none"
+    ? { mode: "none" }
+    : typeof modelEffortSetting === "string"
+      ? { mode: "level", level: modelEffortSetting }
+      : null;
+  const cfg = settingConfig || override || intent || extractThinking(body);
   const caps = getCapabilitiesForModel(provider, cleanModel);
 
   // Model cannot reason → strip any stray thinking fields.

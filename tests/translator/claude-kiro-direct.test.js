@@ -5,6 +5,7 @@ import { describe, it, expect } from "vitest";
 import "./registerAll.js";
 import { translateRequest, translateResponse } from "../../open-sse/translator/index.js";
 import { FORMATS } from "../../open-sse/translator/formats.js";
+import { getModelUpstreamId } from "../../open-sse/config/providerModels.js";
 
 // Kiro rejects a top-level systemPrompt (400 REQUEST_BODY_INVALID; 1892ed77), so the
 // system prompt, thinking tags and agentic prompt travel at the start of the first user
@@ -145,6 +146,20 @@ describe("Claude → Kiro (direct route)", () => {
     });
     expect(kiroPromptOf(out)).not.toContain("<thinking_mode>");
     expect(kiroPromptOf(out)).not.toContain("<max_thinking_length>");
+  });
+
+  it("lets a saved effort override the client and model suffix", () => {
+    const body = {
+      output_config: { effort: "high" },
+      messages: [{ role: "user", content: "use the saved effort" }],
+    };
+    const model = getModelUpstreamId("kr", "claude-sonnet-5.5(high)", body, "low");
+    const out = C2K(body, null, model);
+
+    expect(out.additionalModelRequestFields).toEqual({
+      thinking: { type: "adaptive", display: "summarized" },
+      output_config: { effort: "low" },
+    });
   });
 
   it.each(["auto", "minimal", "ultra"])(
