@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { normalizeThinkingConfig } from "../../open-sse/services/provider.js";
 import { translateRequest } from "../../open-sse/translator/index.js";
 import { FORMATS } from "../../open-sse/translator/formats.js";
+import { extractThinking } from "../../open-sse/translator/concerns/thinkingUnified.js";
 
 describe("normalizeThinkingConfig", () => {
   it("keeps openai reasoning_effort on non-user turns", () => {
@@ -27,5 +28,17 @@ describe("normalizeThinkingConfig", () => {
 
     expect(body.thinking).toBeUndefined();
     expect(translated.reasoning_effort).toBe("high");
+  });
+
+  it("recognizes every client effort shape before provider defaults are injected", () => {
+    const requests = [
+      { reasoning_effort: "high" },
+      { reasoning: { effort: "high" } },
+      { output_config: { effort: "high" } },
+      { thinking: { type: "enabled", budget_tokens: 24576 } },
+      { thinkingConfig: { thinkingLevel: "high" } },
+    ];
+
+    for (const request of requests) expect(extractThinking(request)).not.toBeNull();
   });
 });
