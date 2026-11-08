@@ -501,15 +501,18 @@ export class CodexExecutor extends BaseExecutor {
       delete body.parallel_tool_calls;
     }
 
-    // Extract thinking level from model name suffix
-    // e.g., gpt-5.3-codex-high → high, gpt-5.3-codex → medium (default)
-    const effortLevels = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'];
+    // Extract a supported thinking suffix without consuming a registered model ID.
+    // e.g., gpt-6-luna-max → max, gpt-6-luna → medium (default)
+    const effortLevels = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
     let modelEffort = null;
-    for (const level of effortLevels) {
+    const isRegisteredModel = getProviderModels("cx").some((entry) => entry.id === body.model);
+    if (!isRegisteredModel) for (const level of effortLevels) {
       if (body.model.endsWith(`-${level}`)) {
+        const baseModel = body.model.slice(0, -(level.length + 1));
+        if (!getThinkingLevels("codex", baseModel)?.includes(level)) continue;
         modelEffort = level;
         // Strip suffix from model name for actual API call
-        body.model = body.model.replace(`-${level}`, '');
+        body.model = baseModel;
         break;
       }
     }
