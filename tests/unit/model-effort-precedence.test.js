@@ -177,7 +177,7 @@ describe("saved model effort precedence", () => {
       thinking: { type: "adaptive" },
       stream: false,
     }, "claude", "high", "gemini-3.8-flash-high"],
-    ["disabled Claude thinking", "antigravity", {
+    ["disabled Claude thinking (Gemini 3.8 low floor)", "antigravity", {
       model: "gemini-3.8-flash",
       messages: [{ role: "user", content: "hello" }],
       thinking: { type: "disabled" },

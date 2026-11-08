@@ -75,24 +75,13 @@ describe("Gemini 3.8 Antigravity tiers", () => {
   });
 
   it.each([
-    ["minimal client level", "gemini-3.8-flash", { thinkingConfig: { thinkingLevel: "minimal" } }, "low"],
-    ["explicit none suffix", "gemini-3.8-flash(none)", {}, "low"],
-    ["explicit minimal suffix", "gemini-3.8-flash(minimal)", {}, "low"],
-    ["explicit xhigh suffix", "gemini-3.8-flash(xhigh)", {}, "high"],
-  ])("maps %s to its nearest registered tier and supported thinking level", (_name, model, requestBody, tier) => {
-    const upstreamModel = getModelUpstreamId("ag", model, requestBody);
-    const body = { request: { contents: [], generationConfig: {} } };
-
-    applyThinking(
-      "antigravity",
-      upstreamModel,
-      body,
-      "antigravity",
-      requestBody.reasoning_effort === "none" ? { mode: "none" } : undefined,
-    );
-
-    expect(upstreamModel).toBe(`gemini-3.8-flash-${tier}(${tier})`);
-    expect(body.request.generationConfig.thinkingConfig.thinkingLevel).toBe(tier);
+    ["Gemini minimal thinkingLevel", "gemini-3.8-flash", { thinkingConfig: { thinkingLevel: "minimal" } }, "gemini-3.8-flash-low(low)"],
+    ["none suffix fallback", "gemini-3.8-flash(none)", {}, "gemini-3.8-flash-low(low)"],
+    ["off suffix fallback", "gemini-3.8-flash(off)", {}, "gemini-3.8-flash-low(low)"],
+    ["minimal suffix", "gemini-3.8-flash(minimal)", {}, "gemini-3.8-flash-low(minimal)"],
+    ["xhigh suffix", "gemini-3.8-flash(xhigh)", {}, "gemini-3.8-flash-high(xhigh)"],
+  ])("preserves pre-PR routing for %s, with the no-thinking model floor", (_name, model, requestBody, expectedUpstream) => {
+    expect(getModelUpstreamId("ag", model, requestBody)).toBe(expectedUpstream);
   });
 
   it("preserves explicit model suffix over body", () => {
