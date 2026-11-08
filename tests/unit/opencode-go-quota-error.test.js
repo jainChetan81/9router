@@ -45,6 +45,21 @@ describe("OpenCode Go paid quota error parsing", () => {
     expect(ordinary).not.toHaveProperty("quotaFailure");
   });
 
+  it.each([
+    ["credential-like", "sk-abc123-secret"],
+    ["long junk", "x".repeat(256)],
+  ])("does not retain an unrecognized limit name (%s)", async (_label, limitName) => {
+    const parsed = await parseUpstreamError(
+      response(JSON.stringify({
+        ...quotaFixture,
+        metadata: { ...quotaFixture.metadata, limitName },
+      })),
+      new OpenCodeGoExecutor(),
+    );
+
+    expect(parsed.quotaFailure).toEqual({ kind: "opencode-go-paid", limitName: null });
+  });
+
   it("does not classify the same body under another provider parser", async () => {
     const parsed = await parseUpstreamError(response(JSON.stringify(quotaFixture)), {
       parseError: (upstream, bodyText) => ({ status: upstream.status, message: bodyText }),

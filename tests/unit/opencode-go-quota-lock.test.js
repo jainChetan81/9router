@@ -78,6 +78,7 @@ const {
   markAccountUnavailable,
 } = await import("../../src/sse/services/auth.js");
 const { getModelQuotaScope } = await import("../../open-sse/config/providerModels.js");
+const { OPENCODE_GO_PROBE_LEASE_MS } = await import("../../open-sse/config/errorConfig.js");
 const { getOpenCodeGoCredentialFingerprint } = await import("../../src/lib/db/credentialFingerprint.js");
 mocks.getOpenCodeGoCredentialFingerprint = getOpenCodeGoCredentialFingerprint;
 
@@ -158,8 +159,8 @@ describe("OpenCode Go paid quota lock", () => {
     ];
     try {
       const [first, second] = await Promise.all([
-        getProviderCredentials("opencode-go", null, "paid-model"),
-        getProviderCredentials("opencode-go", null, "paid-model"),
+        getProviderCredentials("opencode-go", null, "paid-model", { allowQuotaProbe: true }),
+        getProviderCredentials("opencode-go", null, "paid-model", { allowQuotaProbe: true }),
       ]);
 
       expect(first.connectionId).not.toBe(second.connectionId);
@@ -168,6 +169,25 @@ describe("OpenCode Go paid quota lock", () => {
       await expect(getProviderCredentials("opencode-go", null, "paid-model")).resolves.toMatchObject({
         allRateLimited: true,
       });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a due lock for non-chat callers while allowing chat to acquire its probe", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-08T12:00:00.000Z"));
+    mocks.state.connections = [connection("go-non-chat", lock("2026-11-08T11:59:00.000Z"))];
+    try {
+      const nonChatCredentials = await getProviderCredentials("opencode-go", null, "paid-model");
+      expect(nonChatCredentials).toMatchObject({ allRateLimited: true });
+      expect(nonChatCredentials).not.toHaveProperty("quotaProbe");
+
+      const chatCredentials = await getProviderCredentials(
+        "opencode-go", null, "paid-model", { allowQuotaProbe: true },
+      );
+      expect(chatCredentials.connectionId).toBe("go-non-chat");
+      expect(chatCredentials.quotaProbe).toMatchObject({ generation: "generation-a", token: expect.any(String) });
     } finally {
       vi.useRealTimers();
     }
@@ -222,6 +242,26 @@ describe("OpenCode Go paid quota lock", () => {
     }
   });
 
+  it.each([
+    ["credential-like", "sk-abc123-secret"],
+    ["long junk", "x".repeat(256)],
+  ])("stores null for an unrecognized quota limit (%s)", async (_label, limitName) => {
+    mocks.state.connections = [connection("go-invalid-limit")];
+    const credentials = await getProviderCredentials("opencode-go", null, "paid-model");
+
+    await markAccountUnavailable(
+      "go-invalid-limit", 429, "upstream free-form error", "opencode-go", "paid-model", null,
+      { kind: "opencode-go-paid", limitName }, null, credentials.quotaCredentialFingerprint,
+    );
+
+    expect(mocks.state.connections[0].quotaLock_opencodeGoPaid).toMatchObject({
+      reason: "GoUsageLimitError",
+      limitName: null,
+    });
+    expect(mocks.state.connections[0].quotaLock_opencodeGoPaid.reason).not.toContain("upstream free-form error");
+    expect(mocks.state.connections[0].lastError).toBe("upstream free-form error");
+  });
+
   it("upgrades the fallback to the matching usage API reset", async () => {
     const resetAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
     mocks.state.connections = [connection("go-usage")];
@@ -267,7 +307,7 @@ describe("OpenCode Go paid quota lock", () => {
     vi.setSystemTime(new Date("2026-11-08T12:00:00.000Z"));
     mocks.state.connections = [connection("go-probe", lock("2026-11-08T11:59:00.000Z"))];
     try {
-      const first = await getProviderCredentials("opencode-go", null, "paid-model");
+      const first = await getProviderCredentials("opencode-go", null, "paid-model", { allowQuotaProbe: true });
       expect(first.quotaProbe).toMatchObject({ generation: "generation-a", token: expect.any(String) });
       await expect(getProviderCredentials("opencode-go", null, "paid-model")).resolves.toMatchObject({
         allRateLimited: true,
@@ -285,7 +325,7 @@ describe("OpenCode Go paid quota lock", () => {
     vi.setSystemTime(new Date("2026-11-08T12:00:00.000Z"));
     mocks.state.connections = [connection("go-renew", lock("2026-11-08T11:59:00.000Z", "old-generation"))];
     try {
-      const probeCredentials = await getProviderCredentials("opencode-go", null, "paid-model");
+      const probeCredentials = await getProviderCredentials("opencode-go", null, "paid-model", { allowQuotaProbe: true });
       await markAccountUnavailable(
         "go-renew", 429, "Go usage limit exceeded", "opencode-go", "paid-model", null,
         { kind: "opencode-go-paid", limitName: "weekly" }, probeCredentials.quotaProbe,
@@ -308,15 +348,84 @@ describe("OpenCode Go paid quota lock", () => {
     }
   });
 
+  it("does not let an expired probe clear a lock owned by a later probe", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-08T12:00:00.000Z"));
+    mocks.state.connections = [connection("go-probe-race", lock("2026-11-08T11:59:00.000Z", "generation-race"))];
+    try {
+      const probeA = await getProviderCredentials("opencode-go", null, "paid-model", { allowQuotaProbe: true });
+      await vi.advanceTimersByTimeAsync(OPENCODE_GO_PROBE_LEASE_MS + 1);
+      const probeB = await getProviderCredentials("opencode-go", null, "paid-model", { allowQuotaProbe: true });
+
+      expect(probeB.quotaProbe.token).not.toBe(probeA.quotaProbe.token);
+      await expect(completeOpenCodeGoQuotaProbe("go-probe-race", probeA.quotaProbe, "success"))
+        .resolves.toMatchObject({ updated: false });
+      expect(mocks.state.connections[0].quotaLock_opencodeGoPaid.generation).toBe("generation-race");
+
+      await markAccountUnavailable(
+        "go-probe-race", 429, "Go usage limit exceeded", "opencode-go", "paid-model", null,
+        { kind: "opencode-go-paid", limitName: "weekly" }, probeB.quotaProbe,
+        probeB.quotaCredentialFingerprint,
+      );
+      const renewedLock = mocks.state.connections[0].quotaLock_opencodeGoPaid;
+      expect(renewedLock.generation).not.toBe("generation-race");
+      expect(renewedLock.reason).toBe("GoUsageLimitError");
+      await completeOpenCodeGoQuotaProbe("go-probe-race", probeB.quotaProbe, "quota-error");
+      expect(mocks.state.connections[0].quotaLock_opencodeGoPaid).toEqual(renewedLock);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("relocks after a stale probe reports exhaustion against a cleared lock", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-08T12:00:00.000Z"));
+    mocks.state.connections = [connection("go-probe-stale", lock("2026-11-08T11:59:00.000Z", "generation-old"))];
+    try {
+      const staleProbe = await getProviderCredentials(
+        "opencode-go", null, "paid-model", { allowQuotaProbe: true },
+      );
+      await vi.advanceTimersByTimeAsync(OPENCODE_GO_PROBE_LEASE_MS + 1);
+      delete mocks.state.connections[0].quotaLock_opencodeGoPaid;
+
+      await markAccountUnavailable(
+        "go-probe-stale", 429, "Go usage limit exceeded", "opencode-go", "paid-model", null,
+        { kind: "opencode-go-paid", limitName: "weekly" }, staleProbe.quotaProbe,
+        staleProbe.quotaCredentialFingerprint,
+      );
+
+      expect(mocks.observeOpenCodeGoPaidQuotaLockIfGeneration).not.toHaveBeenCalled();
+      expect(mocks.setOpenCodeGoPaidQuotaLockIfCredentialFingerprint).toHaveBeenCalledWith(
+        "go-probe-stale",
+        staleProbe.quotaCredentialFingerprint,
+        expect.objectContaining({ reason: "GoUsageLimitError" }),
+        expect.any(Object),
+      );
+      expect(mocks.state.connections[0].quotaLock_opencodeGoPaid).toMatchObject({
+        reason: "GoUsageLimitError",
+        limitName: "weekly",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("clears only a matching generation after paid success", async () => {
     mocks.state.connections = [connection("go-clear", lock("2026-11-08T11:00:00.000Z", "current"))];
-    await expect(completeOpenCodeGoQuotaProbe("go-clear", { generation: "stale", token: "old" }, "success"))
-      .resolves.toMatchObject({ updated: false });
-    expect(mocks.state.connections[0].quotaLock_opencodeGoPaid.generation).toBe("current");
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-08T12:00:00.000Z"));
+    try {
+      const credentials = await getProviderCredentials("opencode-go", null, "paid-model", { allowQuotaProbe: true });
+      await expect(completeOpenCodeGoQuotaProbe("go-clear", { generation: "current", token: "old" }, "success"))
+        .resolves.toMatchObject({ updated: false });
+      expect(mocks.state.connections[0].quotaLock_opencodeGoPaid.generation).toBe("current");
 
-    await expect(completeOpenCodeGoQuotaProbe("go-clear", { generation: "current", token: "new" }, "success"))
-      .resolves.toMatchObject({ updated: true });
-    expect(mocks.state.connections[0]).not.toHaveProperty("quotaLock_opencodeGoPaid");
+      await expect(completeOpenCodeGoQuotaProbe("go-clear", credentials.quotaProbe, "success"))
+        .resolves.toMatchObject({ updated: true });
+      expect(mocks.state.connections[0]).not.toHaveProperty("quotaLock_opencodeGoPaid");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("preserves a paid lock after free success and uses ordinary backoff for a free quota error", async () => {

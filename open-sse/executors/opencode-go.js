@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { DefaultExecutor } from "./default.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
+import { OPENCODE_GO_QUOTA_LIMIT_NAMES } from "../config/errorConfig.js";
 import { getModelTargetFormat } from "../config/providerModels.js";
 import { FORMATS } from "../translator/formats.js";
 import {
@@ -127,9 +128,11 @@ export class OpenCodeGoExecutor extends DefaultExecutor {
       return super.parseError(response, bodyText);
     }
 
-    const limitName = typeof body.metadata?.limitName === "string"
-      && /^[a-z][a-z0-9_-]{0,31}$/i.test(body.metadata.limitName.trim())
-      ? body.metadata.limitName.trim()
+    const normalizedLimitName = typeof body.metadata?.limitName === "string"
+      ? body.metadata.limitName.trim().toLowerCase()
+      : "";
+    const limitName = OPENCODE_GO_QUOTA_LIMIT_NAMES.includes(normalizedLimitName)
+      ? normalizedLimitName
       : null;
     const resetAt = body.metadata?.resetAt ?? body.metadata?.reset_at;
     const resetAtMs = typeof resetAt === "number"

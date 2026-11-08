@@ -13,7 +13,7 @@ import {
 } from "open-sse/services/accountFallback.js";
 import {
   MAX_RATE_LIMIT_COOLDOWN_MS, OPENCODE_GO_QUOTA_RECHECK_MS,
-  OPENCODE_GO_PROBE_LEASE_MS, TRANSIENT_COOLDOWN_MS,
+  OPENCODE_GO_PROBE_LEASE_MS, OPENCODE_GO_QUOTA_LIMIT_NAMES, TRANSIENT_COOLDOWN_MS,
 } from "open-sse/config/errorConfig.js";
 import { getModelQuotaScope } from "open-sse/config/providerModels.js";
 import { getOpenCodeGoUsage } from "open-sse/services/usage/opencode-go.js";
@@ -36,6 +36,15 @@ function setLatestBlocker(blockers, connectionId, retryAt) {
 
 function hasOpenCodeGoPaidQuotaLock(connection) {
   return !!connection?.[OPENCODE_GO_PAID_QUOTA_LOCK];
+}
+
+function ownsOpenCodeGoQuotaProbeLease(connectionId, probe) {
+  const lease = quotaProbeLeases.get(connectionId);
+  return !!probe?.token
+    && !!probe?.generation
+    && lease?.token === probe.token
+    && lease.generation === probe?.generation
+    && lease.expiresAt > Date.now();
 }
 
 const GITHUB_MONTHLY_USAGE_LIMIT = "you've reached your additional usage limit for your plan";
@@ -61,6 +70,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     : (excludeConnectionIds ? new Set([excludeConnectionIds]) : new Set());
   const preferredConnectionId = options?.preferredConnectionId || null;
   const requestedModel = options?.requestedModel || model;
+  const allowQuotaProbe = options?.allowQuotaProbe === true;
   const quotaProbeCandidates = new Map();
   let selectedProbe = null;
   let selectionReturned = false;
@@ -141,6 +151,11 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         const retryAtMs = new Date(quotaLock.retryAt).getTime();
         if (!Number.isFinite(retryAtMs) || retryAtMs <= now) {
           const lease = quotaProbeLeases.get(c.id);
+          if (!allowQuotaProbe) {
+            const deferUntil = lease?.expiresAt > now ? lease.expiresAt : now + OPENCODE_GO_PROBE_LEASE_MS;
+            setLatestBlocker(blockers, c.id, new Date(deferUntil).toISOString());
+            continue;
+          }
           if (lease && lease.expiresAt > now) {
             setLatestBlocker(blockers, c.id, Math.max(now + 1, lease.expiresAt));
             continue;
@@ -352,13 +367,12 @@ async function upgradeOpenCodeGoQuotaLockFromUsage(connection, lock, quotaFailur
 /** Complete one request-driven paid quota probe using its observed generation. */
 export async function completeOpenCodeGoQuotaProbe(connectionId, probe, outcome) {
   if (!connectionId || !probe?.generation || !probe?.token) return { updated: false, connection: null };
-  const currentLease = quotaProbeLeases.get(connectionId);
-  const ownsLease = currentLease?.token === probe.token;
+  const ownsLease = ownsOpenCodeGoQuotaProbeLease(connectionId, probe);
   let result = { updated: false, connection: null };
   try {
-    if (outcome === "success") {
+    if (outcome === "success" && ownsLease) {
       result = await clearOpenCodeGoPaidQuotaLockIfGeneration(connectionId, probe.generation);
-    } else if (outcome === "inconclusive" && (!currentLease || ownsLease)) {
+    } else if (outcome === "inconclusive" && ownsLease) {
       result = await updateOpenCodeGoPaidQuotaLockIfGeneration(connectionId, probe.generation, {
         retryAt: new Date(Date.now() + TRANSIENT_COOLDOWN_MS).toISOString(),
       });
@@ -395,7 +409,12 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
   if (Number(status) === 429 && quotaFailure?.kind === "opencode-go-paid"
     && providerId === "opencode-go" && getModelQuotaScope("opencode-go", model) === "paid") {
     const now = Date.now();
-    const limitName = typeof quotaFailure.limitName === "string" ? quotaFailure.limitName : null;
+    const normalizedLimitName = typeof quotaFailure.limitName === "string"
+      ? quotaFailure.limitName.trim().toLowerCase()
+      : "";
+    const limitName = OPENCODE_GO_QUOTA_LIMIT_NAMES.includes(normalizedLimitName)
+      ? normalizedLimitName
+      : null;
     const lock = {
       version: 1,
       reason: "GoUsageLimitError",
@@ -413,13 +432,14 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
       lastErrorAt: lock.observedAt,
       backoffLevel: 0,
     };
-    const observation = quotaProbe?.generation
+    let observation = quotaProbe?.generation && ownsOpenCodeGoQuotaProbeLease(connectionId, quotaProbe)
       ? await observeOpenCodeGoPaidQuotaLockIfGeneration(connectionId, quotaProbe.generation, lock, healthPatch)
-      : quotaCredentialFingerprint
-        ? await setOpenCodeGoPaidQuotaLockIfCredentialFingerprint(
-          connectionId, quotaCredentialFingerprint, lock, healthPatch,
-        )
-        : { updated: false, connection: null };
+      : { updated: false, connection: null };
+    if (!observation?.updated && quotaCredentialFingerprint) {
+      observation = await setOpenCodeGoPaidQuotaLockIfCredentialFingerprint(
+        connectionId, quotaCredentialFingerprint, lock, healthPatch,
+      );
+    }
     if (!observation?.updated) {
       return { shouldFallback: true, cooldownMs: OPENCODE_GO_QUOTA_RECHECK_MS };
     }
