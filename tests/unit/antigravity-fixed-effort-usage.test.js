@@ -84,4 +84,34 @@ describe("Antigravity fixed-tier effort attribution", () => {
       effortSource: "suffix",
     });
   });
+
+  it("sends a single-level model's fixed effort over client effort", async () => {
+    const body = {
+      model: "hy4-preview",
+      stream: false,
+      reasoning_effort: "low",
+      messages: [{ role: "user", content: "hello" }],
+    };
+
+    await handleChatCore({
+      body,
+      modelInfo: { provider: "codebuddy-cn", model: "hy4-preview" },
+      credentials: { accessToken: "test-token", providerSpecificData: {} },
+      log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn() },
+      connectionId: "codebuddy-fixed-effort-test",
+      rtkEnabled: false,
+      headroomEnabled: false,
+      cavemanEnabled: false,
+      ponytailEnabled: false,
+      pxpipeEnabled: false,
+      sourceFormatOverride: "openai",
+      clientRawRequest: {
+        endpoint: "/v1/chat/completions",
+        body,
+        headers: { accept: "application/json", "user-agent": "model-effort-test" },
+      },
+    });
+
+    expect(executeMock.mock.calls.at(-1)[0].body.reasoning_effort).toBe("high");
+  });
 });

@@ -118,13 +118,15 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const targetFormat = useTransport?.format || modelTargetFormat || getTargetFormat(provider, credentials);
   if (useTransport && credentials) credentials.runtimeTransport = useTransport;
   const stripList = getModelStrip(alias, model);
-  const modelSuffixModel = getModelUpstreamId(alias, model, null, modelEffortSetting);
+  const fixedEffort = getFixedEffortLevel(provider, model);
+  const modelEffortOverride = fixedEffort || modelEffortSetting;
+  const modelSuffixModel = getModelUpstreamId(alias, model, null, modelEffortOverride);
   const modelSuffixIntent = parseSuffix(modelSuffixModel).override;
 
   // Inject provider-level thinking config override when the client has no intent.
   // on/off → extended type (body.thinking), none/low/medium/high → effort type (body.reasoning_effort)
   const hasClientThinkingIntent = extractThinking(body) !== null;
-  if (providerThinking?.mode && providerThinking.mode !== "auto" && !hasClientThinkingIntent && !modelEffortSetting && !modelSuffixIntent) {
+  if (providerThinking?.mode && providerThinking.mode !== "auto" && !hasClientThinkingIntent && !modelEffortOverride && !modelSuffixIntent) {
     const mode = providerThinking.mode;
     providerDefaultApplied = true;
     if (mode === "on") {
@@ -137,17 +139,16 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     }
   }
 
-  const upstreamModel = getModelUpstreamId(alias, model, body, modelEffortSetting);
+  const upstreamModel = getModelUpstreamId(alias, model, body, modelEffortOverride);
   const explicitSuffix = parseSuffix(model).override;
-  const fixedEffort = getFixedEffortLevel(provider, model);
   const routedSuffix = parseSuffix(upstreamModel).override;
   let effortSource = modelEffortSetting
     ? "model-setting"
-    : explicitSuffix || fixedEffort || routedSuffix
+    : explicitSuffix || routedSuffix || fixedEffort
       ? "suffix"
       : originalThinkingIntent
         ? "client"
-        : providerDefaultApplied || parseSuffix(upstreamModel).override
+        : providerDefaultApplied
           ? "provider-default"
           : null;
 
@@ -225,7 +226,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     if (provider === "codex") {
       const normalizedThinking = {};
       const providerDefault = providerDefaultApplied ? extractThinking(translatedBody) : undefined;
-      applyThinking(sourceFormat, upstreamModel, normalizedThinking, provider, providerDefault, modelEffortSetting);
+      applyThinking(sourceFormat, upstreamModel, normalizedThinking, provider, providerDefault, modelEffortOverride);
       const effort = normalizedThinking.reasoning_effort
         ?? (typeof normalizedThinking.reasoning === "object" ? normalizedThinking.reasoning.effort : null);
       if (typeof effort === "string") {
@@ -236,11 +237,11 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
         };
         delete translatedBody.reasoning_effort;
       }
-    } else if (modelEffortSetting || parseSuffix(upstreamModel).override || providerDefaultApplied) {
+    } else if (modelEffortOverride || routedSuffix || providerDefaultApplied) {
       const priorOutputConfig = translatedBody.output_config && typeof translatedBody.output_config === "object"
         ? { ...translatedBody.output_config }
         : null;
-      applyThinking(sourceFormat, upstreamModel, translatedBody, provider, undefined, modelEffortSetting);
+      applyThinking(sourceFormat, upstreamModel, translatedBody, provider, undefined, modelEffortOverride);
       if (priorOutputConfig) {
         const normalizedOutputConfig = translatedBody.output_config && typeof translatedBody.output_config === "object"
           ? translatedBody.output_config
@@ -256,7 +257,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     // Normalize newer Cowork/CC beta shapes (adaptive thinking, mid-conversation system) the API rejects
     if (clientTool === "claude") normalizeClaudePassthrough(translatedBody, translatedBody.model);
   } else {
-    translatedBody = translateRequest(sourceFormat, targetFormat, upstreamModel, body, stream, credentials, provider, reqLogger, stripList, connectionId, clientTool, modelEffortSetting);
+    translatedBody = translateRequest(sourceFormat, targetFormat, upstreamModel, body, stream, credentials, provider, reqLogger, stripList, connectionId, clientTool, modelEffortOverride);
     if (!translatedBody) {
       trackPendingRequest(model, provider, connectionId, false, true);
       return createErrorResult(HTTP_STATUS.BAD_REQUEST, `Failed to translate request for ${sourceFormat} → ${targetFormat}`);
