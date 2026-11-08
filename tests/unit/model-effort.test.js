@@ -4,8 +4,18 @@ import { getFixedEffortLevel, getModelEffortKey, resolveModelEffortSetting } fro
 describe("per-model effort resolution", () => {
   it("stores provider aliases under their canonical provider ID", () => {
     expect(getModelEffortKey("cx", "gpt-6-luna(high)")).toBe("codex/gpt-6-luna");
+    expect(getModelEffortKey("cx", "gpt-6-luna-max")).toBe("codex/gpt-6-luna");
     expect(getModelEffortKey("codex", "gpt-6-luna")).toBe("codex/gpt-6-luna");
     expect(getModelEffortKey("kiro", "claude-sonnet-4-5")).toBe("kiro/claude-sonnet-4.5");
+  });
+
+  it("keeps registered model IDs that end in an effort word", () => {
+    expect(getModelEffortKey("ag", "gemini-3.8-flash-high")).toBe("antigravity/gemini-3.8-flash-high");
+  });
+
+  it("resolves a saved model setting for a Codex hyphen effort suffix", () => {
+    const overrides = { "codex/gpt-6-luna": { effort: "low" } };
+    expect(resolveModelEffortSetting(overrides, "cx", "gpt-6-luna-max")).toBe("low");
   });
 
   it("resolves each target model independently for combo fallbacks", () => {

@@ -6,8 +6,26 @@ import { stripThinkingSuffix } from "../translator/concerns/thinkingUnified.js";
 // modelOverrides keys use the registry provider ID and canonical registry model ID: codex/gpt-6-luna.
 export function getModelEffortKey(provider, model) {
   const canonicalProvider = resolveProviderAlias(provider);
-  const cleanModel = stripThinkingSuffix(model);
   const alias = PROVIDER_ID_TO_ALIAS[canonicalProvider] || canonicalProvider;
+  let cleanModel = stripThinkingSuffix(model);
+
+  // Codex accepts effort as a trailing hyphen suffix (for example,
+  // gpt-6-luna-max), but these suffix variants are not registry models. Keep
+  // registered ids intact because providers can publish real ids ending in a
+  // supported effort word, such as gemini-3.8-flash-high.
+  if (!getModelMeta(alias, cleanModel) && typeof cleanModel === "string") {
+    const suffixMatch = cleanModel.match(/-(none|minimal|low|medium|high|xhigh|max)$/i);
+    if (suffixMatch) {
+      const baseModel = cleanModel.slice(0, suffixMatch.index);
+      const suffix = suffixMatch[1].toLowerCase();
+      const supportedLevels = getThinkingLevels(canonicalProvider, baseModel) || [];
+      const normalizedSuffix = suffix === "max" ? "xhigh" : suffix;
+      if (getModelMeta(alias, baseModel) && supportedLevels.includes(normalizedSuffix)) {
+        cleanModel = baseModel;
+      }
+    }
+  }
+
   const canonicalModel = getModelMeta(alias, cleanModel)?.id || cleanModel;
   return `${canonicalProvider}/${canonicalModel}`;
 }
