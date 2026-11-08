@@ -150,6 +150,7 @@ export function buildView({ data, quota, ui, set, fit, range, feeRefs, saveFees 
   let rowsSrc;
   if (ui.group === "key") rowsSrc = G.key.map((o) => mk(o.k, o.clients.length ? o.clients.join(", ") : "Client not recorded", o));
   else if (ui.group === "model") rowsSrc = G.model.map((o) => mk(o.k, srcLine(o), o));
+  else if (ui.group === "modelEffort") rowsSrc = G.modelEffort.map((o) => mk(o.model, `Effort: ${o.effort}`, o));
   else if (ui.group === "role") rowsSrc = G.role.map((o) => mk(o.k, (ROLEDESC[o.k] || "combo") + " · " + (data.roleCount[o.k] || 0) + " sessions", o));
   else if (ui.group === "client") rowsSrc = G.client.map((o) => {
     const tot = o.mix.reduce((a, e) => a + e[1], 0) || 1;
@@ -172,9 +173,9 @@ export function buildView({ data, quota, ui, set, fit, range, feeRefs, saveFees 
     real: x.nr ? "not logged" : x.real >= 0.005 ? usd(x.real, 1) : x.real > 0 ? "<$0.01" : "—", realC: x.real > 0 && !x.nr ? "var(--acc)" : "var(--tx3)",
     value: x.v ? usd(x.v) : "$0.00", share: ((x.v / list) * 100).toFixed(1) + "%", shareL: ((x.v / list) * 100 < 0.1 && x.v > 0 ? "<0.1" : ((x.v / list) * 100).toFixed(1)) + "%",
   }));
-  const groups = [["key", "API key"], ["model", "Model"], ["role", "Combo/Role"], ["client", "Client"], ["session", "Session"], ["provider", "Provider"]]
+  const groups = [["key", "API key"], ["model", "Model"], ["modelEffort", "Model + effort"], ["role", "Combo/Role"], ["client", "Client"], ["session", "Session"], ["provider", "Provider"]]
     .map(([k, label]) => ({ label, style: seg(ui.group === k), on: () => set({ group: k }) }));
-  const groupHead = { key: "API KEY", model: "MODEL", role: "COMBO / ROLE", client: "CLIENT", session: "SESSION", provider: "PROVIDER" }[ui.group];
+  const groupHead = { key: "API KEY", model: "MODEL", modelEffort: "MODEL + EFFORT", role: "COMBO / ROLE", client: "CLIENT", session: "SESSION", provider: "PROVIDER" }[ui.group];
 
   // Agents and sessions
   const LL = Math.max(data.sessionValue, 0.01);

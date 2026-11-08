@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { getAdapter } from "@/lib/db/driver.js";
 import { getSettings, updateSettings } from "@/lib/localDb";
 import { clientOf } from "@/lib/spendClient.js";
+import { addModelEffortUsage } from "@/lib/spend/modelEffortGroups.js";
 
 export const dynamic = "force-dynamic";
 
@@ -79,7 +80,7 @@ export async function GET(request) {
       };
     });
 
-    const byKey = new Map(), byModel = new Map(), byCombo = new Map(), byClient = new Map(), bySess = new Map(), byProv = new Map();
+    const byKey = new Map(), byModel = new Map(), byModelEffort = new Map(), byCombo = new Map(), byClient = new Map(), bySess = new Map(), byProv = new Map();
     const subs = Object.fromEntries(SUBS.map((s) => [s.k, 0]));
     let value = 0, real = 0, realEst = 0, list = 0, req = 0, tok = 0, realOr = 0, realDs = 0, nrList = 0, nrReq = 0, nrTok = 0;
     const top = [];
@@ -97,6 +98,7 @@ export async function GET(request) {
       if (est) realEst += cost;
       const sk = SUB_OF[r.provider];
       const t = (r.promptTokens || 0) + (r.completionTokens || 0);
+      addModelEffortUsage(byModelEffort, { model: r.model, effort: meta.sentEffort, cost, real: rReal, tokens: t });
       b.list += cost; b.real += rReal;
       const keyName0 = keyNames.get(r.apiKey) || (r.apiKey ? "Unknown key" : "No key");
       (b.keys ||= new Map()).set(keyName0, (b.keys.get(keyName0) || 0) + cost);
@@ -160,7 +162,10 @@ export async function GET(request) {
       allLogged: loggedSince !== null && loggedSince <= range.from,
       subsMeta: SUBS,
       fees: settings.spendFees || {},
-      groups: { key: pack(byKey), model: pack(byModel), role: pack(byCombo), client: pack(byClient), provider: pack(byProv) },
+      groups: {
+        key: pack(byKey), model: pack(byModel), modelEffort: [...byModelEffort.values()].sort((a, b) => b.v - a.v),
+        role: pack(byCombo), client: pack(byClient), provider: pack(byProv),
+      },
       roleCount, sessionCount: sessions.length, sessionValue: sessions.reduce((a, s) => a + s.v, 0),
       sessionRest: sessions.slice(8).reduce((a, s) => ({ v: a.v + s.v, real: a.real + s.real, req: a.req + s.req, tok: a.tok + s.tok }), { v: 0, real: 0, req: 0, tok: 0 }),
       sessions: sessOut, outliers: { value: byValue, real: byReal }, topBars,

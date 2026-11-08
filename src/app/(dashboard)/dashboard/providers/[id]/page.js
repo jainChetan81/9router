@@ -15,6 +15,7 @@ import { translate } from "@/i18n/runtime";
 import { fetchSuggestedModels } from "@/shared/utils/providerModelsFetcher";
 import { getProviderCustomModelRows } from "@/shared/utils/providerCustomModels";
 import ModelRow from "./ModelRow";
+import ModelEffortSelect from "./ModelEffortSelect";
 import PassthroughModelsSection from "./PassthroughModelsSection";
 import CompatibleModelsSection from "./CompatibleModelsSection";
 import ConnectionRow from "./ConnectionRow";
@@ -75,6 +76,8 @@ export default function ProviderDetailPage() {
   const [providerStrategy, setProviderStrategy] = useState(null);
   const [providerStickyLimit, setProviderStickyLimit] = useState("");
   const [thinkingMode, setThinkingMode] = useState("auto");
+  const [modelOverrides, setModelOverrides] = useState({});
+  const [modelEffortError, setModelEffortError] = useState("");
   const [autoPing, setAutoPing] = useState({ enabled: false, connections: {}, schedules: {} });
   const [scheduleConnection, setScheduleConnection] = useState(null);
   const [suggestedModels, setSuggestedModels] = useState([]);
@@ -321,6 +324,7 @@ export default function ProviderDetailPage() {
       const nodesData = await nodesRes.json();
       const proxyPoolsData = await proxyPoolsRes.json();
       const settingsData = settingsRes.ok ? await settingsRes.json() : {};
+      setModelOverrides(settingsData.modelOverrides || {});
       if (connectionsRes.ok) {
         const filtered = (connectionsData.connections || []).filter(c => c.provider === providerId);
         setConnections(filtered);
@@ -442,6 +446,23 @@ export default function ProviderDetailPage() {
       });
     } catch (error) {
       console.log("Error saving thinking config:", error);
+    }
+  };
+
+  const saveModelEffort = async (modelId, effort) => {
+    setModelEffortError("");
+    try {
+      const res = await fetch("/api/settings/model-effort", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: providerId, model: modelId, effort }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to save model effort");
+      setModelOverrides(data.modelOverrides || {});
+    } catch (error) {
+      setModelEffortError(error.message || "Failed to save model effort");
+      throw error;
     }
   };
 
@@ -1166,6 +1187,7 @@ export default function ProviderDetailPage() {
     if (isCompatible) {
       return (
         <CompatibleModelsSection
+          providerId={providerId}
           providerStorageAlias={providerStorageAlias}
           providerDisplayAlias={providerDisplayAlias}
           modelAliases={modelAliases}
@@ -1178,6 +1200,8 @@ export default function ProviderDetailPage() {
           onDeleteCustomModel={(modelId) => handleDeleteCustomModel(modelId, "llm", providerStorageAlias)}
           connections={connections}
           isAnthropic={isAnthropicCompatible}
+          modelOverrides={modelOverrides}
+          onModelEffortChange={saveModelEffort}
         />
       );
     }
@@ -1224,6 +1248,7 @@ export default function ProviderDetailPage() {
             isFree={false}
             caps={getCaps(`${providerId}/${model.id}`)}
             thinkingSuffix={resolveThinkingSuffix(model.id)}
+            effortControl={<ModelEffortSelect providerId={providerId} modelId={model.id} modelOverrides={modelOverrides} onChange={saveModelEffort} />}
           />
         ))}
 
@@ -1250,6 +1275,7 @@ export default function ProviderDetailPage() {
               onDisable={() => handleDisableModel(model.id)}
               caps={getCaps(`${providerId}/${model.id}`)}
               thinkingSuffix={resolveThinkingSuffix(model.id)}
+              effortControl={<ModelEffortSelect providerId={providerId} modelId={model.id} modelOverrides={modelOverrides} onChange={saveModelEffort} />}
             />
           );
         })}
@@ -1776,22 +1802,24 @@ export default function ProviderDetailPage() {
       {/* Models */}
       <Card>
         <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex items-center gap-3">
-            <h2 className="text-lg font-semibold">
-              {"Available Models"}
-            </h2>
-            {providerThinkingLevels && (
-              <select
-                value={thinkingMode}
-                onChange={(e) => handleThinkingModeChange(e.target.value)}
-                title="Appends (level) suffix to copied model names"
-                className="rounded-md border border-border bg-background px-2 py-1 text-xs focus:border-primary focus:outline-none"
-              >
-                {providerThinkingLevels.map((opt) => (
-                  <option key={opt} value={opt}>{`Thinking: ${opt.charAt(0).toUpperCase() + opt.slice(1)}`}</option>
-                ))}
-              </select>
-            )}
+          <div className="flex min-w-0 flex-col gap-1">
+            <div className="flex flex-wrap items-center gap-3">
+              <h2 className="text-lg font-semibold">{"Available Models"}</h2>
+              {providerThinkingLevels && (
+                <select
+                  value={thinkingMode}
+                  onChange={(e) => handleThinkingModeChange(e.target.value)}
+                  title="Appends (level) suffix to copied model names"
+                  className="rounded-md border border-border bg-background px-2 py-1 text-xs focus:border-primary focus:outline-none"
+                >
+                  {providerThinkingLevels.map((opt) => (
+                    <option key={opt} value={opt}>{`Thinking: ${opt.charAt(0).toUpperCase() + opt.slice(1)}`}</option>
+                  ))}
+                </select>
+              )}
+            </div>
+            <p className="text-xs text-text-muted">Auto respects client requests and defaults. A selected level applies to every request for this model.</p>
+            {!!modelEffortError && <p className="text-xs text-red-500">{modelEffortError}</p>}
           </div>
           {!isCompatible && (() => {
             const allIds = [
