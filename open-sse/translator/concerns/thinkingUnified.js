@@ -257,6 +257,12 @@ function stripAll(body) {
   }
 }
 
+export function stripThinkingConfig(body) {
+  if (!body || typeof body !== "object") return body;
+  stripAll(body);
+  return body;
+}
+
 // Apply unified thinking config to body in the resolved provider-native format.
 function applyFormat(fmt, body, cfg, caps, supportedLevels, display, model = "") {
   const none = cfg.mode === "none";

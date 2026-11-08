@@ -1,6 +1,6 @@
 import { detectFormat, getTargetFormat, resolveTransport } from "../services/provider.js";
 import { translateRequest } from "../translator/index.js";
-import { applyThinking, extractThinking, parseSuffix, stripThinkingSuffix } from "../translator/concerns/thinkingUnified.js";
+import { applyThinking, extractThinking, parseSuffix, stripThinkingConfig, stripThinkingSuffix } from "../translator/concerns/thinkingUnified.js";
 import { FORMATS } from "../translator/formats.js";
 import { normalizeClaudePassthrough, anchorClaudeCache } from "../translator/formats/claude.js";
 import { createStreamController } from "../utils/streamHandler.js";
@@ -120,25 +120,20 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const stripList = getModelStrip(alias, model);
   const fixedEffort = getFixedEffortLevel(provider, model);
   const modelMeta = getModelMeta(alias, model);
-  const hasExplicitFixedEffort = typeof modelMeta?.fixedEffort === "string";
-  const savedEffort = modelOverrides?.[getModelEffortKey(provider, model)]?.effort;
-  const hasSavedEffort = savedEffort != null && savedEffort !== "";
-  const hasProviderEffort = providerThinking?.mode && providerThinking.mode !== "auto";
-  const hasModelSuffixEffort = parseSuffix(model).override != null;
-  // Bare-upstream presets preserve the existing default payload when no effort
-  // was requested. Pin them when a client, saved setting, or provider default
-  // tries to choose an effort. Presets with an upstream (level) suffix stay
-  // pinned on every request.
-  const fixedEffortApplied = fixedEffort != null
-    && (!hasExplicitFixedEffort || originalThinkingIntent !== null || hasSavedEffort || hasProviderEffort || hasModelSuffixEffort);
-  const modelEffortOverride = fixedEffortApplied ? fixedEffort : modelEffortSetting;
+  const fixedEffortInModelId = modelMeta?.fixedEffortInModelId === true;
+  // A fixed preset always pins the translated request, even when the client
+  // provides no effort. The executor may select the level from the model ID.
+  const fixedEffortApplied = fixedEffort != null;
+  const modelEffortOverride = fixedEffortInModelId
+    ? null
+    : fixedEffortApplied ? fixedEffort : modelEffortSetting;
   const modelSuffixModel = getModelUpstreamId(alias, model, null, modelEffortOverride);
   const modelSuffixIntent = parseSuffix(modelSuffixModel).override;
 
   // Inject provider-level thinking config override when the client has no intent.
   // on/off → extended type (body.thinking), none/low/medium/high → effort type (body.reasoning_effort)
   const hasClientThinkingIntent = extractThinking(body) !== null;
-  if (providerThinking?.mode && providerThinking.mode !== "auto" && !hasClientThinkingIntent && !modelEffortOverride && !modelSuffixIntent) {
+  if (providerThinking?.mode && providerThinking.mode !== "auto" && !hasClientThinkingIntent && !modelEffortOverride && !modelSuffixIntent && !fixedEffortInModelId) {
     const mode = providerThinking.mode;
     providerDefaultApplied = true;
     if (mode === "on") {
@@ -281,6 +276,10 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     translatedBody.model = stripThinkingSuffix(upstreamModel);
     stripContinuityFields(translatedBody);
   }
+
+  // These executors select the fixed tier from their model ID and have no
+  // separate effort field. Drop client/default effort fields before execution.
+  if (fixedEffortInModelId) stripThinkingConfig(translatedBody);
 
   // Tool normalization: MCP-equivalent built-in dedup (Claude clients) + same-name
   // dedup for DeepSeek models (upstream rejects duplicate tool names on all endpoints).
@@ -555,9 +554,9 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     ?? (typeof sentKiroEffort === "string" ? sentKiroEffort.toLowerCase() : null)
     ?? sentKiroBudgetEffort
     ?? normalizeThinkingEffort(parseSuffix(sentBody?.model).override);
-  const sentEffort = fixedEffortApplied && fixedEffort != null
-    ? observedSentEffort ?? fixedEffort
-    : observedSentEffort;
+  // Fixed model tiers are authoritative when an executor omits a separate
+  // effort field and sends the tier only through its model ID.
+  const sentEffort = fixedEffort ?? observedSentEffort;
   if (!effortSource) effortSource = sentEffort === null ? "none" : "executor-default";
   if (clientRawRequest) {
     clientRawRequest = {

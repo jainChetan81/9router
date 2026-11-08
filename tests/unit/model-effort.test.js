@@ -64,6 +64,12 @@ describe("per-model effort resolution", () => {
     expect(getFixedEffortLevel("antigravity", "gemini-3.1-pro-high")).toBe("high");
   });
 
+  it.each([
+    ["antigravity", "gpt-oss-120b-medium", "medium"],
+  ])("reports %s/%s as fixed at %s", (provider, model, effort) => {
+    expect(getFixedEffortLevel(provider, model)).toBe(effort);
+  });
+
   it("does not resolve saved settings for explicit fixed presets", () => {
     const onInvalid = vi.fn();
     const effort = resolveModelEffortSetting(

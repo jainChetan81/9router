@@ -98,6 +98,26 @@ describe("bare-upstream fixed-effort presets", () => {
     expect(wireBody.reasoning.effort).toBe("low");
   });
 
+  it.each(["low", "medium", "high"])("sends Grok CLI %s when no effort is requested", async (effort) => {
+    const model = `grok-4.5-${effort}`;
+    const body = {
+      model,
+      stream: false,
+      messages: [{ role: "user", content: "hello" }],
+    };
+    const { result, sentBody } = await sendRequest({ provider: "grok-cli", model, body });
+    const wireBody = new GrokCliExecutor().transformRequest(
+      model,
+      structuredClone(sentBody),
+      true,
+      { connectionId: `grok-no-intent-${effort}`, rawHeaders: {} },
+    );
+
+    expect(result.success).toBe(true);
+    expect(wireBody.model).toBe("grok-4.5");
+    expect(wireBody.reasoning.effort).toBe(effort);
+  });
+
   it("disables DeepSeek V4 Pro thinking when the client requests high", async () => {
     const body = {
       model: "deepseek-v4-pro-none",
@@ -135,6 +155,41 @@ describe("bare-upstream fixed-effort presets", () => {
     expect(usage.meta).toMatchObject({ clientEffort: "low", sentEffort: "high", effortSource: "suffix" });
   });
 
+  it.each([
+    ["antigravity", "gpt-oss-120b-medium", "medium"],
+  ])("attributes %s/%s from its fixed model tier", async (provider, model, effort) => {
+    const body = {
+      model,
+      stream: false,
+      messages: [{ role: "user", content: "hello" }],
+    };
+    const { result, sentBody, usage } = await sendRequest({ provider, model, body });
+
+    expect(result.success).toBe(true);
+    expect(sentBody.model).toBe(model);
+    expect(sentBody.reasoning_effort).toBeUndefined();
+    expect(sentBody.thinking).toBeUndefined();
+    expect(sentBody.output_config).toBeUndefined();
+    expect(sentBody.request?.generationConfig?.thinkingConfig).toBeUndefined();
+    expect(usage.meta).toMatchObject({ sentEffort: effort, effortSource: "suffix" });
+  });
+
+  it("drops client effort fields when a fixed tier is selected by the model ID", async () => {
+    const model = "gpt-oss-120b-medium";
+    const body = {
+      model,
+      stream: false,
+      reasoning_effort: "high",
+      messages: [{ role: "user", content: "hello" }],
+    };
+    const { sentBody, usage } = await sendRequest({ provider: "antigravity", model, body });
+
+    expect(sentBody.model).toBe(model);
+    expect(sentBody.reasoning_effort).toBeUndefined();
+    expect(sentBody.request?.generationConfig?.thinkingConfig).toBeUndefined();
+    expect(usage.meta).toMatchObject({ clientEffort: "high", sentEffort: "medium", effortSource: "suffix" });
+  });
+
   it("keeps a stale saved setting from overriding a fixed no-thinking preset", async () => {
     const body = {
       model: "deepseek-v4-pro-none",
@@ -154,33 +209,18 @@ describe("bare-upstream fixed-effort presets", () => {
     expect(usage.meta).toMatchObject({ sentEffort: "none", effortSource: "suffix" });
   });
 
-  it("preserves the existing default payload when no effort is requested", async () => {
-    const grokBody = {
-      model: "grok-4.5-low",
-      stream: false,
-      messages: [{ role: "user", content: "hello" }],
-    };
-    const grok = await sendRequest({ provider: "grok-cli", model: "grok-4.5-low", body: grokBody });
-    const grokWire = new GrokCliExecutor().transformRequest(
-      "grok-4.5-low",
-      structuredClone(grok.sentBody),
-      true,
-      { connectionId: "grok-no-effort-test", rawHeaders: {} },
-    );
-
-    expect(grok.result.success).toBe(true);
-    expect(grokWire.reasoning).toEqual({ summary: "concise", effort: "high" });
-
+  it("sends fixed DeepSeek effort and keeps Antigravity's selected-model payload", async () => {
     const deepseekBody = {
       model: "deepseek-v4-pro-none",
       stream: false,
       messages: [{ role: "user", content: "hello" }],
     };
-    const deepseekExpected = { ...structuredClone(deepseekBody), model: "deepseek-v4-pro" };
     const deepseek = await sendRequest({ provider: "deepseek", model: "deepseek-v4-pro-none", body: deepseekBody });
 
     expect(deepseek.result.success).toBe(true);
-    expect(deepseek.sentBody).toEqual(deepseekExpected);
+    expect(deepseek.sentBody.model).toBe("deepseek-v4-pro");
+    expect(deepseek.sentBody.thinking).toEqual({ type: "disabled" });
+    expect(deepseek.usage.meta).toMatchObject({ sentEffort: "none", effortSource: "suffix" });
 
     const antigravityBody = {
       model: "gemini-3.1-pro-high",
@@ -194,6 +234,8 @@ describe("bare-upstream fixed-effort presets", () => {
     });
 
     expect(antigravity.result.success).toBe(true);
+    expect(antigravity.sentBody.model).toBe("gemini-pro-agent");
     expect(antigravity.sentBody.request.generationConfig?.thinkingConfig).toBeUndefined();
+    expect(antigravity.usage.meta).toMatchObject({ sentEffort: "high", effortSource: "suffix" });
   });
 });

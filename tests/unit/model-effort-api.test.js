@@ -43,6 +43,7 @@ describe("model effort settings API", () => {
     ["deepseek", "deepseek-v4-pro-none"],
     ["deepseek", "deepseek-v4-pro-max"],
     ["antigravity", "gemini-3.1-pro-high"],
+    ["antigravity", "gpt-oss-120b-medium"],
   ])("rejects saved effort edits for fixed preset %s/%s", async (provider, model) => {
     const response = await PATCH(request({ provider, model, effort: "high" }));
     const data = await response.json();
