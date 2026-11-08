@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { getFixedEffortLevel, getModelEffortKey, resolveModelEffortSetting } from "../../open-sse/services/modelEffort.js";
+import { getModelUpstreamId } from "../../open-sse/config/providerModels.js";
 
 describe("per-model effort resolution", () => {
   it("stores provider aliases under their canonical provider ID", () => {
@@ -11,6 +12,14 @@ describe("per-model effort resolution", () => {
 
   it("keeps registered model IDs that end in an effort word", () => {
     expect(getModelEffortKey("ag", "gemini-3.8-flash-high")).toBe("antigravity/gemini-3.8-flash-high");
+  });
+
+  it("normalizes a supported Codex hyphen suffix for downstream thinking selection", () => {
+    expect(getModelUpstreamId("cx", "gpt-6-luna-max", { reasoning_effort: "low" })).toBe("gpt-6-luna(max)");
+  });
+
+  it("resolves max suffixes for models that do not support xhigh", () => {
+    expect(getModelEffortKey("codebuddy-cn", "deepseek-v4.1-flash-max")).toBe("codebuddy-cn/deepseek-v4.1-flash");
   });
 
   it("resolves a saved model setting for a Codex hyphen effort suffix", () => {

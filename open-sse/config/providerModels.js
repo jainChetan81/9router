@@ -4,6 +4,8 @@ import { PROVIDER_MODELS } from "../providers/index.js";
 import { modelQuotaFamily, modelStrip, modelTargetFormat, modelSupportedFormats, normalizeModelId } from "../providers/models/schema.js";
 import { CODEX_REVIEW_SUFFIX, isMuseSparkModel, opencodeFamilyFormats } from "../providers/models/helpers.js";
 import { FORMATS } from "../translator/formats.js";
+import { getThinkingLevels } from "../providers/thinkingLevels.js";
+import { parseModelEffortSuffix } from "../utils/modelEffortSuffix.js";
 export { PROVIDER_MODELS };
 
 // OpenCode providers sharing the endpoint-family fallback for unknown model ids
@@ -93,15 +95,30 @@ export function getModelMeta(aliasOrId, modelId) {
 }
 
 export function getModelUpstreamId(aliasOrId, modelId, clientBody = null, effortOverride = null) {
-  // Split off thinking suffix "(level)" so lookup hits the base id; re-append it to
-  // the result so downstream applyThinking still sees the suffix (body.model is stripped separately).
-  const sufMatch = typeof modelId === "string" ? modelId.match(/\([^()]+\)\s*$/) : null;
-  const suffix = sufMatch ? sufMatch[0] : "";
-  const baseId = suffix ? modelId.slice(0, sufMatch.index).trim() : modelId;
+  // Normalize both "(level)" and valid Codex "-level" suffixes to the same
+  // parenthesized form so applyThinking and usage attribution see one shape.
+  const models = PROVIDER_MODELS[aliasOrId];
+  const parsedSuffix = parseModelEffortSuffix(modelId, { allowHyphen: true });
+  let suffix = "";
+  let baseId = modelId;
+  if (parsedSuffix.syntax === "parenthesized") {
+    baseId = parsedSuffix.cleanModel;
+    suffix = parsedSuffix.suffixText;
+  } else if (parsedSuffix.syntax === "hyphenated") {
+    const fullModel = findModel(models, modelId, aliasOrId);
+    const baseModel = findModel(models, parsedSuffix.cleanModel, aliasOrId);
+    const providerId = REGISTRY.find((entry) =>
+      entry.id === aliasOrId || entry.alias === aliasOrId || entry.aliases?.includes(aliasOrId)
+    )?.id || aliasOrId;
+    const supportedLevels = baseModel ? getThinkingLevels(providerId, parsedSuffix.cleanModel) : null;
+    if (!fullModel && baseModel && supportedLevels?.includes(parsedSuffix.suffix)) {
+      baseId = parsedSuffix.cleanModel;
+      suffix = parsedSuffix.suffixText;
+    }
+  }
   const requestedSuffix = typeof effortOverride === "string" && effortOverride
     ? `(${effortOverride.toLowerCase()})`
     : suffix;
-  const models = PROVIDER_MODELS[aliasOrId];
 
   // Some tiered model IDs are fixed presets (for example, gemini-3.8-flash-high
   // maps to an upstream ID ending in (high)). Their registered preset wins over

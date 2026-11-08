@@ -1,9 +1,9 @@
 // Resolve valid thinking levels per model — drives UI level picker (suffix "model(level)").
 // Reuses capabilities.js (thinkingFormat/canDisable) so this file only maps format→levels (DRY).
 import { getCapabilitiesForModel } from "./capabilities.js";
+import { PROVIDER_MODELS } from "./index.js";
 import { matchPattern } from "./pricing.js";
 import { resolveKiroEffortPath } from "../config/kiroConstants.js";
-import { getProviderModels } from "../config/providerModels.js";
 
 // Shared level sets (deduped) — verified against provider docs + wire in thinkingUnified.applyFormat.
 const L = {
@@ -113,7 +113,7 @@ export function getThinkingLevels(provider, model) {
   if (!caps.reasoning) return null;
   const baseId = String(model || "").replace(/\([^()]+\)\s*$/, "");
   const modelLevels = provider === "codex"
-    ? getProviderModels("cx").find((entry) => entry.id === baseId)?.thinkingLevels
+    ? PROVIDER_MODELS.cx?.find((entry) => entry.id === baseId)?.thinkingLevels
     : null;
   const hit = PATTERN_THINKING.find((entry) =>
     (!entry.provider || entry.provider === provider) && matchPattern(entry.pattern, model)

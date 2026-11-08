@@ -2,6 +2,7 @@ import { PROVIDER_ID_TO_ALIAS, getModelMeta } from "../config/providerModels.js"
 import { getThinkingLevels } from "../providers/thinkingLevels.js";
 import { resolveProviderAlias } from "./model.js";
 import { stripThinkingSuffix } from "../translator/concerns/thinkingUnified.js";
+import { parseModelEffortSuffix } from "../utils/modelEffortSuffix.js";
 
 // modelOverrides keys use the registry provider ID and canonical registry model ID: codex/gpt-6-luna.
 export function getModelEffortKey(provider, model) {
@@ -14,13 +15,12 @@ export function getModelEffortKey(provider, model) {
   // registered ids intact because providers can publish real ids ending in a
   // supported effort word, such as gemini-3.8-flash-high.
   if (!getModelMeta(alias, cleanModel) && typeof cleanModel === "string") {
-    const suffixMatch = cleanModel.match(/-(none|minimal|low|medium|high|xhigh|max)$/i);
-    if (suffixMatch) {
-      const baseModel = cleanModel.slice(0, suffixMatch.index);
-      const suffix = suffixMatch[1].toLowerCase();
+    const suffixMatch = parseModelEffortSuffix(cleanModel, { allowHyphen: true });
+    if (suffixMatch.syntax === "hyphenated") {
+      const baseModel = suffixMatch.cleanModel;
+      const suffix = suffixMatch.suffix;
       const supportedLevels = getThinkingLevels(canonicalProvider, baseModel) || [];
-      const normalizedSuffix = suffix === "max" ? "xhigh" : suffix;
-      if (getModelMeta(alias, baseModel) && supportedLevels.includes(normalizedSuffix)) {
+      if (getModelMeta(alias, baseModel) && supportedLevels.includes(suffix)) {
         cleanModel = baseModel;
       }
     }

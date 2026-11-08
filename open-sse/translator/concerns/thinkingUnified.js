@@ -6,6 +6,7 @@ import { getCapabilitiesForModel } from "../../providers/capabilities.js";
 import { getThinkingLevels } from "../../providers/thinkingLevels.js";
 import { PROVIDERS } from "../../providers/index.js";
 import { LEVEL_TO_BUDGET, budgetToLevel, effortToBudget, effortToThinkingLevel } from "./thinking.js";
+import { parseModelEffortSuffix } from "../../utils/modelEffortSuffix.js";
 
 // Map a target wire-format to its native thinking format (when capability has none).
 const FORMAT_TO_NATIVE = {
@@ -25,18 +26,16 @@ const FORMAT_TO_NATIVE = {
 // Strip a trailing thinking suffix "model(value)" → "model" (no-op when absent).
 export function stripThinkingSuffix(model) {
   if (typeof model !== "string") return model;
-  const m = model.match(/^(.*)\([^()]+\)\s*$/);
-  return m ? m[1].trim() : model;
+  return parseModelEffortSuffix(model).cleanModel;
 }
 
 // Parse model-name suffix "model(value)" → { cleanModel, override }.
 // value: level name (high) | number (8192) | auto | none. null override when absent.
 export function parseSuffix(model) {
   if (typeof model !== "string") return { cleanModel: model, override: null };
-  const m = model.match(/^(.*)\(([^()]+)\)\s*$/);
-  if (!m) return { cleanModel: model, override: null };
-  const cleanModel = m[1].trim();
-  const raw = m[2].trim().toLowerCase();
+  const parsed = parseModelEffortSuffix(model);
+  if (!parsed.syntax) return { cleanModel: model, override: null };
+  const { cleanModel, suffix: raw } = parsed;
   if (raw === "none" || raw === "off") return { cleanModel, override: { mode: "none" } };
   if (raw === "auto") return { cleanModel, override: { mode: "auto" } };
   if (raw === "ultra") return { cleanModel, override: { mode: "level", level: raw } };

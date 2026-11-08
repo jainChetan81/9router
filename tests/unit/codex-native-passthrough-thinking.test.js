@@ -147,6 +147,37 @@ describe("native Codex passthrough thinking suffixes", () => {
     expect(body.reasoning.effort).toBe("medium");
   });
 
+  it("lets a Codex hyphen suffix override client effort on native passthrough", async () => {
+    const body = await runNativeCodexRequest("gpt-6-luna-max", { effort: "low" });
+
+    expect(body.model).toBe("gpt-6-luna");
+    expect(body.reasoning.effort).toBe("max");
+  });
+
+  it("does not let a provider default override a Codex hyphen suffix", async () => {
+    const body = await runNativeCodexRequest("gpt-6-luna-max", null, {}, { mode: "low" });
+
+    expect(body.reasoning.effort).toBe("max");
+  });
+
+  it("lets a saved effort override a Codex hyphen suffix", async () => {
+    const body = await runNativeCodexRequest("gpt-6-luna-max", null, {
+      "codex/gpt-6-luna": { effort: "high" },
+    });
+
+    expect(body.reasoning.effort).toBe("high");
+  });
+
+  it("attributes a Codex hyphen suffix as the effort source", async () => {
+    await runNativeCodexRequest("gpt-6-luna-max");
+
+    expect(forcedSSEToJsonMock.mock.calls.at(-1)[0].clientRawRequest.effort).toEqual({
+      clientEffort: null,
+      sentEffort: "max",
+      effortSource: "suffix",
+    });
+  });
+
   it.each([
     ["reasoning.effort", { reasoning: { effort: "low" } }],
     ["reasoning_effort", { reasoning_effort: "low" }],

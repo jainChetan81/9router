@@ -118,11 +118,13 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const targetFormat = useTransport?.format || modelTargetFormat || getTargetFormat(provider, credentials);
   if (useTransport && credentials) credentials.runtimeTransport = useTransport;
   const stripList = getModelStrip(alias, model);
+  const modelSuffixModel = getModelUpstreamId(alias, model, null, modelEffortSetting);
+  const modelSuffixIntent = parseSuffix(modelSuffixModel).override;
 
   // Inject provider-level thinking config override when the client has no intent.
   // on/off → extended type (body.thinking), none/low/medium/high → effort type (body.reasoning_effort)
   const hasClientThinkingIntent = extractThinking(body) !== null;
-  if (providerThinking?.mode && providerThinking.mode !== "auto" && !hasClientThinkingIntent) {
+  if (providerThinking?.mode && providerThinking.mode !== "auto" && !hasClientThinkingIntent && !modelEffortSetting && !modelSuffixIntent) {
     const mode = providerThinking.mode;
     providerDefaultApplied = true;
     if (mode === "on") {
@@ -138,9 +140,10 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const upstreamModel = getModelUpstreamId(alias, model, body, modelEffortSetting);
   const explicitSuffix = parseSuffix(model).override;
   const fixedEffort = getFixedEffortLevel(provider, model);
+  const routedSuffix = parseSuffix(upstreamModel).override;
   let effortSource = modelEffortSetting
     ? "model-setting"
-    : explicitSuffix || fixedEffort
+    : explicitSuffix || fixedEffort || routedSuffix
       ? "suffix"
       : originalThinkingIntent
         ? "client"

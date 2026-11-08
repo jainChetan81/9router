@@ -67,6 +67,18 @@ describe("Codex GPT-6 Sol/Luna transport", () => {
     expect(registered.model).toBe("gpt-5.1-codex-max");
   });
 
+  it.each([
+    ["reasoning.effort", { reasoning: { effort: "low" } }],
+    ["reasoning_effort", { reasoning_effort: "low" }],
+  ])("lets a supported max suffix override client %s", (_shape, thinking) => {
+    const body = new CodexExecutor().transformRequest("gpt-6-luna-max", {
+      model: "gpt-6-luna-max", input: "hello", ...thinking,
+    }, true, credentials);
+
+    expect(body.model).toBe("gpt-6-luna");
+    expect(body.reasoning.effort).toBe("max");
+  });
+
   it("uses official OpenAI Standard pricing for GPT-6", () => {
     expect(getPricingForModel("codex", "gpt-6-astra")).toMatchObject({ input: 10, cached: 1, cache_creation: 12.5, output: 50 });
     expect(getPricingForModel("codex", "gpt-6-sol")).toMatchObject({ input: 2, cached: 0.2, cache_creation: 2.5, output: 10 });
