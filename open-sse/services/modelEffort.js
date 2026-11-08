@@ -33,12 +33,16 @@ export function getModelEffortKey(provider, model) {
 export function getFixedEffortLevel(provider, model) {
   const canonicalProvider = resolveProviderAlias(provider);
   const cleanModel = stripThinkingSuffix(model);
+  const alias = PROVIDER_ID_TO_ALIAS[canonicalProvider] || canonicalProvider;
+  const meta = getModelMeta(alias, cleanModel);
+  if (typeof meta?.fixedEffort === "string" && meta.fixedEffort.trim()) {
+    return meta.fixedEffort.trim().toLowerCase();
+  }
+
   const levels = getThinkingLevels(canonicalProvider, cleanModel);
   if (!levels?.length) return null;
   if (levels.length === 1) return levels[0];
 
-  const alias = PROVIDER_ID_TO_ALIAS[canonicalProvider] || canonicalProvider;
-  const meta = getModelMeta(alias, cleanModel);
   const upstreamLevel = meta?.upstreamModelId?.match(/\(([^()]+)\)\s*$/)?.[1]?.toLowerCase();
   const idLevel = cleanModel.match(/-(none|minimal|low|medium|high|xhigh|max)$/i)?.[1]?.toLowerCase();
   return upstreamLevel && idLevel === upstreamLevel ? upstreamLevel : null;

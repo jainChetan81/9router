@@ -38,6 +38,20 @@ describe("model effort settings API", () => {
     expect(updateModelEffortOverride).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["grok-cli", "grok-4.5-low"],
+    ["deepseek", "deepseek-v4-pro-none"],
+    ["deepseek", "deepseek-v4-pro-max"],
+    ["antigravity", "gemini-3.1-pro-high"],
+  ])("rejects saved effort edits for fixed preset %s/%s", async (provider, model) => {
+    const response = await PATCH(request({ provider, model, effort: "high" }));
+    const data = await response.json();
+
+    expect(response.status).toBe(400);
+    expect(data.validChoices).toEqual(["auto"]);
+    expect(updateModelEffortOverride).not.toHaveBeenCalled();
+  });
+
   it("writes a valid setting using the canonical provider key", async () => {
     const response = await PATCH(request({ provider: "cx", model: "gpt-6-luna", effort: "high" }));
 

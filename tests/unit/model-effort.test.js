@@ -54,4 +54,30 @@ describe("per-model effort resolution", () => {
     expect(getFixedEffortLevel("antigravity", "gemini-3.8-flash-high")).toBe("high");
     expect(getFixedEffortLevel("antigravity", "gemini-3.8-flash")).toBeNull();
   });
+
+  it("reads explicit fixed effort for presets with bare upstream IDs", () => {
+    expect(getFixedEffortLevel("grok-cli", "grok-4.5-low")).toBe("low");
+    expect(getFixedEffortLevel("grok-cli", "grok-4.5-medium")).toBe("medium");
+    expect(getFixedEffortLevel("grok-cli", "grok-4.5-high")).toBe("high");
+    expect(getFixedEffortLevel("deepseek", "deepseek-v4-pro-max")).toBe("max");
+    expect(getFixedEffortLevel("deepseek", "deepseek-v4-pro-none")).toBe("none");
+    expect(getFixedEffortLevel("antigravity", "gemini-3.1-pro-high")).toBe("high");
+  });
+
+  it("does not resolve saved settings for explicit fixed presets", () => {
+    const onInvalid = vi.fn();
+    const effort = resolveModelEffortSetting(
+      { "deepseek/deepseek-v4-pro-none": { effort: "high" } },
+      "deepseek",
+      "deepseek-v4-pro-none",
+      onInvalid,
+    );
+
+    expect(effort).toBeNull();
+    expect(onInvalid).toHaveBeenCalledWith({
+      key: "deepseek/deepseek-v4-pro-none",
+      effort: "high",
+      validChoices: ["auto"],
+    });
+  });
 });

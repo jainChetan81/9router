@@ -6,7 +6,7 @@ import { normalizeClaudePassthrough, anchorClaudeCache } from "../translator/for
 import { createStreamController } from "../utils/streamHandler.js";
 import { refreshWithRetry } from "../services/tokenRefresh.js";
 import { createRequestLogger } from "../utils/requestLogger.js";
-import { getModelTargetFormat, getModelSupportedFormats, getModelStrip, getModelUpstreamId, getModelType, PROVIDER_ID_TO_ALIAS } from "../config/providerModels.js";
+import { getModelTargetFormat, getModelSupportedFormats, getModelStrip, getModelUpstreamId, getModelMeta, getModelType, PROVIDER_ID_TO_ALIAS } from "../config/providerModels.js";
 import { PROVIDERS } from "../config/providers.js";
 import { createErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
 import { upstreamResponseHeaders } from "../utils/upstreamHeaders.js";
@@ -30,7 +30,7 @@ import { compressWithHeadroom, formatHeadroomLog, formatHeadroomSizeLog, isHeadr
 import { compressWithPxpipe } from "../rtk/pxpipe.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { stripUnsupportedModalities } from "../translator/concerns/modality.js";
-import { getFixedEffortLevel, normalizeThinkingEffort, resolveModelEffortSetting } from "../services/modelEffort.js";
+import { getFixedEffortLevel, getModelEffortKey, normalizeThinkingEffort, resolveModelEffortSetting } from "../services/modelEffort.js";
 import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
 import { defaultClaudeToolType, shouldDefaultClaudeToolType } from "../translator/concerns/toolCall.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
@@ -119,7 +119,19 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   if (useTransport && credentials) credentials.runtimeTransport = useTransport;
   const stripList = getModelStrip(alias, model);
   const fixedEffort = getFixedEffortLevel(provider, model);
-  const modelEffortOverride = fixedEffort || modelEffortSetting;
+  const modelMeta = getModelMeta(alias, model);
+  const hasExplicitFixedEffort = typeof modelMeta?.fixedEffort === "string";
+  const savedEffort = modelOverrides?.[getModelEffortKey(provider, model)]?.effort;
+  const hasSavedEffort = savedEffort != null && savedEffort !== "";
+  const hasProviderEffort = providerThinking?.mode && providerThinking.mode !== "auto";
+  const hasModelSuffixEffort = parseSuffix(model).override != null;
+  // Bare-upstream presets preserve the existing default payload when no effort
+  // was requested. Pin them when a client, saved setting, or provider default
+  // tries to choose an effort. Presets with an upstream (level) suffix stay
+  // pinned on every request.
+  const fixedEffortApplied = fixedEffort != null
+    && (!hasExplicitFixedEffort || originalThinkingIntent !== null || hasSavedEffort || hasProviderEffort || hasModelSuffixEffort);
+  const modelEffortOverride = fixedEffortApplied ? fixedEffort : modelEffortSetting;
   const modelSuffixModel = getModelUpstreamId(alias, model, null, modelEffortOverride);
   const modelSuffixIntent = parseSuffix(modelSuffixModel).override;
 
@@ -144,7 +156,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const routedSuffix = parseSuffix(upstreamModel).override;
   let effortSource = modelEffortSetting
     ? "model-setting"
-    : explicitSuffix || routedSuffix || fixedEffort
+    : explicitSuffix || routedSuffix || fixedEffortApplied
       ? "suffix"
       : originalThinkingIntent
         ? "client"
@@ -539,10 +551,13 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const sentKiroBudgetEffort = Number.isFinite(sentBody?._kiroThinkingBudget) && sentBody._kiroThinkingBudget > 0
     ? normalizeThinkingEffort({ mode: "budget", budget: sentBody._kiroThinkingBudget })
     : null;
-  const sentEffort = normalizeThinkingEffort(sentThinking)
+  const observedSentEffort = normalizeThinkingEffort(sentThinking)
     ?? (typeof sentKiroEffort === "string" ? sentKiroEffort.toLowerCase() : null)
     ?? sentKiroBudgetEffort
     ?? normalizeThinkingEffort(parseSuffix(sentBody?.model).override);
+  const sentEffort = fixedEffortApplied && fixedEffort != null
+    ? observedSentEffort ?? fixedEffort
+    : observedSentEffort;
   if (!effortSource) effortSource = sentEffort === null ? "none" : "executor-default";
   if (clientRawRequest) {
     clientRawRequest = {
