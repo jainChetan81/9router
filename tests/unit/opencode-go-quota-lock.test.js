@@ -250,7 +250,7 @@ describe("OpenCode Go paid quota lock", () => {
     const credentials = await getProviderCredentials("opencode-go", null, "paid-model");
 
     await markAccountUnavailable(
-      "go-invalid-limit", 429, "upstream free-form error", "opencode-go", "paid-model", null,
+      "go-invalid-limit", 429, "upstream free-form error sk-echoed-key", "opencode-go", "paid-model", null,
       { kind: "opencode-go-paid", limitName }, null, credentials.quotaCredentialFingerprint,
     );
 
@@ -259,7 +259,8 @@ describe("OpenCode Go paid quota lock", () => {
       limitName: null,
     });
     expect(mocks.state.connections[0].quotaLock_opencodeGoPaid.reason).not.toContain("upstream free-form error");
-    expect(mocks.state.connections[0].lastError).toBe("upstream free-form error");
+    expect(mocks.state.connections[0].lastError).toBe("Go usage limit exceeded");
+    expect(JSON.stringify(mocks.state.connections[0])).not.toContain("upstream free-form error");
   });
 
   it("upgrades the fallback to the matching usage API reset", async () => {

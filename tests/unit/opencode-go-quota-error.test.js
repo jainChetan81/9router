@@ -27,13 +27,20 @@ describe("OpenCode Go paid quota error parsing", () => {
 
     expect(parsed).toMatchObject({
       statusCode: 429,
-      message: "Go usage limit exceeded",
+      message: "Go usage limit exceeded (weekly)",
       quotaFailure: { kind: "opencode-go-paid", limitName: "weekly" },
     });
     expect(parsed.quotaFailure).not.toHaveProperty("workspace");
 
     const result = createErrorResult(parsed.statusCode, parsed.message, parsed.resetsAtMs, null, parsed.quotaFailure);
     expect(result.quotaFailure).toEqual({ kind: "opencode-go-paid", limitName: "weekly" });
+  });
+
+  it("never passes upstream quota text through", async () => {
+    const echoed = { ...quotaFixture, error: { ...quotaFixture.error, message: "limit hit for key sk-echoed-secret" } };
+    const parsed = await parseUpstreamError(response(JSON.stringify(echoed)), new OpenCodeGoExecutor());
+    expect(parsed.message).toBe("Go usage limit exceeded (weekly)");
+    expect(JSON.stringify(parsed)).not.toContain("sk-echoed-secret");
   });
 
   it("does not classify malformed or unrelated 429 responses", async () => {

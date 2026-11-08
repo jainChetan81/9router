@@ -148,9 +148,8 @@ export class OpenCodeGoExecutor extends DefaultExecutor {
 
     return {
       status: response.status,
-      message: typeof body.error.message === "string" && body.error.message
-        ? body.error.message
-        : "Go usage limit exceeded",
+      // Fixed text: upstream free text must not reach logs, request details, or clients.
+      message: limitName ? `Go usage limit exceeded (${limitName})` : "Go usage limit exceeded",
       quotaFailure,
     };
   }

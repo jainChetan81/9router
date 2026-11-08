@@ -424,7 +424,8 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
       resetAt: null,
       generation: crypto.randomUUID(),
     };
-    const reason = typeof errorText === "string" ? errorText.slice(0, 200) : "Go usage limit exceeded";
+    // Typed quota errors store a fixed message: upstream free text must never reach persisted state.
+    const reason = limitName ? `Go usage limit exceeded (${limitName})` : "Go usage limit exceeded";
     const healthPatch = {
       testStatus: "unavailable",
       lastError: reason,
