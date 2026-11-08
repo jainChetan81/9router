@@ -22,7 +22,7 @@ function parsePercent(value) {
   return null;
 }
 
-export async function getOpenCodeGoUsage(apiKey = null, proxyOptions = null) {
+export async function getOpenCodeGoUsage(apiKey = null, proxyOptions = null, { signal } = {}) {
   if (!apiKey || typeof apiKey !== "string" || !apiKey.trim()) {
     return {
       message: "OpenCode Go API key not available. Add a key to view usage.",
@@ -38,6 +38,7 @@ export async function getOpenCodeGoUsage(apiKey = null, proxyOptions = null) {
           Authorization: `Bearer ${apiKey.trim()}`,
           Accept: "application/json",
         },
+        signal,
       },
       proxyOptions,
     );

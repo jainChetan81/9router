@@ -125,6 +125,7 @@ export function formatRetryAfter(rateLimitedUntil) {
 
 /** Prefix for model lock flat fields on connection record */
 export const MODEL_LOCK_PREFIX = "modelLock_";
+export const OPENCODE_GO_PAID_QUOTA_LOCK = "quotaLock_opencodeGoPaid";
 
 /** Special key used when no model is known (account-level lock) */
 export const MODEL_LOCK_ALL = `${MODEL_LOCK_PREFIX}__all`;
@@ -143,6 +144,37 @@ export function isModelLockActive(connection, model) {
   const expiry = connection[key] || connection[MODEL_LOCK_ALL];
   if (!expiry) return false;
   return new Date(expiry).getTime() > Date.now();
+}
+
+/**
+ * Resolve the latest applicable blocker for one connection/model pair.
+ * `quotaScope` is supplied by the caller so this helper stays provider-neutral.
+ */
+export function getConnectionModelAvailability(connection, model, { now = Date.now(), quotaScope = null } = {}) {
+  if (!connection) return { available: false, retryAt: null, reason: "missing-connection" };
+
+  const expiries = [];
+  const lockKeys = new Set([getModelLockKey(model), MODEL_LOCK_ALL]);
+  for (const key of lockKeys) {
+    const value = connection[key];
+    const expiry = value ? new Date(value).getTime() : NaN;
+    if (Number.isFinite(expiry) && expiry > now) expiries.push({ expiry, reason: "model" });
+  }
+
+  if (quotaScope === "paid") {
+    const retryAt = connection[OPENCODE_GO_PAID_QUOTA_LOCK]?.retryAt;
+    const expiry = retryAt ? new Date(retryAt).getTime() : NaN;
+    if (Number.isFinite(expiry) && expiry > now) expiries.push({ expiry, reason: "quota" });
+  }
+
+  if (expiries.length === 0) return { available: true, retryAt: null, reason: null };
+  const latestExpiry = Math.max(...expiries.map(({ expiry }) => expiry));
+  const reasons = [...new Set(expiries.filter(({ expiry }) => expiry === latestExpiry).map(({ reason }) => reason))];
+  return {
+    available: false,
+    retryAt: new Date(latestExpiry).toISOString(),
+    reason: reasons.join("+")
+  };
 }
 
 /**

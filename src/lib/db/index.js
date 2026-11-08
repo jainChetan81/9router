@@ -13,6 +13,9 @@ export {
 export {
   getProviderConnections, getProviderConnectionById,
   createProviderConnection, updateProviderConnection,
+  setOpenCodeGoPaidQuotaLock, observeOpenCodeGoPaidQuotaLockIfGeneration,
+  updateOpenCodeGoPaidQuotaLockIfGeneration,
+  clearOpenCodeGoPaidQuotaLockIfGeneration,
   deleteProviderConnection, deleteProviderConnectionsByProvider,
   reorderProviderConnections, cleanupProviderConnections,
 } from "./repos/connectionsRepo.js";
