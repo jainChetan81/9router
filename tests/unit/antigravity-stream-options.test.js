@@ -42,4 +42,14 @@ describe("AntigravityExecutor stream_options normalization", () => {
     expect(output.stream).toBe(true);
     expect(output.stream_options).toEqual({ include_usage: true });
   });
+
+  it("keeps the GPT-OSS request on its model-selected default payload", () => {
+    const executor = new AntigravityExecutor();
+    const output = executor.transformRequest("gpt-oss-120b-medium", requestBody(true), true, credentials);
+
+    expect(output.model).toBe("gpt-oss-120b-medium");
+    expect(output.reasoning_effort).toBeUndefined();
+    expect(output.request.reasoning_effort).toBeUndefined();
+    expect(output.request.generationConfig.thinkingConfig).toBeUndefined();
+  });
 });

@@ -6,6 +6,7 @@ import { getCapabilitiesForModel } from "../../providers/capabilities.js";
 import { getThinkingLevels } from "../../providers/thinkingLevels.js";
 import { PROVIDERS } from "../../providers/index.js";
 import { LEVEL_TO_BUDGET, budgetToLevel, effortToBudget, effortToThinkingLevel } from "./thinking.js";
+import { parseModelEffortSuffix } from "../../utils/modelEffortSuffix.js";
 
 // Map a target wire-format to its native thinking format (when capability has none).
 const FORMAT_TO_NATIVE = {
@@ -25,18 +26,16 @@ const FORMAT_TO_NATIVE = {
 // Strip a trailing thinking suffix "model(value)" → "model" (no-op when absent).
 export function stripThinkingSuffix(model) {
   if (typeof model !== "string") return model;
-  const m = model.match(/^(.*)\([^()]+\)\s*$/);
-  return m ? m[1].trim() : model;
+  return parseModelEffortSuffix(model).cleanModel;
 }
 
 // Parse model-name suffix "model(value)" → { cleanModel, override }.
 // value: level name (high) | number (8192) | auto | none. null override when absent.
 export function parseSuffix(model) {
   if (typeof model !== "string") return { cleanModel: model, override: null };
-  const m = model.match(/^(.*)\(([^()]+)\)\s*$/);
-  if (!m) return { cleanModel: model, override: null };
-  const cleanModel = m[1].trim();
-  const raw = m[2].trim().toLowerCase();
+  const parsed = parseModelEffortSuffix(model);
+  if (!parsed.syntax) return { cleanModel: model, override: null };
+  const { cleanModel, suffix: raw } = parsed;
   if (raw === "none" || raw === "off") return { cleanModel, override: { mode: "none" } };
   if (raw === "auto") return { cleanModel, override: { mode: "auto" } };
   if (raw === "ultra") return { cleanModel, override: { mode: "level", level: raw } };
@@ -258,6 +257,12 @@ function stripAll(body) {
   }
 }
 
+export function stripThinkingConfig(body) {
+  if (!body || typeof body !== "object") return body;
+  stripAll(body);
+  return body;
+}
+
 // Apply unified thinking config to body in the resolved provider-native format.
 function applyFormat(fmt, body, cfg, caps, supportedLevels, display, model = "") {
   const none = cfg.mode === "none";
@@ -436,11 +441,16 @@ function applyFormat(fmt, body, cfg, caps, supportedLevels, display, model = "")
 // Mutates and returns body. No-op when model has no reasoning capability.
 // `intent` is a pre-captured config (from captureThinking on the original body);
 // falls back to extracting from the current body when omitted.
-export function applyThinking(targetFormat, model, body, provider = null, intent = undefined) {
+export function applyThinking(targetFormat, model, body, provider = null, intent = undefined, modelEffortSetting = null) {
   if (!body || typeof body !== "object") return body;
 
   const { cleanModel, override } = parseSuffix(model);
-  const cfg = override || intent || extractThinking(body);
+  const settingConfig = modelEffortSetting === "none"
+    ? { mode: "none" }
+    : typeof modelEffortSetting === "string"
+      ? { mode: "level", level: modelEffortSetting }
+      : null;
+  const cfg = settingConfig || override || intent || extractThinking(body);
   const caps = getCapabilitiesForModel(provider, cleanModel);
 
   // Model cannot reason → strip any stray thinking fields.

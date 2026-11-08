@@ -75,9 +75,9 @@ export default {
     },
     { id: "grok-4.7", name: "Grok 4.7" },
     { id: "grok-4.5", name: "Grok 4.5" },
-    { id: "grok-4.5-high", name: "Grok 4.5 (High)", upstreamModelId: "grok-4.5" },
-    { id: "grok-4.5-medium", name: "Grok 4.5 (Medium)", upstreamModelId: "grok-4.5" },
-    { id: "grok-4.5-low", name: "Grok 4.5 (Low)", upstreamModelId: "grok-4.5" },
+    { id: "grok-4.5-high", name: "Grok 4.5 (High)", upstreamModelId: "grok-4.5", fixedEffort: "high" },
+    { id: "grok-4.5-medium", name: "Grok 4.5 (Medium)", upstreamModelId: "grok-4.5", fixedEffort: "medium" },
+    { id: "grok-4.5-low", name: "Grok 4.5 (Low)", upstreamModelId: "grok-4.5", fixedEffort: "low" },
   ],
   features: {
     usage: true,

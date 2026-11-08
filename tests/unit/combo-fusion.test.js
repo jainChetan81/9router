@@ -71,6 +71,31 @@ describe("fusion combo", () => {
     expect(res.ok).toBe(true);
   });
 
+  it("isolates nested request data for each panel attempt", async () => {
+    const body = {
+      messages: [{ role: "user", content: "Q" }],
+      requestOptions: { nested: { value: "original" } },
+    };
+    const initialValues = [];
+    await handleFusionChat({
+      body,
+      models: ["p/a", "p/b"],
+      handleSingleModel: async (attemptBody, model, isPanel) => {
+        if (isPanel) {
+          initialValues.push(attemptBody.requestOptions.nested.value);
+          attemptBody.requestOptions.nested.value = model;
+        }
+        return okResponse(`ans-${model}`);
+      },
+      log,
+      comboName: "fusion-isolation",
+      judgeModel: "p/judge",
+    });
+
+    expect(initialValues).toEqual(["original", "original"]);
+    expect(body.requestOptions.nested.value).toBe("original");
+  });
+
   it("defaults the judge to the first panel model when none is set", async () => {
     const seen = [];
     const handleSingleModel = vi.fn(async (_body, model) => { seen.push(model); return okResponse(`ans-${model}`); });

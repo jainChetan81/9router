@@ -225,10 +225,32 @@ function extractClaudeSystemText(system) {
   return "";
 }
 
+function toKiroThinkingOverride(intent) {
+  if (!intent || typeof intent !== "object") return null;
+  if (intent.mode === "budget" && Number.isFinite(intent.budget) && intent.budget > 0) {
+    return { mode: "budget", budget: intent.budget };
+  }
+  if (intent.mode === "none" || intent.mode === "auto") return { mode: intent.mode };
+  if (intent.mode === "level" && typeof intent.level === "string") {
+    return { mode: "level", level: intent.level };
+  }
+  return null;
+}
+
+function buildKiroThinkingBody(body, thinkingIntent, modelEffortSetting, modelIntent) {
+  const savedOverride = typeof modelEffortSetting === "string" && modelEffortSetting
+    ? modelEffortSetting === "none"
+      ? { mode: "none" }
+      : { mode: "level", level: modelEffortSetting }
+    : null;
+  const override = savedOverride || modelIntent.thinkingOverride || toKiroThinkingOverride(thinkingIntent);
+  return override ? applyKiroThinkingOverride(body, override) : body;
+}
+
 /**
  * Build a Kiro payload directly from a Claude Messages API request body.
  */
-export function claudeToKiroRequest(model, body, stream, credentials) {
+export function claudeToKiroRequest(model, body, stream, credentials, thinkingIntent = null, modelEffortSetting = null) {
   const messages = Array.isArray(body.messages) ? body.messages : [];
   const tools = Array.isArray(body.tools) ? body.tools : [];
   const maxTokens = body.max_tokens || 32000;
@@ -237,7 +259,7 @@ export function claudeToKiroRequest(model, body, stream, credentials) {
 
   const modelIntent = resolveKiroModelIntent(model);
   const { upstream: upstreamModel, agentic } = modelIntent;
-  const thinkingBody = applyKiroThinkingOverride(body, modelIntent.thinkingOverride);
+  const thinkingBody = buildKiroThinkingBody(body, thinkingIntent, modelEffortSetting, modelIntent);
   const thinkingBudget = resolveKiroThinkingBudget(thinkingBody, credentials?.rawHeaders, modelIntent.model);
   const additionalModelRequestFields = buildKiroAdditionalModelRequestFieldsForModel(thinkingBody, upstreamModel);
   const usesNativeGptEffort = usesKiroNativeGptEffort(thinkingBody, upstreamModel);
@@ -350,6 +372,10 @@ export function claudeToKiroRequest(model, body, stream, credentials) {
   // Non-enumerable hint so the executor can route the upstream model id.
   Object.defineProperty(payload, "_kiroUpstreamModel", {
     value: upstreamModel,
+    enumerable: false,
+  });
+  Object.defineProperty(payload, "_kiroThinkingBudget", {
+    value: thinkingBudget,
     enumerable: false,
   });
 

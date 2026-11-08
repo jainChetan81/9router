@@ -13,6 +13,7 @@ import { DEFAULT_RETRY_CONFIG, HTTP_STATUS, resolveRetryEntry } from "../config/
 import { dbg } from "../utils/debugLog.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { stripCodexUnsupportedPatterns } from "../utils/codexToolSchema.js";
+import { parseModelEffortSuffix } from "../utils/modelEffortSuffix.js";
 
 // SSE error patterns inside 200-OK bodies. Some retry same account first; capacity rotates accounts.
 const CODEX_SSE_RETRY_PATTERNS = ["server_is_overloaded", "service_unavailable_error"];
@@ -501,25 +502,33 @@ export class CodexExecutor extends BaseExecutor {
       delete body.parallel_tool_calls;
     }
 
-    // Extract thinking level from model name suffix
-    // e.g., gpt-5.3-codex-high → high, gpt-5.3-codex → medium (default)
-    const effortLevels = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'];
     let modelEffort = null;
-    for (const level of effortLevels) {
-      if (body.model.endsWith(`-${level}`)) {
-        modelEffort = level;
-        // Strip suffix from model name for actual API call
-        body.model = body.model.replace(`-${level}`, '');
-        break;
+    const parsedSuffix = parseModelEffortSuffix(body.model, { allowHyphen: true });
+    if (parsedSuffix.syntax === "parenthesized") {
+      const models = getProviderModels("cx");
+      const baseIsRegistered = models.some((entry) => entry.id === parsedSuffix.cleanModel);
+      if (baseIsRegistered && getThinkingLevels("codex", parsedSuffix.cleanModel)?.includes(parsedSuffix.suffix)) {
+        modelEffort = parsedSuffix.suffix;
+        body.model = parsedSuffix.cleanModel;
+      }
+    } else if (parsedSuffix.syntax === "hyphenated") {
+      const models = getProviderModels("cx");
+      const isRegisteredModel = models.some((entry) => entry.id === body.model);
+      const baseIsRegistered = models.some((entry) => entry.id === parsedSuffix.cleanModel);
+      if (!isRegisteredModel && baseIsRegistered && getThinkingLevels("codex", parsedSuffix.cleanModel)?.includes(parsedSuffix.suffix)) {
+        modelEffort = parsedSuffix.suffix;
+        // Strip the suffix from the model name sent to the Codex API.
+        body.model = parsedSuffix.cleanModel;
       }
     }
 
-    // Priority: explicit reasoning.effort > reasoning_effort param > model suffix > default (medium)
+    // A supported model suffix is the explicit model selection and overrides
+    // effort fields carried alongside it by clients or provider defaults.
     if (!body.reasoning) {
-      const effort = normalizeReasoningEffort(body.model, body.reasoning_effort || modelEffort || (responsesLite ? 'medium' : 'low'));
+      const effort = normalizeReasoningEffort(body.model, modelEffort || body.reasoning_effort || (responsesLite ? 'medium' : 'low'));
       body.reasoning = responsesLite ? { effort } : { effort, summary: "auto" };
     } else {
-      body.reasoning.effort = normalizeReasoningEffort(body.model, body.reasoning.effort);
+      body.reasoning.effort = normalizeReasoningEffort(body.model, modelEffort || body.reasoning.effort || body.reasoning_effort);
       if (!responsesLite && !body.reasoning.summary) body.reasoning.summary = "auto";
     }
     if (responsesLite) body.reasoning.context = "all_turns";

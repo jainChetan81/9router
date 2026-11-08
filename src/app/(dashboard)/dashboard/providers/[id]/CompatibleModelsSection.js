@@ -4,7 +4,8 @@ import { useState } from "react";
 import PropTypes from "prop-types";
 import { Button } from "@/shared/components";
 import { getProviderCustomModelRows } from "@/shared/utils/providerCustomModels";
-function CompatibleModelRow({ modelId, fullModel, copied, onCopy, onDeleteAlias, onTest, testStatus, isTesting }) {
+import ModelEffortSelect from "./ModelEffortSelect";
+function CompatibleModelRow({ providerId, modelId, fullModel, copied, onCopy, onDeleteAlias, onTest, testStatus, isTesting, modelOverrides, onModelEffortChange }) {
   const borderColor = testStatus === "ok"
     ? "border-green-500/40"
     : testStatus === "error"
@@ -29,6 +30,7 @@ function CompatibleModelRow({ modelId, fullModel, copied, onCopy, onDeleteAlias,
         <p className="text-sm font-medium truncate">{modelId}</p>
         <div className="flex items-center gap-1 mt-1">
           <code className="text-xs text-text-muted font-mono bg-sidebar px-1.5 py-0.5 rounded">{fullModel}</code>
+          <ModelEffortSelect providerId={providerId} modelId={modelId} modelOverrides={modelOverrides} onChange={onModelEffortChange} />
           <div className="relative group/btn">
             <button
               onClick={() => onCopy(fullModel, `model-${modelId}`)}
@@ -71,7 +73,7 @@ function CompatibleModelRow({ modelId, fullModel, copied, onCopy, onDeleteAlias,
   );
 }
 
-export default function CompatibleModelsSection({ providerStorageAlias, providerDisplayAlias, modelAliases, customModels, copied, onCopy, onDeleteAlias, onAddCustomModel, onDeleteCustomModel, connections, isAnthropic }) {
+export default function CompatibleModelsSection({ providerId, providerStorageAlias, providerDisplayAlias, modelAliases, customModels, copied, onCopy, onDeleteAlias, onAddCustomModel, onDeleteCustomModel, connections, isAnthropic, modelOverrides, onModelEffortChange }) {
   const [newModel, setNewModel] = useState("");
   const [adding, setAdding] = useState(false);
   const [importing, setImporting] = useState(false);
@@ -198,6 +200,7 @@ export default function CompatibleModelsSection({ providerStorageAlias, provider
           {allModels.map(({ id, alias, source }) => (
             <CompatibleModelRow
               key={`${source}-${providerStorageAlias}/${id}`}
+              providerId={providerId}
               modelId={id}
               fullModel={`${providerDisplayAlias}/${id}`}
               copied={copied}
@@ -206,6 +209,8 @@ export default function CompatibleModelsSection({ providerStorageAlias, provider
               onTest={connections.length > 0 ? () => handleTestModel(id) : undefined}
               testStatus={modelTestResults[id]}
               isTesting={testingModelId === id}
+              modelOverrides={modelOverrides}
+              onModelEffortChange={onModelEffortChange}
             />
           ))}
         </div>
@@ -215,6 +220,7 @@ export default function CompatibleModelsSection({ providerStorageAlias, provider
 }
 
 CompatibleModelsSection.propTypes = {
+  providerId: PropTypes.string.isRequired,
   providerStorageAlias: PropTypes.string.isRequired,
   providerDisplayAlias: PropTypes.string.isRequired,
   modelAliases: PropTypes.object.isRequired,
@@ -229,4 +235,6 @@ CompatibleModelsSection.propTypes = {
     isActive: PropTypes.bool,
   })).isRequired,
   isAnthropic: PropTypes.bool,
+  modelOverrides: PropTypes.object,
+  onModelEffortChange: PropTypes.func.isRequired,
 };

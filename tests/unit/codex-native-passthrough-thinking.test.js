@@ -35,11 +35,12 @@ vi.mock("../../open-sse/handlers/chatCore/sseToJsonHandler.js", () => ({
 
 const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
 
-async function runNativeCodexRequest(model, reasoning) {
+async function runNativeCodexRequest(model, reasoning, modelOverrides = {}, providerThinking = null, extraBody = {}) {
   const body = {
     model,
     input: "hello",
     stream: false,
+    ...extraBody,
     ...(reasoning ? { reasoning } : {}),
   };
 
@@ -55,12 +56,49 @@ async function runNativeCodexRequest(model, reasoning) {
     ponytailEnabled: false,
     pxpipeEnabled: false,
     sourceFormatOverride: "openai-responses",
+    modelOverrides,
+    providerThinking,
     clientRawRequest: {
       endpoint: "/v1/responses",
       body,
       headers: {
         accept: "application/json",
         "user-agent": "codex-cli/0.144.1",
+      },
+    },
+  });
+
+  return executeMock.mock.calls.at(-1)[0].body;
+}
+
+async function runNativeClaudeRequest(model, outputConfig, modelOverrides = {}, providerThinking = null) {
+  const body = {
+    model,
+    messages: [{ role: "user", content: "hello" }],
+    stream: false,
+    ...(outputConfig ? { output_config: outputConfig } : {}),
+  };
+
+  await handleChatCore({
+    body,
+    modelInfo: { provider: "claude", model },
+    credentials: { accessToken: "test-token", providerSpecificData: {} },
+    log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn() },
+    connectionId: "test-connection",
+    rtkEnabled: false,
+    headroomEnabled: false,
+    cavemanEnabled: false,
+    ponytailEnabled: false,
+    pxpipeEnabled: false,
+    sourceFormatOverride: "claude",
+    modelOverrides,
+    providerThinking,
+    clientRawRequest: {
+      endpoint: "/v1/messages",
+      body,
+      headers: {
+        accept: "application/json",
+        "user-agent": "claude-cli/2.1.0",
       },
     },
   });
@@ -98,6 +136,97 @@ describe("native Codex passthrough thinking suffixes", () => {
 
     expect(body.model).toBe("gpt-5.6-luna");
     expect(body.reasoning).toEqual({ effort: "max", summary: "detailed" });
+  });
+
+  it("applies the saved model effort to a native passthrough request", async () => {
+    const body = await runNativeCodexRequest("gpt-6-luna(high)", { effort: "low" }, {
+      "codex/gpt-6-luna": { effort: "medium" },
+    });
+
+    expect(body.model).toBe("gpt-6-luna");
+    expect(body.reasoning.effort).toBe("medium");
+  });
+
+  it("lets a Codex hyphen suffix override client effort on native passthrough", async () => {
+    const body = await runNativeCodexRequest("gpt-6-luna-max", { effort: "low" });
+
+    expect(body.model).toBe("gpt-6-luna");
+    expect(body.reasoning.effort).toBe("max");
+  });
+
+  it("does not let a provider default override a Codex hyphen suffix", async () => {
+    const body = await runNativeCodexRequest("gpt-6-luna-max", null, {}, { mode: "low" });
+
+    expect(body.reasoning.effort).toBe("max");
+  });
+
+  it("lets a saved effort override a Codex hyphen suffix", async () => {
+    const body = await runNativeCodexRequest("gpt-6-luna-max", null, {
+      "codex/gpt-6-luna": { effort: "high" },
+    });
+
+    expect(body.reasoning.effort).toBe("high");
+  });
+
+  it("attributes a Codex hyphen suffix as the effort source", async () => {
+    await runNativeCodexRequest("gpt-6-luna-max");
+
+    expect(forcedSSEToJsonMock.mock.calls.at(-1)[0].clientRawRequest.effort).toEqual({
+      clientEffort: null,
+      sentEffort: "max",
+      effortSource: "suffix",
+    });
+  });
+
+  it.each([
+    ["reasoning.effort", { reasoning: { effort: "low" } }],
+    ["reasoning_effort", { reasoning_effort: "low" }],
+    ["Claude output_config.effort", { output_config: { effort: "low" } }],
+    ["Claude thinking", { thinking: { type: "enabled", budget_tokens: 4096 } }],
+    ["Gemini thinkingLevel", { thinkingConfig: { thinkingLevel: "low" } }],
+  ])("does not override client %s with provider defaults", async (_shape, fields) => {
+    const body = await runNativeCodexRequest("gpt-6-luna", null, {}, { mode: "high" }, fields);
+
+    expect(body).toMatchObject(fields);
+  });
+
+  it("applies provider defaults when the client has no effort intent", async () => {
+    const body = await runNativeCodexRequest("gpt-6-luna", null, {}, { mode: "high" });
+
+    expect(body.reasoning.effort).toBe("high");
+  });
+
+  it("applies a saved effort to native Claude passthrough requests", async () => {
+    const body = await runNativeClaudeRequest("claude-sonnet-5.5(high)", { effort: "high" }, {
+      "claude/claude-sonnet-5.5": { effort: "low" },
+    });
+
+    expect(body.model).toBe("claude-sonnet-5.5");
+    expect(body.output_config.effort).toBe("low");
+  });
+
+  it("preserves unrelated Claude output config when disabling effort", async () => {
+    const format = { type: "json_schema", schema: { type: "object" } };
+    const body = await runNativeClaudeRequest("claude-sonnet-5.5", { effort: "high", format }, {
+      "claude/claude-sonnet-5.5": { effort: "none" },
+    });
+
+    expect(body.thinking).toEqual({ type: "disabled" });
+    expect(body.output_config).toEqual({ format });
+  });
+
+  it("lets a Claude model suffix override the client's effort in passthrough", async () => {
+    const body = await runNativeClaudeRequest("claude-sonnet-5.5(high)", { effort: "low" });
+
+    expect(body.model).toBe("claude-sonnet-5.5");
+    expect(body.output_config.effort).toBe("high");
+  });
+
+  it("normalizes provider defaults for native Claude passthrough", async () => {
+    const body = await runNativeClaudeRequest("claude-sonnet-5.5", null, {}, { mode: "low" });
+
+    expect(body.output_config.effort).toBe("low");
+    expect(body.reasoning_effort).toBeUndefined();
   });
 
   it("forwards Ultra through a Terra review alias", async () => {

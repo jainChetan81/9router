@@ -432,6 +432,9 @@ describe("openaiToKiroRequest", () => {
 
       expect(systemPromptOf(result)).toContain("<max_thinking_length>24576</max_thinking_length>");
       expect(result.additionalModelRequestFields).toBeUndefined();
+      expect(result._kiroThinkingBudget).toBe(24576);
+      expect(Object.getOwnPropertyDescriptor(result, "_kiroThinkingBudget").enumerable).toBe(false);
+      expect(JSON.stringify(result)).not.toContain("_kiroThinkingBudget");
     });
 
     it.each([

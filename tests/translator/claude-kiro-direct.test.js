@@ -5,20 +5,21 @@ import { describe, it, expect } from "vitest";
 import "./registerAll.js";
 import { translateRequest, translateResponse } from "../../open-sse/translator/index.js";
 import { FORMATS } from "../../open-sse/translator/formats.js";
+import { getModelUpstreamId } from "../../open-sse/config/providerModels.js";
 
 // Kiro rejects a top-level systemPrompt (400 REQUEST_BODY_INVALID; 1892ed77), so the
 // system prompt, thinking tags and agentic prompt travel at the start of the first user
 // turn, ahead of the "[Context: Current time …]" line. This returns that prompt part.
 const kiroPromptOf = (out) => {
   const cs = out?.conversationState || {};
-  const content = (cs.history || []).find((t) => t.userInputMessage)?.userInputMessage?.content
-    ?? cs.currentMessage?.userInputMessage?.content ?? "";
+  const content = cs.currentMessage?.userInputMessage?.content
+    ?? (cs.history || []).find((t) => t.userInputMessage)?.userInputMessage?.content ?? "";
   const at = content.indexOf("[Context: Current time");
   return (at >= 0 ? content.slice(0, at) : content).trim();
 };
 
-const C2K = (body, credentials = null, model = "claude-sonnet-4.5") =>
-  translateRequest(FORMATS.CLAUDE, FORMATS.KIRO, model, body, true, credentials, "kiro");
+const C2K = (body, credentials = null, model = "claude-sonnet-4.5", modelEffortSetting = null) =>
+  translateRequest(FORMATS.CLAUDE, FORMATS.KIRO, model, body, true, credentials, "kiro", null, [], null, null, modelEffortSetting);
 
 describe("Claude → Kiro (direct route)", () => {
   it("produces a Kiro conversationState payload", () => {
@@ -108,6 +109,36 @@ describe("Claude → Kiro (direct route)", () => {
     expect(kiroPromptOf(out)).toContain("<max_thinking_length>24576</max_thinking_length>");
   });
 
+  it.each([
+    ["enabled", { type: "enabled" }, "<max_thinking_length>16000</max_thinking_length>"],
+    ["disabled", { type: "disabled" }, null],
+    ["explicit budget", { type: "enabled", budget_tokens: 10000 }, "<max_thinking_length>10000</max_thinking_length>"],
+  ])("preserves Claude %s thinking on an assistant/tool turn", (_, thinking, expectedTag) => {
+    const out = C2K({
+      thinking,
+      messages: [
+        { role: "user", content: "go" },
+        { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "run", input: {} }] },
+      ],
+    });
+
+    const prompt = kiroPromptOf(out);
+    if (expectedTag) expect(prompt).toContain(expectedTag);
+    else expect(prompt).not.toContain("<thinking_mode>");
+  });
+
+  it("maps a saved model effort ahead of captured tool-turn thinking intent", () => {
+    const out = C2K({
+      thinking: { type: "enabled", budget_tokens: 10000 },
+      messages: [
+        { role: "user", content: "go" },
+        { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "run", input: {} }] },
+      ],
+    }, null, "claude-sonnet-4.5", "low");
+
+    expect(kiroPromptOf(out)).toContain("<max_thinking_length>1024</max_thinking_length>");
+  });
+
   it("normalizes an unsupported Kiro intensity suffix while preserving agentic behavior", () => {
     const out = C2K(
       { messages: [{ role: "user", content: "hello" }] },
@@ -145,6 +176,20 @@ describe("Claude → Kiro (direct route)", () => {
     });
     expect(kiroPromptOf(out)).not.toContain("<thinking_mode>");
     expect(kiroPromptOf(out)).not.toContain("<max_thinking_length>");
+  });
+
+  it("lets a saved effort override the client and model suffix", () => {
+    const body = {
+      output_config: { effort: "high" },
+      messages: [{ role: "user", content: "use the saved effort" }],
+    };
+    const model = getModelUpstreamId("kr", "claude-sonnet-5.5(high)", body, "low");
+    const out = C2K(body, null, model);
+
+    expect(out.additionalModelRequestFields).toEqual({
+      thinking: { type: "adaptive", display: "summarized" },
+      output_config: { effort: "low" },
+    });
   });
 
   it.each(["auto", "minimal", "ultra"])(

@@ -4,6 +4,8 @@ import { PROVIDER_MODELS } from "../providers/index.js";
 import { modelQuotaFamily, modelStrip, modelTargetFormat, modelSupportedFormats, normalizeModelId } from "../providers/models/schema.js";
 import { CODEX_REVIEW_SUFFIX, isMuseSparkModel, opencodeFamilyFormats } from "../providers/models/helpers.js";
 import { FORMATS } from "../translator/formats.js";
+import { getThinkingLevels } from "../providers/thinkingLevels.js";
+import { parseModelEffortSuffix } from "../utils/modelEffortSuffix.js";
 export { PROVIDER_MODELS };
 
 // OpenCode providers sharing the endpoint-family fallback for unknown model ids
@@ -92,16 +94,47 @@ export function getModelMeta(aliasOrId, modelId) {
   return findModel(PROVIDER_MODELS[aliasOrId], modelId, aliasOrId) || null;
 }
 
-export function getModelUpstreamId(aliasOrId, modelId, clientBody = null) {
-  // Split off thinking suffix "(level)" so lookup hits the base id; re-append it to
-  // the result so downstream applyThinking still sees the suffix (body.model is stripped separately).
-  const sufMatch = typeof modelId === "string" ? modelId.match(/\([^()]+\)\s*$/) : null;
-  const suffix = sufMatch ? sufMatch[0] : "";
-  const baseId = suffix ? modelId.slice(0, sufMatch.index).trim() : modelId;
+export function getModelUpstreamId(aliasOrId, modelId, clientBody = null, effortOverride = null) {
+  // Normalize both "(level)" and valid Codex "-level" suffixes to the same
+  // parenthesized form so applyThinking and usage attribution see one shape.
   const models = PROVIDER_MODELS[aliasOrId];
+  const parsedSuffix = parseModelEffortSuffix(modelId, { allowHyphen: true });
+  let suffix = "";
+  let baseId = modelId;
+  if (parsedSuffix.syntax === "parenthesized") {
+    baseId = parsedSuffix.cleanModel;
+    suffix = parsedSuffix.suffixText;
+  } else if (parsedSuffix.syntax === "hyphenated") {
+    const fullModel = findModel(models, modelId, aliasOrId);
+    const baseModel = findModel(models, parsedSuffix.cleanModel, aliasOrId);
+    const providerId = REGISTRY.find((entry) =>
+      entry.id === aliasOrId || entry.alias === aliasOrId || entry.aliases?.includes(aliasOrId)
+    )?.id || aliasOrId;
+    const supportedLevels = baseModel ? getThinkingLevels(providerId, parsedSuffix.cleanModel) : null;
+    if (!fullModel && baseModel && supportedLevels?.includes(parsedSuffix.suffix)) {
+      baseId = parsedSuffix.cleanModel;
+      suffix = parsedSuffix.suffixText;
+    }
+  }
+  const requestedSuffix = typeof effortOverride === "string" && effortOverride
+    ? `(${effortOverride.toLowerCase()})`
+    : suffix;
+
+  // Some tiered model IDs are fixed presets (for example, gemini-3.8-flash-high
+  // maps to an upstream ID ending in (high)). Their registered preset wins over
+  // client effort and saved effort overrides. Plain aliases without a matching
+  // effort suffix remain selectable from client intent below.
+  const registeredModel = findModel(models, baseId, aliasOrId);
+  const presetLevel = registeredModel?.upstreamModelId?.match(/\(([^()]+)\)\s*$/)?.[1]?.toLowerCase();
+  const idLevel = typeof baseId === "string"
+    ? baseId.match(/-(none|minimal|low|medium|high|xhigh|max)$/i)?.[1]?.toLowerCase()
+    : null;
+  const fixedLevel = idLevel && presetLevel === idLevel ? presetLevel : null;
 
   // Resolve requested thinking level from suffix or client request body
-  const rawSuffix = suffix ? suffix.slice(1, -1).trim().toLowerCase() : "";
+  const rawSuffix = fixedLevel || (typeof effortOverride === "string" && effortOverride
+    ? effortOverride.toLowerCase()
+    : suffix ? suffix.slice(1, -1).trim().toLowerCase() : "");
   let tier = rawSuffix === "xhigh" || rawSuffix === "max" ? "high" : rawSuffix === "minimal" ? "low" : rawSuffix;
   if (!tier && clientBody && typeof clientBody === "object") {
     const rawEffort = clientBody.reasoning_effort || clientBody.output_config?.effort || (typeof clientBody.reasoning === "object" ? clientBody.reasoning?.effort : null);
@@ -124,12 +157,15 @@ export function getModelUpstreamId(aliasOrId, modelId, clientBody = null) {
     const presetMatch = resolvedId.match(/\([^()]+\)\s*$/);
     const presetSuffix = presetMatch?.[0] || "";
     const resolvedBase = presetSuffix ? resolvedId.slice(0, presetMatch.index).trim() : resolvedId;
-    return resolvedBase + (suffix || (presetSuffix && tier ? `(${tier})` : presetSuffix));
+    const resolvedSuffix = fixedLevel
+      ? `(${fixedLevel})`
+      : requestedSuffix || (presetSuffix && tier ? `(${tier})` : presetSuffix);
+    return resolvedBase + resolvedSuffix;
   }
   if (aliasOrId === "cx" && typeof baseId === "string" && baseId.endsWith(CODEX_REVIEW_SUFFIX)) {
-    return baseId.slice(0, -CODEX_REVIEW_SUFFIX.length) + suffix;
+    return baseId.slice(0, -CODEX_REVIEW_SUFFIX.length) + requestedSuffix;
   }
-  return baseId + suffix;
+  return baseId + requestedSuffix;
 }
 
 export function getModelQuotaFamily(aliasOrId, modelId) {

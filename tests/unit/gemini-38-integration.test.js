@@ -6,7 +6,8 @@ import { dirname, join } from "node:path";
 
 import { getModelUpstreamId } from "../../open-sse/config/providerModels.js";
 import { AntigravityExecutor } from "../../open-sse/executors/antigravity.js";
-import { applyThinking, stripThinkingSuffix } from "../../open-sse/translator/concerns/thinkingUnified.js";
+import { getFixedEffortLevel, normalizeThinkingEffort } from "../../open-sse/services/modelEffort.js";
+import { applyThinking, extractThinking, stripThinkingSuffix } from "../../open-sse/translator/concerns/thinkingUnified.js";
 import gemini from "../../open-sse/providers/registry/gemini.js";
 import { MODEL_PRICING } from "../../open-sse/providers/pricing.js";
 import { MITM_TOOLS } from "../../src/shared/constants/cliTools.js";
@@ -69,9 +70,47 @@ describe("Gemini 3.8 Antigravity tiers", () => {
     expect(upstreamModel).toBe("gemini-3.8-flash-low(low)");
   });
 
+  it("uses saved model effort before explicit suffix and client effort", () => {
+    const upstreamModel = getModelUpstreamId("ag", "gemini-3.8-flash(low)", { reasoning_effort: "high" }, "medium");
+    expect(upstreamModel).toBe("gemini-3.8-flash-medium(medium)");
+  });
+
   it("preserves direct tiered model IDs", () => {
     const upstreamModel = getModelUpstreamId("ag", "gemini-3.8-flash-high", {});
     expect(upstreamModel).toBe("gemini-3.8-flash-high(high)");
+  });
+
+  it("keeps a fixed high tier and attributes sent effort to the model suffix", () => {
+    const clientBody = {
+      output_config: { effort: "medium" },
+      request: { contents: [{ role: "user", parts: [{ text: "hello" }] }], generationConfig: {} },
+    };
+    const publicModel = "gemini-3.8-flash-high";
+    const upstreamModel = getModelUpstreamId("ag", publicModel, clientBody);
+    const body = {
+      model: stripThinkingSuffix(upstreamModel),
+      request: clientBody.request,
+    };
+
+    expect(getFixedEffortLevel("antigravity", publicModel)).toBe("high");
+    expect(upstreamModel).toBe("gemini-3.8-flash-high(high)");
+    applyThinking("antigravity", upstreamModel, body, "antigravity");
+    const finalBody = new AntigravityExecutor().transformRequest(
+      publicModel,
+      body,
+      true,
+      { projectId: "project", connectionId: "connection" }
+    );
+
+    const sentEffort = normalizeThinkingEffort(extractThinking(finalBody));
+    expect(finalBody.request.generationConfig.thinkingConfig.thinkingLevel).toBe("high");
+    expect(sentEffort).toBe("high");
+  });
+
+  it("still lets client effort choose a tier for the plain selectable alias", () => {
+    const clientBody = { output_config: { effort: "high" } };
+    expect(getFixedEffortLevel("antigravity", "gemini-3.8-flash")).toBeNull();
+    expect(getModelUpstreamId("ag", "gemini-3.8-flash", clientBody)).toBe("gemini-3.8-flash-high(high)");
   });
 });
 
