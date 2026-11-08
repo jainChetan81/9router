@@ -115,6 +115,43 @@ export class OpenCodeGoExecutor extends DefaultExecutor {
     super("opencode-go");
   }
 
+  parseError(response, bodyText) {
+    let body;
+    try {
+      body = JSON.parse(bodyText);
+    } catch {
+      return super.parseError(response, bodyText);
+    }
+
+    if (response?.status !== 429 || body?.error?.type !== "GoUsageLimitError") {
+      return super.parseError(response, bodyText);
+    }
+
+    const limitName = typeof body.metadata?.limitName === "string"
+      && /^[a-z][a-z0-9_-]{0,31}$/i.test(body.metadata.limitName.trim())
+      ? body.metadata.limitName.trim()
+      : null;
+    const resetAt = body.metadata?.resetAt ?? body.metadata?.reset_at;
+    const resetAtMs = typeof resetAt === "number"
+      ? resetAt
+      : typeof resetAt === "string"
+        ? Date.parse(resetAt)
+        : NaN;
+    const quotaFailure = {
+      kind: "opencode-go-paid",
+      limitName,
+      ...(Number.isFinite(resetAtMs) && resetAtMs > Date.now() ? { resetAtMs } : {}),
+    };
+
+    return {
+      status: response.status,
+      message: typeof body.error.message === "string" && body.error.message
+        ? body.error.message
+        : "Go usage limit exceeded",
+      quotaFailure,
+    };
+  }
+
   buildUrl(model, stream, urlIndex = 0, credentials = null) {
     // Muse Spark lives on /responses even when a stale runtimeTransport leaks in.
     if (isResponsesModel(model)) return RESPONSES_BASE_URL;

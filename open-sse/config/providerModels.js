@@ -2,7 +2,7 @@ import REGISTRY from "../providers/registry/index.js";
 // PROVIDER_MODELS now built from providers/registry (transport + models co-located)
 import { PROVIDER_MODELS } from "../providers/index.js";
 import { modelQuotaFamily, modelStrip, modelTargetFormat, modelSupportedFormats, normalizeModelId } from "../providers/models/schema.js";
-import { CODEX_REVIEW_SUFFIX, isMuseSparkModel, opencodeFamilyFormats } from "../providers/models/helpers.js";
+import { CODEX_REVIEW_SUFFIX, isMuseSparkModel, isOpencodeFreeTierModel, opencodeFamilyFormats } from "../providers/models/helpers.js";
 import { FORMATS } from "../translator/formats.js";
 import { getThinkingLevels } from "../providers/thinkingLevels.js";
 import { parseModelEffortSuffix } from "../utils/modelEffortSuffix.js";
@@ -10,6 +10,7 @@ export { PROVIDER_MODELS };
 
 // OpenCode providers sharing the endpoint-family fallback for unknown model ids
 const isOpenCodeAlias = (aliasOrId) => !aliasOrId || ["oc", "opencode", "ocg", "opencode-go", "ocz", "opencode-zen"].includes(aliasOrId);
+const MODEL_EFFORT_SUFFIXES = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 
 // Helper functions
@@ -92,6 +93,35 @@ export function getModelType(aliasOrId, modelId) {
 // Raw registry entry for a model (suffix-aware) — executor lookups of per-model hints (e.g. defaultLocation).
 export function getModelMeta(aliasOrId, modelId) {
   return findModel(PROVIDER_MODELS[aliasOrId], modelId, aliasOrId) || null;
+}
+
+/**
+ * Return the quota scope for an OpenCode Go model. Registry metadata wins;
+ * passthrough ids use the provider's explicit terminal `-free` convention.
+ */
+export function getModelQuotaScope(provider, model) {
+  if (!["opencode-go", "ocg"].includes(provider)) return null;
+  if (typeof model !== "string" || !model.trim()) return null;
+
+  let modelId = model.trim();
+  const slash = modelId.indexOf("/");
+  if (slash >= 0 && ["opencode-go", "ocg"].includes(modelId.slice(0, slash))) {
+    modelId = modelId.slice(slash + 1);
+  }
+
+  const effort = parseModelEffortSuffix(modelId, { allowHyphen: true });
+  const isRecognizedEffort = effort.syntax && MODEL_EFFORT_SUFFIXES.has(effort.suffix);
+  const exactMeta = PROVIDER_MODELS["opencode-go"]?.find((entry) => entry.id === modelId);
+  if (isRecognizedEffort && effort.syntax === "parenthesized") {
+    modelId = effort.cleanModel;
+  } else if (isRecognizedEffort && effort.syntax === "hyphenated" && !exactMeta) {
+    modelId = effort.cleanModel;
+  }
+
+  const quotaScope = (exactMeta || PROVIDER_MODELS["opencode-go"]?.find((entry) => entry.id === modelId))?.quotaScope;
+  if (quotaScope === "free" || quotaScope === "paid") return quotaScope;
+  if (effort.syntax === "parenthesized" && !isRecognizedEffort) return "paid";
+  return isOpencodeFreeTierModel(modelId) ? "free" : "paid";
 }
 
 export function getModelUpstreamId(aliasOrId, modelId, clientBody = null, effortOverride = null) {
