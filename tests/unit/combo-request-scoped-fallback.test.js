@@ -60,6 +60,28 @@ describe("combo fallback — request-scoped 4xx from a member", () => {
     expect(body.choices[0].message.content).toBe("served by member b");
   });
 
+  it("starts each fallback with the original request effort", async () => {
+    const receivedEfforts = [];
+    let attempt = 0;
+    const result = await handleComboChat({
+      body: { reasoning: { effort: "low" }, messages: [{ role: "user", content: "hi" }] },
+      models: ["provider-a/model-a", "provider-b/model-b"],
+      handleSingleModel: async (body) => {
+        receivedEfforts.push(body.reasoning.effort);
+        body.reasoning.effort = "high";
+        attempt += 1;
+        return attempt === 1
+          ? validationError()
+          : jsonResponse({ choices: [{ message: { content: "served by member b" } }] });
+      },
+      log: silentLog,
+      comboStrategy: "fallback",
+    });
+
+    expect(result.status).toBe(200);
+    expect(receivedEfforts).toEqual(["low", "low"]);
+  });
+
   it("still returns the last error when every member rejects the request", async () => {
     const handleSingleModel = vi.fn(async (_body, modelStr) => (
       modelStr === "provider-a/model-a"
