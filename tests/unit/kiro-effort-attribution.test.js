@@ -89,4 +89,43 @@ describe("Kiro effort usage attribution", () => {
       effortSource: "client",
     });
   });
+
+  it("attributes OpenAI-to-Kiro prompt tags and keeps the private budget off the wire", async () => {
+    const body = {
+      model: "claude-sonnet-4.5",
+      stream: false,
+      reasoning_effort: "high",
+      messages: [{ role: "user", content: "Think deeply" }],
+    };
+
+    const result = await handleChatCore({
+      body,
+      modelInfo: { provider: "kiro", model: "claude-sonnet-4.5" },
+      credentials: { accessToken: "test-token", providerSpecificData: {} },
+      log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn() },
+      connectionId: "kiro-openai-effort-test",
+      rtkEnabled: false,
+      headroomEnabled: false,
+      cavemanEnabled: false,
+      ponytailEnabled: false,
+      pxpipeEnabled: false,
+      sourceFormatOverride: "openai",
+      clientRawRequest: {
+        endpoint: "/v1/chat/completions",
+        body,
+        headers: { accept: "application/json", "user-agent": "openai/test" },
+      },
+    });
+
+    expect(result.success).toBe(true);
+    const sentBody = executeMock.mock.calls.at(-1)[0].body;
+    expect(sentBody._kiroThinkingBudget).toBe(24576);
+    expect(JSON.stringify(sentBody)).toContain("<max_thinking_length>24576</max_thinking_length>");
+    expect(JSON.stringify(sentBody)).not.toContain("_kiroThinkingBudget");
+    expect(saveRequestUsageMock.mock.calls.at(-1)[0].meta).toMatchObject({
+      clientEffort: "high",
+      sentEffort: "high",
+      effortSource: "client",
+    });
+  });
 });
