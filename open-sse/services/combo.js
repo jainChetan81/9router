@@ -558,6 +558,7 @@ export async function handleComboChat({
               if (isZeroContentResponse(peekBody)) {
                 if (isLastModel) {
                   log.warn("COMBO", `Model ${modelStr} returned HTTP 200 with zero usable content as the final candidate, returning as-is`);
+                  if (sessionId) clearStickyComboSession(comboName, sessionId, modelStr);
                   return result;
                 }
                 log.warn("COMBO", `Model ${modelStr} returned HTTP 200 with zero usable content, falling back to next model`);
@@ -589,9 +590,10 @@ export async function handleComboChat({
         const isLast = i === rotatedModels.length - 1;
         if (isNoRetryFinish(peeked.finishReason) || isLast) {
           log.warn("COMBO", `Model ${modelStr} returned empty (${reasonLabel}) — ${isNoRetryFinish(peeked.finishReason) ? "no-retry class" : "last candidate"}, returning as-is`);
-          return isNoRetryFinish(peeked.finishReason)
-            ? acceptResponse(peeked.response, modelStr)
-            : peeked.response;
+          if (isNoRetryFinish(peeked.finishReason)) return acceptResponse(peeked.response, modelStr);
+          // A known-empty final answer must not keep (or leave) this member pinned.
+          if (sessionId) clearStickyComboSession(comboName, sessionId, modelStr);
+          return peeked.response;
         }
 
         log.warn("COMBO", `Model ${modelStr} returned empty (${reasonLabel}) — falling through to next candidate`);

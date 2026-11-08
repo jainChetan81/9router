@@ -92,4 +92,22 @@ describe("sticky round-robin combo", () => {
     expect((await first("s9", new Set(), false))[0]).toBe("p/a");
     expect(getStickyComboModel("rr", "s9", models)).toBeNull();
   });
+
+  it("drops the pin when the pinned member returns empty JSON as the final candidate", async () => {
+    setStickyComboModel("solo", "s-empty", "p/a");
+    const empty = { choices: [{ message: { role: "assistant", content: "" }, finish_reason: "in_progress" }] };
+    const make = () => ({ ok: true, status: 200, headers: new Headers({ "content-type": "application/json" }), clone: make, json: async () => empty });
+    await handleComboChat({
+      body: { messages: [{ role: "user", content: "hi" }] },
+      models: ["p/a"],
+      handleSingleModel: async () => make(),
+      log,
+      comboName: "solo",
+      comboStrategy: "round-robin",
+      sessionId: "s-empty",
+      sessionSticky: true,
+    });
+    expect(getStickyComboModel("solo", "s-empty", ["p/a"])).toBeNull();
+  });
 });
+
