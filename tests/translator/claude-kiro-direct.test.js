@@ -12,14 +12,14 @@ import { getModelUpstreamId } from "../../open-sse/config/providerModels.js";
 // turn, ahead of the "[Context: Current time …]" line. This returns that prompt part.
 const kiroPromptOf = (out) => {
   const cs = out?.conversationState || {};
-  const content = (cs.history || []).find((t) => t.userInputMessage)?.userInputMessage?.content
-    ?? cs.currentMessage?.userInputMessage?.content ?? "";
+  const content = cs.currentMessage?.userInputMessage?.content
+    ?? (cs.history || []).find((t) => t.userInputMessage)?.userInputMessage?.content ?? "";
   const at = content.indexOf("[Context: Current time");
   return (at >= 0 ? content.slice(0, at) : content).trim();
 };
 
-const C2K = (body, credentials = null, model = "claude-sonnet-4.5") =>
-  translateRequest(FORMATS.CLAUDE, FORMATS.KIRO, model, body, true, credentials, "kiro");
+const C2K = (body, credentials = null, model = "claude-sonnet-4.5", modelEffortSetting = null) =>
+  translateRequest(FORMATS.CLAUDE, FORMATS.KIRO, model, body, true, credentials, "kiro", null, [], null, null, modelEffortSetting);
 
 describe("Claude → Kiro (direct route)", () => {
   it("produces a Kiro conversationState payload", () => {
@@ -107,6 +107,36 @@ describe("Claude → Kiro (direct route)", () => {
     expect(out.additionalModelRequestFields).toBeUndefined();
     expect(out.thinking).toBeUndefined();
     expect(kiroPromptOf(out)).toContain("<max_thinking_length>24576</max_thinking_length>");
+  });
+
+  it.each([
+    ["enabled", { type: "enabled" }, "<max_thinking_length>16000</max_thinking_length>"],
+    ["disabled", { type: "disabled" }, null],
+    ["explicit budget", { type: "enabled", budget_tokens: 10000 }, "<max_thinking_length>10000</max_thinking_length>"],
+  ])("preserves Claude %s thinking on an assistant/tool turn", (_, thinking, expectedTag) => {
+    const out = C2K({
+      thinking,
+      messages: [
+        { role: "user", content: "go" },
+        { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "run", input: {} }] },
+      ],
+    });
+
+    const prompt = kiroPromptOf(out);
+    if (expectedTag) expect(prompt).toContain(expectedTag);
+    else expect(prompt).not.toContain("<thinking_mode>");
+  });
+
+  it("maps a saved model effort ahead of captured tool-turn thinking intent", () => {
+    const out = C2K({
+      thinking: { type: "enabled", budget_tokens: 10000 },
+      messages: [
+        { role: "user", content: "go" },
+        { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "run", input: {} }] },
+      ],
+    }, null, "claude-sonnet-4.5", "low");
+
+    expect(kiroPromptOf(out)).toContain("<max_thinking_length>1024</max_thinking_length>");
   });
 
   it("normalizes an unsupported Kiro intensity suffix while preserving agentic behavior", () => {
