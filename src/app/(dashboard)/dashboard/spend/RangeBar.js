@@ -38,14 +38,19 @@ export default function RangeBar({ preset, customLabel, onChange, today }) {
     onChange({ preset: "Custom", from: key(from), to: key(to), label });
   };
   return (
-    <div ref={root} style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 3, position: "relative", maxWidth: "100%" }}>
-      <div style={{ display: "flex", flexWrap: "nowrap", gap: 2, padding: 3, borderRadius: 9, background: "var(--seg)", maxWidth: "100%", overflowX: "auto", boxSizing: "border-box" }}>
-        {PRESETS.map((k) => <button key={k} onClick={() => { setOpen(false); setA(null); onChange({ preset: k }); }} style={seg(preset === k)}>{k}</button>)}
-        <button onClick={() => { setOpen((o) => !o); setA(null); }} style={seg(preset === "Custom")} aria-expanded={open}>
+    <div ref={root} className="r9-range-root">
+      <div className="r9-scroll-x r9-segment" role="radiogroup" aria-label="Date range" onKeyDown={(e) => {
+        if (!["ArrowLeft", "ArrowRight"].includes(e.key)) return;
+        const radios = [...e.currentTarget.querySelectorAll('[role="radio"]')];
+        const index = radios.indexOf(document.activeElement);
+        if (index < 0) return;
+        e.preventDefault(); const next = radios[(index + (e.key === "ArrowRight" ? 1 : -1) + radios.length) % radios.length]; next?.focus(); next?.click();
+      }} style={{ display: "flex", flexWrap: "nowrap", gap: 2, padding: 3, borderRadius: 9, background: "var(--seg)", maxWidth: "100%", overflowX: "auto", boxSizing: "border-box" }}>
+        {PRESETS.map((k) => <button key={k} role="radio" aria-checked={preset === k} tabIndex={preset === k ? 0 : -1} onClick={() => { setOpen(false); setA(null); onChange({ preset: k }); }} style={seg(preset === k)}>{k}</button>)}
+        <button role="radio" aria-checked={preset === "Custom"} tabIndex={preset === "Custom" ? 0 : -1} onClick={() => { setOpen((o) => !o); setA(null); }} style={seg(preset === "Custom")} aria-expanded={open}>
           <span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: 15 }}>calendar_month</span><span style={{ whiteSpace: "nowrap" }}>{preset === "Custom" ? customLabel || "Custom" : "Custom"}</span>
         </button>
       </div>
-      <span style={{ fontSize: 11, color: "var(--tx3)", display: "flex", alignItems: "center", gap: 4 }}><span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: 14 }}>schedule</span>Times in IST (UTC+5:30)</span>
       {open && (
         <div style={{ position: "absolute", top: 38, right: 0, zIndex: 60, width: 280, background: "var(--card)", border: "1px solid var(--line2)", borderRadius: 12, boxShadow: "0 12px 32px rgba(40,20,10,.16)", padding: 14, display: "flex", flexDirection: "column", gap: 10 }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>

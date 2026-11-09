@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import RangeBar from "../spend/RangeBar";
+import PageHeader from "../spend/PageHeader";
 import { buildView } from "./view";
 import "../spend/spend.css";
 import "./agents.css";
@@ -297,36 +298,32 @@ export default function AgentsClient() {
 
   return (
     <div data-r9={theme}>
-      <div style={{ maxWidth: 1240, margin: "0 auto", padding: "22px 22px 40px" }}>
-        {/* header */}
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, flexWrap: "wrap", marginBottom: 14 }}>
-          <div>
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <h1 className="r9-h1" style={{ fontSize: 20, fontWeight: 700, margin: 0 }}>Agents</h1>
-              <span title="Which agent runs each request. Role = the combo that routed it: main, implementer, reviewer, thinker, scout, background (Claude Code Haiku jobs), or direct (single model, no combo)." style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 11.5, fontWeight: 600, padding: "2px 9px", borderRadius: 999, background: v.status.bg, color: v.status.c, whiteSpace: "nowrap" }}>
-                <span className="material-symbols-outlined" style={{ fontSize: 14 }}>smart_toy</span>{v.status.text}
-              </span>
-            </div>
-            <p style={{ margin: "4px 0 0", fontSize: 12.5, color: "var(--tx2)" }}>Live and past agent sessions, by role and model.</p>
+      <div className="r9-agent-shell" style={{ maxWidth: 1240, margin: "0 auto", padding: "0 24px 40px", boxSizing: "border-box" }}>
+        {/* shared page header */}
+        <div className="r9-page-header">
+          <div className="r9-header-main">
+            <PageHeader title="Agents" subtitle="Live and past agent sessions, by role and model." icon="smart_toy" />
+            <span title="Which agent runs each request. Role = the combo that routed it: main, implementer, reviewer, thinker, scout, background (Claude Code Haiku jobs), or direct (single model, no combo)." style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 11, fontWeight: 600, padding: "0 9px", height: 22, borderRadius: 11, background: v.status.bg, color: v.status.c, whiteSpace: "nowrap" }}>
+              {v.tabs[0].dot && <span style={v.tabs[0].dot} />}{v.status.text}
+            </span>
           </div>
-          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
-            <div style={{ display: "flex", gap: 2, padding: 3, borderRadius: 9, background: "var(--seg)" }}>
-              {v.tabs.map((t) => (
-                <button key={t.label} onClick={t.on} style={t.style} aria-label={t.count ? t.label + " " + t.count : t.label}>
-                  {t.dot && <span style={t.dot} />}{t.label}{t.count && <span style={{ fontSize: 11.5, color: "var(--tx2)" }}>{t.count}</span>}
-                </button>
-              ))}
-            </div>
+          <div className="r9-header-controls">
+            <div className="r9-scroll-x"><div className="r9-tablist" role="tablist" aria-label="Agent views" onKeyDown={(e) => {
+              if (!["ArrowLeft", "ArrowRight"].includes(e.key)) return;
+              const buttons = [...e.currentTarget.querySelectorAll('[role="tab"]')];
+              const index = buttons.indexOf(document.activeElement);
+              if (index < 0) return;
+              e.preventDefault(); const next = buttons[(index + (e.key === "ArrowRight" ? 1 : -1) + buttons.length) % buttons.length]; next?.focus(); next?.click();
+            }}>
+              {v.tabs.map((t) => <button key={t.label} onClick={t.on} style={t.style} role="tab" aria-selected={ui.tab === t.label.toLowerCase()} aria-label={t.count ? t.label + " " + t.count : t.label}>{t.dot && <span style={t.dot} />}{t.label}{t.count && <span style={{ fontSize: 11, color: "var(--tx2)", marginLeft: 8 }}>{t.count}</span>}</button>)}
+            </div></div>
             {ui.tab === "live" ? (
-              <button onClick={v.togglePause} aria-label={v.paused ? "Resume live feed" : "Pause live feed"} style={{ display: "flex", alignItems: "center", gap: 7, border: 0, background: "transparent", padding: 0, font: "inherit", fontSize: 12, color: v.fresh.c, fontWeight: 600, cursor: "pointer" }}>
+              <button onClick={v.togglePause} aria-label={v.paused ? "Resume live feed" : "Pause live feed"} style={{ display: "flex", alignItems: "center", gap: 7, border: 0, background: "transparent", padding: 0, font: "inherit", fontSize: 12, color: v.fresh.c, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>
                 <span style={v.fresh.dot} />{v.fresh.text}<span className="r9-hacc" style={{ fontFamily: "'Material Symbols Outlined'", fontSize: 15 }}>{v.fresh.icon}</span>{v.fresh.btn}
               </button>
-            ) : (
-              <div style={{ display: "flex", gap: 2, padding: 3, borderRadius: 9, background: "var(--seg)", maxWidth: "100%", overflowX: "auto", boxSizing: "border-box" }}>
-                <RangeBar preset={v.preset} customLabel={v.customLabel} onChange={onRange} />
-              </div>
-            )}
+            ) : <RangeBar preset={v.preset} customLabel={v.customLabel} onChange={onRange} />}
           </div>
+          <div style={{ fontSize: 11, color: "var(--tx2)", display: "flex", alignItems: "center", gap: 4 }}><span className="material-symbols-outlined" style={{ fontSize: 14 }}>schedule</span>Times in IST (UTC+5:30) · Agent telemetry logging began Nov 9</div>
         </div>
 
         {isLoading && <AgentsSkeleton v={v} />}
@@ -423,11 +420,11 @@ function LiveTab({ v }) {
   if (!v.v.live) return null;
   if (v.liveWide) {
     return (
-      <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(6,minmax(150px,1fr))", gap: 10, overflowX: "auto" }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+        <div className="r9-kpis" style={{ display: "grid", gridTemplateColumns: "repeat(6,minmax(0,1fr))", gap: 16 }}>
           {v.live.kpis.map((k) => <Kpi key={k.label} k={k} />)}
         </div>
-        <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(min(100%,360px),1fr))", gap: 16, alignItems: "start" }}>
           {v.live.cards.map((c) => <LiveCard key={c.id} c={c} />)}
         </div>
       </div>
@@ -435,51 +432,51 @@ function LiveTab({ v }) {
   }
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-      <div style={{ display: "flex", gap: 8, overflowX: "auto", paddingBottom: 2 }}>
-        {v.live.kpis.map((k) => <Kpi key={k.label} k={k} mini />)}
+      <div className="r9-kpis" style={{ display: "grid", gridTemplateColumns: "repeat(6,minmax(0,1fr))", gap: 16 }}>
+        {v.live.kpis.map((k) => <Kpi key={k.label} k={k} />)}
       </div>
-      {v.live.cards.map((c) => <LiveCard key={c.id} c={c} narrow />)}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 16 }}>{v.live.cards.map((c) => <LiveCard key={c.id} c={c} narrow />)}</div>
     </div>
   );
 }
 
 function Kpi({ k, mini }) {
   return (
-    <div title={k.tip} style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: 10, boxShadow: "var(--shadow)", padding: mini ? "8px 10px" : "10px 12px", minWidth: mini ? 130 : 0 }}>
-      <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: ".04em", color: "var(--tx3)", whiteSpace: "nowrap" }}><span style={{ display: "inline-block", width: 6, height: 6, borderRadius: "50%", background: k.dot, marginRight: 5 }} />{k.label}</div>
-      <div style={{ fontSize: mini ? 15 : 18, fontWeight: 700, color: k.c, fontVariantNumeric: "tabular-nums" }}>{k.value}</div>
-      <div style={{ fontSize: 11, color: "var(--tx3)", whiteSpace: "nowrap" }}>{k.sub}</div>
+    <div title={k.tip} style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: 12, boxShadow: "var(--shadow)", padding: 12, minWidth: 0 }}>
+      <div style={{ fontSize: 11, fontWeight: 600, letterSpacing: ".06em", color: "var(--tx2)", whiteSpace: "nowrap" }}><span style={{ display: "inline-block", width: 6, height: 6, borderRadius: "50%", background: k.dot, marginRight: 5 }} />{k.label}</div>
+      <div style={{ fontSize: 28, fontWeight: 700, color: k.c, fontVariantNumeric: "tabular-nums" }}>{["Not tracked yet", "No samples"].includes(k.value) ? <span className="r9-nodata" title={k.tip} aria-label={k.tip}><span className="material-symbols-outlined" style={{ fontSize: 14 }}>info</span>{k.value}</span> : k.value}</div>
+      <div style={{ fontSize: 11, color: "var(--tx2)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={k.sub}>{k.sub}</div>
     </div>
   );
 }
 
 function LiveCard({ c, narrow }) {
   return (
-    <article style={{ ...c.wrap, background: "var(--card)", border: "1px solid var(--line)", borderRadius: 12, boxShadow: "var(--shadow)", padding: "12px 14px", minWidth: narrow ? 0 : 300, flex: narrow ? "1 1 100%" : "1 1 320px" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-        <span style={{ fontSize: 13, fontWeight: 700 }}>{c.id}</span>
+    <article style={{ ...c.wrap, background: "var(--card)", border: "1px solid var(--line)", borderRadius: 12, boxShadow: "var(--shadow)", padding: 0, minWidth: 0, display: "flex", flexDirection: "column" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", padding: "12px 12px 8px" }}>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 8, fontSize: 12.5, fontWeight: 600, fontFamily: "var(--mono)" }}><span style={{ ...c.activityDot, width: 8, height: 8, borderRadius: "50%" }} title={c.inFlight == null ? "Session activity" : `${c.inFlight} requests in flight`} />{c.id}</span>
         <span style={{ fontSize: 11.5, color: "var(--tx2)" }}>{c.client} · since {c.started}</span>
         {c.isChild && <span title={c.parentTip || ""} style={{ fontSize: 10.5, fontWeight: 600, padding: "1px 7px", borderRadius: 5, background: "var(--seg)", color: "var(--tx2)" }}>inferred child</span>}
         {c.bgNote && <span title="Claude Code Haiku jobs: titles, summaries, WebSearch. Not subagents." style={{ fontSize: 10.5, fontWeight: 600, padding: "1px 7px", borderRadius: 5, background: "var(--amberbg)", color: "var(--chipthink)" }}>+background</span>}
       </div>
-      <div style={{ display: "flex", flexDirection: "column", marginTop: 6 }}>
+      <div style={{ display: "flex", flexDirection: "column", marginTop: 0 }}>
         {c.rows.map((r) => (
-          <div key={r.role} style={{ display: "flex", flexDirection: "column", gap: 3, padding: "6px 0", borderTop: "1px solid var(--line)", opacity: r.op, minWidth: 0 }}>
+          <div key={r.role} style={{ display: "flex", flexDirection: "column", gap: 4, padding: "8px 12px", borderTop: "1px solid var(--line)", opacity: r.op, minWidth: 0 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
               <span style={r.chip}>{r.role}</span>
-              <span title={r.model} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12, color: "var(--tx)" }}><span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: r.mc, marginRight: 5 }} />{r.model}</span>
+              <span title={r.model} style={{ minWidth: 0, flex: "1 1 180px", overflowWrap: "anywhere", fontSize: 12.5, fontFamily: "var(--mono)", color: "var(--tx)" }}><span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: r.mc, marginRight: 5 }} />{r.model}</span>
               {r.tag && <span style={r.tagStyle}>{r.tag}</span>}
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", fontSize: 11, color: "var(--tx3)", paddingLeft: 2 }}>
               <span>{r.prov}</span>
-              <span style={{ display: "flex", alignItems: "center", gap: 3, color: r.stC }}><span style={r.dot} />{r.st}</span>
-              <span title={r.sparkTip} style={{ fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>{r.rpm}/m · {r.tps}t/s · {r.p50}</span>
-              <span style={{ color: r.succC, fontVariantNumeric: "tabular-nums" }}>{r.succ}</span>
+              <span aria-label={`${r.role} ${r.state.aria}`} style={{ display: "inline-flex", alignItems: "center", gap: 4, height: 20, padding: "0 8px 0 6px", borderRadius: 10, background: r.state.bg, color: r.state.color, fontSize: 11, fontWeight: 600 }}><span style={r.dot} />{r.state.label}</span>
+              <span style={{ fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>{r.rpm}/m{r.tps && ` · ${r.tps}`}{r.p50 && ` · ${r.p50}`}</span>
+              {r.succ && <span style={{ color: r.succC, fontVariantNumeric: "tabular-nums" }}>{r.succ}</span>}
             </div>
           </div>
         ))}
       </div>
-      <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+      <div className="r9-card-footer" style={{ display: "flex", gap: 8, marginTop: "auto", borderTop: "1px solid var(--line)", padding: "8px 12px", justifyContent: "flex-end" }}>
         <button onClick={c.route} style={{ height: 28, padding: "0 12px", borderRadius: 7, border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Change routing</button>
         <button onClick={c.timeline} style={{ height: 28, padding: "0 12px", borderRadius: 7, border: 0, background: "transparent", color: "var(--tx2)", font: "inherit", fontSize: 12, cursor: "pointer" }}>Timeline</button>
       </div>

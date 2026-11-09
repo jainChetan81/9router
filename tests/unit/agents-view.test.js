@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildView, chip } from "../../src/app/(dashboard)/dashboard/agents/view.js";
+import { buildView, chip, formatIdle, formatTps, formatP50, stateChip } from "../../src/app/(dashboard)/dashboard/agents/view.js";
 
 const NOW = Date.parse("2026-11-09T08:00:00Z");
 const ui = (o = {}) => ({ tab: "live", mode: "ready", exp: {}, ...o });
@@ -100,6 +100,27 @@ describe("agents view fixes", () => {
 });
 
 describe("agents view", () => {
+  it("formats live role state and measurements", () => {
+    expect(formatIdle(42_000)).toBe("idle 42 s");
+    expect(formatIdle(180_000)).toBe("idle 3 m");
+    expect(formatTps(63.7)).toBe("64 t/s");
+    expect(formatTps(null)).toBe("");
+    expect(formatP50(4200)).toBe("p50 4.2 s");
+    expect(stateChip("streaming", null, NOW, 2)).toMatchObject({ label: "streaming · 2", color: "var(--green)" });
+    expect(stateChip("thinking", null, NOW)).toMatchObject({ label: "thinking", color: "var(--amber)" });
+    expect(stateChip("idle", NOW - 42_000, NOW).label).toBe("idle 42 s");
+  });
+
+  it("uses live registry fields for in-flight and per-role metrics", () => {
+    const payload = { inFlight: 3, sessions: [{ session: "live-session", lastActivityMs: NOW - 42000, inFlight: 2,
+      roles: [{ role: "implementer", state: "thinking", inFlight: 2, lastActivityMs: NOW - 42000, idleSeconds: 42, tps: 64, p50Ms: 4200 }] }] };
+    const v = buildView({ live: payload, sessions: [], analytics: null, range: { preset: "7D" }, ui: ui(), now: NOW });
+    const row = v.live.cards[0].rows[0];
+    expect(v.live.kpis.find((k) => k.label === "IN FLIGHT").value).toBe("3");
+    expect(row).toMatchObject({ st: "thinking", tps: "64 t/s", p50: "p50 4.2 s" });
+    expect(v.live.cards[0].inFlight).toBe(2);
+  });
+
   it("builds live KPIs and nests inferred children under the parent", () => {
     const v = buildView({ live, sessions: [], analytics: null, range: { preset: "7D" }, ui: ui(), now: NOW });
     const byLabel = Object.fromEntries(v.live.kpis.map((k) => [k.label, k]));
@@ -114,8 +135,8 @@ describe("agents view", () => {
     const old = { sessions: [{ ...live.sessions[1], parent: null, tpsRecent: null, p50TotalMs: null }] };
     const v = buildView({ live: old, sessions: [], analytics: null, range: { preset: "7D" }, ui: ui(), now: NOW });
     const byLabel = Object.fromEntries(v.live.kpis.map((k) => [k.label, k]));
-    expect(byLabel["TOKENS / S"].value).toBe("—");
-    expect(byLabel["LATENCY P50"].value).toBe("—");
+    expect(byLabel["TOKENS / S"].value).toBe("No samples");
+    expect(byLabel["LATENCY P50"].value).toBe("No samples");
   });
 
   it("handles an empty response without throwing", () => {

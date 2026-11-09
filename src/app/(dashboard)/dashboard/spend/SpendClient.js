@@ -3,6 +3,7 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import RangeBar from "./RangeBar";
+import PageHeader from "./PageHeader";
 import QuotaRunway from "./QuotaRunway";
 import BreakdownDrill from "./BreakdownDrill";
 import RoutingMap from "./RoutingMap";
@@ -121,13 +122,15 @@ export default function SpendClient() {
     <div data-r9={theme} style={{ display: "flex", flexDirection: "column", minHeight: minH, backgroundColor: "var(--bg)", backgroundImage: "linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px)", backgroundSize: "44px 44px", color: "var(--tx)", fontFamily: "system-ui,-apple-system,'Segoe UI',sans-serif", fontSize: "13px", lineHeight: "1.4" }}>
       <div style={{ display: "flex", alignItems: "stretch", flex: "1" }}>
       <main style={{ flex: "1", minWidth: "0", display: "flex", flexDirection: "column" }}>
+        <PageHeader title="Spend" subtitle="Track real spend, subscription value, and usage." icon="payments" />
         {(s.range) && (<>
-          <div style={{ position: "sticky", top: "0", zIndex: "30", display: "flex", justifyContent: "space-between", alignItems: "center", gap: "12px", flexWrap: "wrap", padding: "10px 32px", background: "var(--bg)", borderBottom: "1px solid var(--line)" }}>
+          <div className="r9-spend-range" style={{ position: "sticky", top: "0", zIndex: "30", display: "flex", justifyContent: "space-between", alignItems: "center", gap: "12px", flexWrap: "wrap", padding: "8px 24px", background: "var(--bg)", borderBottom: "1px solid var(--line)" }}>
             <div style={{ display: "flex", alignItems: "baseline", gap: "8px" }}><span style={{ fontWeight: "600" }}>{rangeTitle}</span><span style={{ color: "var(--tx3)", fontSize: "12px" }}>{rangeSub}</span></div>
             <RangeBar preset={preset} customLabel={customLabel} onChange={onRange} today={todayKey} />
+            <span style={{ fontSize: 11, color: "var(--tx2)", display: "flex", alignItems: "center", gap: 4 }}><span className="material-symbols-outlined" style={{ fontSize: 14 }}>schedule</span>Times in IST (UTC+5:30) · Real spend logging began Nov 9</span>
           </div>
         </>)}
-        <div style={{ display: "flex", flexDirection: "column", gap: "16px", padding: "16px 32px 48px" }}>
+        <div className="r9-spend-content" style={{ display: "flex", flexDirection: "column", gap: "16px", padding: "16px 32px 48px" }}>
 
           {(isLoading) && (<>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(240px,1fr))", gap: "16px" }}>

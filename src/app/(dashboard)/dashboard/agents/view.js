@@ -46,7 +46,23 @@ const seg = (on) => ({ border: 0, height: 26, padding: "0 10px", borderRadius: 7
 
 export function chip(role) {
   const c = RC[role] || ["var(--seg)", "var(--tx2)"];
-  return { display: "inline-block", fontSize: 10.5, fontWeight: 600, padding: "1px 7px", borderRadius: 5, background: c[0], color: role === "background" ? "var(--tx2)" : c[1], border: role === "background" ? "1px dashed var(--tx3)" : "1px solid transparent", whiteSpace: "nowrap", lineHeight: "16px" };
+  return { display: "inline-block", fontSize: 11, fontWeight: 600, padding: "2px 8px", borderRadius: 5, background: c[0], color: role === "background" ? "var(--tx2)" : role === "main" ? "var(--tx)" : c[1], border: role === "background" ? "1px dashed var(--tx2)" : "1px solid transparent", whiteSpace: "nowrap", lineHeight: "16px" };
+}
+
+export function formatIdle(ms) {
+  if (!Number.isFinite(ms)) return "idle";
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  return seconds < 60 ? `idle ${seconds} s` : `idle ${Math.floor(seconds / 60)} m`;
+}
+export function formatTps(value) { return Number.isFinite(value) ? `${Math.round(value)} t/s` : ""; }
+export function formatP50(value) { return Number.isFinite(value) ? `p50 ${fs(value / 1000)}` : ""; }
+export function stateChip(state, lastActivityMs, now = Date.now(), inFlight = 1, idleSeconds) {
+  const key = ["streaming", "thinking", "idle"].includes(state) ? state : "idle";
+  const label = key === "idle" ? formatIdle(Number.isFinite(lastActivityMs) ? now - lastActivityMs : Number.isFinite(idleSeconds) ? idleSeconds * 1000 : NaN) : key;
+  const multi = key !== "idle" && inFlight > 1 ? `${label} · ${inFlight}` : label;
+  const color = key === "streaming" ? "var(--green)" : key === "thinking" ? "var(--amber)" : "var(--tx2)";
+  const bg = key === "streaming" ? "var(--greenbg)" : key === "thinking" ? "var(--amberbg)" : "var(--seg)";
+  return { label: multi, aria: `${key === "idle" ? "idle" : key}${key !== "idle" && inFlight > 1 ? ` · ${inFlight}` : ""}`, color, bg, dot: key !== "idle" };
 }
 
 const call = (fn, ...args) => () => fn?.(...args);
@@ -80,23 +96,27 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
   const topLevel = liveSessions.filter((s) => !s.parent);
   const kidOf = (id) => liveSessions.filter((s) => s.parent && (s.parent.session === id || s.parent === id));
   const allReq5 = liveSessions.reduce((a, s) => a + (s.reqPerMin || 0) * 5, 0);
-  const tpsVals = liveSessions.map((s) => s.tpsRecent).filter((v) => v != null && Number.isFinite(v));
-  const p50Vals = liveSessions.map((s) => s.p50TotalMs).filter((v) => v != null && Number.isFinite(v)).map((v) => v / 1000);
+  const liveRoles = liveSessions.flatMap((s) => (s.roles || []).map((r) => ({ ...r, tps: r.tps ?? s.tpsRecent, p50Ms: r.p50Ms ?? s.p50TotalMs })));
+  const tpsVals = liveRoles.map((r) => r.tps).filter((v) => v != null && Number.isFinite(v));
+  const p50Vals = liveRoles.map((r) => r.p50Ms).filter((v) => v != null && Number.isFinite(v));
+  const inFlightKnown = Number.isFinite(live?.inFlight);
+  const stateCounts = liveRoles.reduce((counts, r) => { if (r.state === "streaming" || r.state === "thinking") counts[r.state]++; return counts; }, { streaming: 0, thinking: 0 });
   const succW = liveSessions.reduce((a, s) => a + (s.reqPerMin || 0), 0);
   const succAvg = succW ? liveSessions.reduce((a, s) => a + (s.successRate ?? 100) * (s.reqPerMin || 0), 0) / succW : 100;
   const fails5 = Math.round(allReq5 * (1 - succAvg / 100));
   const liveKids = kidOfAll(liveSessions);
   const kpis = [
     ["ACTIVE SESSIONS", String(topLevel.length), liveKids ? liveKids + " delegated children" : "child links need parent IDs", "Sessions with a request in the last 5 minutes." + (liveKids ? " T3 delegated children count under their parent." : " The live feed carries no parent links yet, so children cannot be nested here."), "var(--acc)", "var(--tx)"],
-    ["IN FLIGHT", "—", "not tracked yet", "The in-flight registry (P2) is not built yet, so running requests cannot be counted.", "var(--green)", "var(--tx3)"],
+    ["IN FLIGHT", inFlightKnown ? String(live.inFlight) : "Not tracked yet", inFlightKnown ? `${stateCounts.streaming} streaming · ${stateCounts.thinking} thinking` : "In-flight requests are not available from this server.", "Current requests tracked by the live feed.", "var(--green)", inFlightKnown ? "var(--tx)" : "var(--tx3)"],
     ["REQUESTS / MIN", (allReq5 / 5).toFixed(1), Math.round(allReq5) + " requests in 5 min", "All agents, background jobs included, over the last 5 minutes.", "var(--blue)", "var(--tx)"],
-    ["TOKENS / S", tpsVals.length ? String(Math.round(med(tpsVals))) : "—", "median output speed", "Median output tokens per second across live sessions, counted after the first token.", "var(--violet)", tpsVals.length ? "var(--tx)" : "var(--tx3)"],
-    ["LATENCY P50", p50Vals.length ? fs(med(p50Vals)) : "—", "start to last token", "Median request latency over live sessions. P95 needs per-request samples (P2).", "var(--tx3)", "var(--tx)"],
+    ["TOKENS / S", tpsVals.length ? String(Math.round(med(tpsVals))) : "No samples", "median output speed", "Output speed has no samples in the live feed.", "var(--violet)", tpsVals.length ? "var(--tx)" : "var(--tx3)"],
+    ["LATENCY P50", p50Vals.length ? fs(med(p50Vals) / 1000) : "No samples", "start to last token", "Latency has no samples in the live feed.", "var(--tx3)", "var(--tx)"],
     ["SUCCESS RATE", succAvg.toFixed(1) + "%", fails5 + " failed of " + Math.round(allReq5), "Requests in the last 5 minutes that returned a complete response.", succAvg < 95 ? "var(--red)" : "var(--green)", succAvg < 95 ? "var(--red)" : "var(--tx)"],
   ].map(([label, value, sub, tip, dot, c]) => ({ label, value, sub, tip, dot, c }));
 
   const card = (s, isChild, more) => {
     const lastMs = Date.parse(s.lastTs);
+    const activityMs = Number.isFinite(s.lastActivityMs) ? s.lastActivityMs : lastMs;
     const routeOverrides = overridesBySession[s.session] || [];
     const rows = (s.roles || []).map((r) => {
       const isBg = r.role === "background";
@@ -105,10 +125,12 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
       const pending = entry?.status === "pending";
       return {
         role: r.role, chip: chip(r.role), model: currentModel, prov: prov(currentModel), mc: mc(currentModel),
-        op: isBg ? 0.72 : 1, st: "waiting", stC: "var(--tx2)",
-        dot: { width: 8, height: 8, borderRadius: "50%", flex: "none", background: "var(--tx3)" },
-        rpm: r.requests != null ? (r.requests / 5).toFixed(1) : "—", tps: "—", p50: "—",
-        succ: s.successRate == null ? "—" : (s.successRate === 100 ? "100" : s.successRate.toFixed(1)) + "%",
+        op: isBg ? 0.72 : 1, state: stateChip(r.state, r.lastActivityMs ?? s.lastActivityMs, now, r.inFlight ?? 1, r.idleSeconds),
+        st: r.state === "streaming" || r.state === "thinking" ? r.state : stateChip(r.state, r.lastActivityMs ?? s.lastActivityMs, now, r.inFlight ?? 1, r.idleSeconds).label,
+        stC: r.state === "streaming" ? "var(--green)" : r.state === "thinking" ? "var(--amber)" : "var(--tx2)",
+        dot: { width: 6, height: 6, borderRadius: "50%", flex: "none", background: r.state === "streaming" ? "var(--green)" : r.state === "thinking" ? "var(--amber)" : "var(--tx3)", animation: r.state === "streaming" ? "r9pulse 1.6s infinite" : "none" },
+        rpm: r.requests != null ? (r.requests / 5).toFixed(1) : "—", tps: formatTps(r.tps), p50: formatP50(r.p50Ms),
+        succ: s.successRate == null ? "" : (s.successRate === 100 ? "100" : s.successRate.toFixed(1)) + "%",
         succC: s.successRate == null ? "var(--tx3)" : s.successRate < 95 ? "var(--red)" : "var(--tx)",
         spark: "", sparkTip: "Per-minute history needs the in-flight registry (P2).",
         tag: pending ? "pending → " + short(entry.model) : entry?.mode === "override" ? "override" : entry?.mode === "member" ? "Routing changed" : "",
@@ -119,6 +141,7 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
     const flags = rows.map((r) => r._override).filter(Boolean);
     return {
       id: "s·" + s.session, client: s.client || "Unknown", started: Number.isFinite(lastMs) ? hm(lastMs) : "—",
+      inFlight: s.inFlight, activityDot: { background: (s.roles || []).some((r) => r.state === "streaming") ? "var(--green)" : Number.isFinite(activityMs) && now - activityMs < 60000 ? "var(--green)" : "var(--tx3)", animation: (s.roles || []).some((r) => r.state === "streaming") ? "r9pulse 1.6s infinite" : "none" },
       rows, isChild, more,
       wrap: { position: "relative", marginLeft: isChild ? (vw < 900 ? 28 : 40) : 0 },
       parentId: s.parent ? "s·" + (s.parent.session || s.parent) : "",
