@@ -204,7 +204,7 @@ export default function PiiGuardClient() {
       try {
         while (!ctl.signal.aborted) {
           const cur = cursor ? `&before=${cursor.before}&skip=${cursor.skip}` : "";
-          const { events = [], next = null } = await call(`/api/pii-guard?events=1&limit=50&from=${Math.round(from)}&to=${Math.round(to)}${cur}`, null, ctl.signal);
+          const { events = [], next = null } = await call(`/api/pii-guard?events=1&limit=200&tests=1&q=${encodeURIComponent(fullHash)}&from=${Math.round(from)}&to=${Math.round(to)}${cur}`, null, ctl.signal);
           pageCount++;
           const found = eventRows(events).find((row) => row.requestId === requestId && row.fullHash === fullHash);
           if (found) {

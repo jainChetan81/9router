@@ -38,7 +38,8 @@ export function buildEventsRequestKey(filterKey, cursor) {
   return JSON.stringify([filterKey, cursor?.before ?? null, cursor?.skip ?? 0]);
 }
 
-export const HIT_LOOKUP_PAGE_LIMIT = 10;
+// The lookup filters by hash on the server (q matches the hash), so pages hold only candidate rows.
+export const HIT_LOOKUP_PAGE_LIMIT = 50;
 
 export function nextHitLookupCursor({ pageCount, next, found = false }) {
   return found || !next || pageCount >= HIT_LOOKUP_PAGE_LIMIT ? null : next;

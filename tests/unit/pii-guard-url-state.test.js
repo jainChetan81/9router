@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseUrlState, serialiseUrlState, dropMissingDetail, validDate, rangeLabel, buildRangeKey, buildEventsFilterKey, buildEventsRequestKey, nextHitLookupCursor, clearPromptLandingOnNavigation, shouldSyncSearchInput, shouldDropMissingDetail, DEFAULT_RANGE, occurrences } from "../../src/app/(dashboard)/dashboard/pii-guard/urlState.js";
+import { parseUrlState, serialiseUrlState, dropMissingDetail, validDate, rangeLabel, buildRangeKey, buildEventsFilterKey, buildEventsRequestKey, nextHitLookupCursor, HIT_LOOKUP_PAGE_LIMIT, clearPromptLandingOnNavigation, shouldSyncSearchInput, shouldDropMissingDetail, DEFAULT_RANGE, occurrences } from "../../src/app/(dashboard)/dashboard/pii-guard/urlState.js";
 
 describe("masked preview matches", () => {
   it("finds every non-overlapping occurrence", () => {
@@ -170,6 +170,7 @@ describe("cold hit lookup paging", () => {
     expect(nextHitLookupCursor({ pageCount: 1, next: cursor })).toBe(cursor);
     expect(nextHitLookupCursor({ pageCount: 1, next: null })).toBeNull();
     expect(nextHitLookupCursor({ pageCount: 1, next: cursor, found: true })).toBeNull();
-    expect(nextHitLookupCursor({ pageCount: 10, next: cursor })).toBeNull();
+    expect(nextHitLookupCursor({ pageCount: HIT_LOOKUP_PAGE_LIMIT - 1, next: cursor })).toBe(cursor);
+    expect(nextHitLookupCursor({ pageCount: HIT_LOOKUP_PAGE_LIMIT, next: cursor })).toBeNull();
   });
 });
