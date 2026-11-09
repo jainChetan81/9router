@@ -15,6 +15,8 @@ export default function RangeBar({ preset, customLabel, onChange, today }) {
   const [m, setM] = useState(0);
   const [a, setA] = useState(null);
   const root = useRef(null);
+  const scrollRef = useRef(null);
+  const [atEnd, setAtEnd] = useState(false);
   // Same light-dismiss as HeaderMenu: a press outside or Escape closes the calendar.
   useEffect(() => {
     if (!open) return;
@@ -24,6 +26,14 @@ export default function RangeBar({ preset, customLabel, onChange, today }) {
     document.addEventListener("keydown", key);
     return () => { document.removeEventListener("mousedown", down); document.removeEventListener("keydown", key); };
   }, [open]);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const update = () => setAtEnd(el.scrollWidth <= el.clientWidth + 1 || el.scrollLeft + el.clientWidth >= el.scrollWidth - 1);
+    update(); el.addEventListener("scroll", update, { passive: true });
+    const ro = new ResizeObserver(update); ro.observe(el);
+    return () => { el.removeEventListener("scroll", update); ro.disconnect(); };
+  }, []);
   const T = today ? new Date(today + "T00:00:00") : new Date();
   const base = new Date(T.getFullYear(), T.getMonth() - m, 1);
   const off = (base.getDay() + 6) % 7, dim = new Date(base.getFullYear(), base.getMonth() + 1, 0).getDate();
@@ -39,7 +49,7 @@ export default function RangeBar({ preset, customLabel, onChange, today }) {
   };
   return (
     <div ref={root} className="r9-range-root">
-      <div className="r9-scroll-x r9-segment" role="radiogroup" aria-label="Date range" onKeyDown={(e) => {
+      <div ref={scrollRef} className={`r9-scroll-x r9-segment${atEnd ? " at-end" : ""}`} role="radiogroup" aria-label="Date range" onKeyDown={(e) => {
         if (!["ArrowLeft", "ArrowRight"].includes(e.key)) return;
         const radios = [...e.currentTarget.querySelectorAll('[role="radio"]')];
         const index = radios.indexOf(document.activeElement);

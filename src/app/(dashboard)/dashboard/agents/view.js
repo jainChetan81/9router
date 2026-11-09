@@ -334,16 +334,29 @@ export function buildView({ live, sessions, totalSessions, detail, detailLoad = 
   const byRole = analytics?.byRole || [];
   const modelByRole = analytics?.modelByRole || [];
   const orderRoles = [...ROLE_ORDER.filter((r) => byRole.some((x) => x.role === r)), ...byRole.map((x) => x.role).filter((r) => !ROLE_ORDER.includes(r))];
-  const TR = byRole.reduce((a, x) => a + (x.requests || 0), 0) || 1;
+  const totalRequests = analytics?.totalRequests ?? byRole.reduce((a, x) => a + (x.requests || 0), 0);
+  const sessionRequests = analytics?.sessionRequests ?? totalRequests;
+  const TR = totalRequests || 1;
   const TT = byRole.reduce((a, x) => a + (x.tokens || 0), 0) || 1;
   const TV = byRole.reduce((a, x) => a + (x.value || 0), 0) || 1;
   const p1 = (x) => (x * 100 < 1 && x > 0 ? "<1" : (x * 100).toFixed(0)) + "%";
   const BAR = { main: "var(--tx2)", implementer: "var(--violet)", scout: "var(--blue)", reviewer: "var(--green)", thinker: "var(--amber)", background: "var(--mbar)" };
   const barC = (r) => BAR[r] || "var(--mbar)";
-  const share = [["Requests", "requests", TR, cnt(TR), "var(--tx)"], ["Tokens", "tokens", TT, cnt(TT), "var(--tx)"], ["Value", "value", TV, usd(TV), "var(--violet)"]].map(([label, k, tot, total, c]) => ({ label, total, c,
-    aria: label + " by role: " + orderRoles.map((r) => { const x = byRole.find((y) => y.role === r); return r + " " + p1((x?.[k] || 0) / tot); }).join(", "),
-    segs: orderRoles.map((r) => { const x = byRole.find((y) => y.role === r); return { f: (((x?.[k] || 0) / tot) * 1000).toFixed(0), c: barC(r), t: r + " · " + p1((x?.[k] || 0) / tot) }; }).filter((s) => +s.f > 0) }));
-  const legendR = orderRoles.map((r) => { const x = byRole.find((y) => y.role === r) || {}; return { role: r, chip: chip(r), c: barC(r), req: p1((x.requests || 0) / TR), tok: p1((x.tokens || 0) / TT), val: p1((x.value || 0) / TV) }; });
+  const directRows = modelByRole.filter((m) => m.role === "direct").sort((a, b) => (b.requests || 0) - (a.requests || 0));
+  const roleShares = (key) => byRole.filter((x) => x.role !== "direct").map((x) => ({ name: x.role, amount: x[key] || 0, color: barC(x.role), role: x.role }));
+  const directShares = (key) => directRows.map((x) => ({ name: x.model || "Unknown", amount: x[key] || 0, color: mc(x.model), model: x.model || "Unknown" }));
+  const share = [["Requests", "requests", TR, cnt(TR), "var(--tx)"], ["Tokens", "tokens", TT, cnt(TT), "var(--tx)"], ["Value", "value", TV, usd(TV), "var(--violet)"]].map(([label, k, tot, total, c]) => {
+    const directKey = k === "requests" ? "requests" : k;
+    const items = [...roleShares(k), ...directShares(directKey)];
+    const aria = [...orderRoles.filter((r) => r !== "direct").map((r) => { const x = byRole.find((y) => y.role === r); return r + " " + p1((x?.[k] || 0) / tot); }), ...directRows.map((x) => `${x.model || "Unknown"} ${p1((x[directKey] || 0) / tot)}`)];
+    const raw = items.map((x) => ({ ...x, share: (x.amount || 0) / tot }));
+    const visible = raw.filter((x) => x.share >= 0.01);
+    const other = raw.filter((x) => x.share < 0.01).reduce((a, x) => a + x.share, 0);
+    if (other > 0) visible.push({ name: "Other", share: other, color: "var(--line2)" });
+    return { label, total, c, aria: label + " by role and direct model: " + aria.join(", "), segs: visible.map((x) => ({ f: (x.share * 1000).toFixed(2), c: x.color, t: x.name + " · " + p1(x.share) })) };
+  });
+  const legendR = orderRoles.filter((r) => r !== "direct").map((r) => { const x = byRole.find((y) => y.role === r) || {}; return { role: r, chip: chip(r), c: barC(r), req: p1((x.requests || 0) / TR), tok: p1((x.tokens || 0) / TT), val: p1((x.value || 0) / TV) }; });
+  const legendDirect = directRows.map((x) => ({ model: x.model || "Unknown", c: mc(x.model), req: p1((x.requests || 0) / TR), tok: p1((x.tokens || 0) / TT), val: p1((x.value || 0) / TV) }));
   const deleg = analytics ? analytics.delegationRate : null;
   const cps = analytics ? analytics.childrenPerSession : null;
   const bgReq = (byRole.find((x) => x.role === "background")?.requests || 0) / TR;
@@ -364,7 +377,7 @@ export function buildView({ live, sessions, totalSessions, detail, detailLoad = 
     rows.forEach((m) => {
       const sc = (m.successRate ?? 1) * 100;
       const sC = sc >= 98 ? "var(--green)" : sc >= 95 ? "var(--amber)" : "var(--red)";
-      roRows.push({ head: false, row: true, model: m.model || "unknown", mc: mc(m.model), prov: prov(m.model), req: cnt(m.requests || 0),
+      roRows.push({ head: false, row: true, model: m.model || "unknown", mc: mc(m.model), prov: prov(m.model), req: cnt(m.requests || 0), noSamples: !(m.samples > 0), configError: m.model === "invalid",
         tps: m.tpsP50 != null ? String(Math.round(m.tpsP50)) : "—", tpsW: ((m.tpsP50 || 0) / maxTps * 100).toFixed(0) + "%",
         ttft: m.ttftP50 != null ? (m.ttftP50 / 1000).toFixed(1) + " s" : "—",
         lat: (m.totalP50 != null ? (m.totalP50 / 1000).toFixed(1) : "—") + " / " + (m.totalP95 != null ? (m.totalP95 / 1000).toFixed(1) : "—") + " s",
@@ -373,7 +386,7 @@ export function buildView({ live, sessions, totalSessions, detail, detailLoad = 
         samples: cnt(m.samples || 0), fast: fast && m.model === fast.model, rel: rel && m.model === rel.model });
     });
   });
-  const ro = { share, legend: legendR, cards: roCards, rows: roRows,
+  const ro = { share, totalRequests: cnt(totalRequests), sessionRequests: cnt(sessionRequests), legend: legendR, legendDirect, cards: roCards, rows: roRows,
     fastChip: { display: "inline-flex", alignItems: "center", gap: 2, fontSize: 10.5, fontWeight: 600, padding: "0 6px", height: 18, borderRadius: 4, background: "var(--bluebg)", color: "var(--chipscout)", whiteSpace: "nowrap", flex: "none" },
     relChip: { display: "inline-flex", alignItems: "center", gap: 2, fontSize: 10.5, fontWeight: 600, padding: "0 6px", height: 18, borderRadius: 4, background: "var(--greenbg)", color: "var(--chiprev)", whiteSpace: "nowrap", flex: "none" },
     note: "TPS = output tokens per second after the first token. Value per request at API list price (estimate). Samples = requests with latency logged; rows logged before Nov 9 show —. thinker is fusion: every member answers each call." };
@@ -381,19 +394,21 @@ export function buildView({ live, sessions, totalSessions, detail, detailLoad = 
   // ---------- tools ----------
   const toolRole = ui.toolRole || "";
   const toolData = tools?.tools || [];
-  const toolRoles = [...new Set(toolData.flatMap((t) => (t.byRole || []).map((r) => r.role)))].sort((a, b) => {
+  const toolRoles = [...new Set(toolData.flatMap((t) => (t.byRole || []).map((r) => r.role)).filter((r) => r !== "direct"))].sort((a, b) => {
     const ai = ROLE_ORDER.indexOf(a), bi = ROLE_ORDER.indexOf(b);
     return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi) || a.localeCompare(b);
   });
+  const toolModels = [...new Set(toolData.flatMap((t) => (t.byRole || []).filter((r) => r.role === "direct").map((r) => r.model).filter(Boolean)))].sort();
   const toolRows = toolData.map((t) => {
-    const roles = (t.byRole || []).filter((r) => !toolRole || r.role === toolRole);
+    const roles = (t.byRole || []).filter((r) => !toolRole || r.role === toolRole || (r.role === "direct" && r.model === toolRole));
     const calls = toolRole ? roles.reduce((n, r) => n + r.calls, 0) : t.calls;
     const errors = toolRole ? roles.reduce((n, r) => n + r.errors, 0) : t.errors;
     return { name: t.name, calls, errors, pct: (calls ? errors / calls * 100 : 0).toFixed(1) + "%",
-      topModel: t.topModel?.model || "—", split: roles.map((r) => ({ role: r.role, calls: r.calls, c: barC(r.role), f: calls ? r.calls / calls * 100 : 0 })) };
+      topModel: t.topModel?.model || "—", split: roles.map((r) => ({ role: r.role, model: r.model, label: r.role === "direct" ? r.model || "Direct model" : r.role, calls: r.calls, c: r.role === "direct" ? mc(r.model || t.topModel?.model) : barC(r.role), f: calls ? r.calls / calls * 100 : 0 })) };
   }).filter((t) => t.calls > 0).sort((a, b) => b.calls - a.calls);
   const tl = { rows: toolRows, none: toolRows.length === 0, hasData: toolData.length > 0, emptyTitle: "Tool tracking started Nov 9, 2026",
-    roleBtns: ["", ...toolRoles].map((role) => ({ label: role || "All", on2: role === toolRole, style: seg(role === toolRole), on: call(act.setToolRole, role) })),
+    roleBtns: ["", ...toolRoles].map((role) => ({ label: role || "All", on2: role === toolRole, style: seg(role === toolRole), on: call(act.setToolRole, role) })), directModelBtns: toolModels.map((model) => ({ label: model, on2: model === toolRole, style: seg(model === toolRole), on: call(act.setToolRole, model) })),
+    legend: toolRoles.map((role) => ({ role, c: barC(role) })), directLegend: toolModels.map((model) => ({ model, c: mc(model) })),
     perRole: (tools?.topToolsByRole || []).map((r) => ({ role: r.role, chip: chip(r.role), c: barC(r.role), items: (r.tools || []).map((t) => ({ ...t, w: ((t.calls / (r.tools[0]?.calls || 1)) * 100).toFixed(0) + "%" })) })),
     sampleNote: tools?.sampled ? `Sampled ${cnt(tools.sampled.rows)} rows (limit ${cnt(tools.sampled.cap)}).${tools.truncated ? " Results are truncated." : ""}` : tools?.truncated ? "Results are truncated." : "",
     note: "Calls counted per tool use. Errors are tool results marked as errors." };

@@ -901,11 +901,12 @@ function getToolsInline(db, fromIso, toIso) {
       tool.calls += calls;
       tool.errors += errors;
       const role = row.role || "direct";
-      const roleCount = tool.byRole.get(role) || { role, calls: 0, errors: 0 };
+      const model = row.model || "unknown";
+      const roleKey = role === "direct" ? `${role}\u0000${model}` : role;
+      const roleCount = tool.byRole.get(roleKey) || { role, ...(role === "direct" ? { model } : {}), calls: 0, errors: 0 };
       roleCount.calls += calls;
       roleCount.errors += errors;
-      tool.byRole.set(role, roleCount);
-      const model = row.model || "unknown";
+      tool.byRole.set(roleKey, roleCount);
       if (calls) tool.byModel.set(model, (tool.byModel.get(model) || 0) + calls);
       const key = `${role}\u0000${name}`;
       const top = roleTotals.get(key) || { role, name, calls: 0, errors: 0 };

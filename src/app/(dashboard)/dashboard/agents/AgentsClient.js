@@ -636,7 +636,7 @@ function Gantt({ v, ui }) {
         {g.now && <div style={{ position: "absolute", left: g.nowL, top: 20, bottom: 0, width: 1, background: "var(--green)" }} title="now" />}
         {g.lanes.map((l, li) => (
           <div key={li} className="r9-timeline-lane" role="group" aria-label={`${l.role} requests`} title={l.tip} style={{ display: "flex", alignItems: "center", gap: 8, height: 39, opacity: l.op }}>
-            <button onClick={l.focus} style={{ width: 120, flex: "none", display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 1, border: 0, background: "transparent", padding: 0, font: "inherit", cursor: "pointer", textAlign: "left" }}>
+            <button className="r9-timeline-role-label" onClick={l.focus} style={{ width: 120, flex: "none", display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 1, border: 0, background: "transparent", padding: 0, font: "inherit", cursor: "pointer", textAlign: "left" }}>
               <span style={l.chip}>{l.role}</span>
               <span style={{ fontSize: 10.5, color: "var(--tx3)", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{l.model}</span>
             </button>
@@ -681,28 +681,25 @@ function Gantt({ v, ui }) {
 function RolesTab({ v }) {
   const r = v.ro;
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
       <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: 12, boxShadow: "var(--shadow)", padding: "14px 16px" }}>
-        <div style={{ fontSize: 11.5, fontWeight: 600, letterSpacing: ".05em", color: "var(--tx2)", marginBottom: 10 }}>SHARE OF WORK</div>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 8, fontSize: 11, fontWeight: 600, letterSpacing: ".06em", color: "var(--tx2)", marginBottom: 10 }}><span>SHARE OF WORK</span><span style={{ fontWeight: 400, letterSpacing: 0 }}>{r.totalRequests} requests · {r.sessionRequests} with a session</span></div>
         {r.share.map((s) => (
           <div key={s.label} style={{ marginBottom: 10 }}>
             <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 4 }}>
               <span style={{ color: "var(--tx2)" }}>{s.label}</span><b style={{ color: s.c }}>{s.total}</b>
             </div>
-            <div role="img" aria-label={s.aria} style={{ display: "flex", height: 14, borderRadius: 7, overflow: "hidden", background: "var(--seg)" }}>
-              {s.segs.map((g, i) => <span key={i} title={g.t} style={{ flex: g.f, background: g.c }} />)}
+            <div role="img" aria-label={s.aria} style={{ display: "flex", height: 12, borderRadius: 6, overflow: "hidden", background: "var(--seg)" }}>
+              {s.segs.map((g, i) => <span key={i} title={g.t} style={{ flex: `${g.f} 1 0`, minWidth: Number(g.f) > 0 && Number(g.f) < 5 ? 2 : 0, background: g.c, borderRight: "1px solid var(--card)" }} />)}
             </div>
           </div>
         ))}
-        <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginTop: 6 }}>
-          {r.legend.map((l) => (
-            <span key={l.role} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11.5, color: "var(--tx2)" }}>
-              <span style={{ width: 9, height: 9, borderRadius: 3, background: l.c }} /><span style={l.chip}>{l.role}</span>{l.req} req · {l.tok} tok · {l.val} val
-            </span>
-          ))}
+        <div className="r9-role-legends">
+          <div><div className="r9-caps">Roles</div>{r.legend.map((l) => <div key={l.role} className="r9-role-legend-row"><span className="r9-role-dot" style={{ background: l.c }} /><span style={l.chip}>{l.role}</span><span>{l.req} req · {l.tok} tok · {l.val} val</span></div>)}</div>
+          <div><div className="r9-caps">Direct models</div>{r.legendDirect.map((l) => <div key={l.model} className="r9-role-legend-row"><span className="r9-role-dot" style={{ background: l.c }} /><code>{l.model}</code><span>{l.req} req · {l.tok} tok · {l.val} val</span></div>)}</div>
         </div>
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(3,minmax(180px,1fr))", gap: 10 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3,minmax(180px,1fr))", gap: 16 }} className="r9-role-kpis">
         {r.cards.map((c) => (
           <div key={c.label} title={c.tip} style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: 10, padding: "10px 12px" }}>
             <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: ".04em", color: "var(--tx3)" }}><span style={{ display: "inline-block", width: 6, height: 6, borderRadius: "50%", background: c.dot, marginRight: 5 }} />{c.label}</div>
@@ -713,8 +710,8 @@ function RolesTab({ v }) {
       </div>
       <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: 12, boxShadow: "var(--shadow)" }}>
         <div style={{ padding: "12px 16px", borderBottom: "1px solid var(--line)", fontSize: 11.5, fontWeight: 600, letterSpacing: ".05em", color: "var(--tx2)" }}>MODELS INSIDE EACH ROLE</div>
-        <div style={{ overflowX: "auto" }}>
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, fontVariantNumeric: "tabular-nums" }}>
+        <div className="r9-role-table-wrap" style={{ overflowX: "auto" }}>
+          <table className="r9-role-table" style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, fontVariantNumeric: "tabular-nums" }}>
             <thead>
               <tr style={{ textAlign: "left", fontSize: 11, color: "var(--tx3)" }}>
                 <th style={{ padding: "8px 12px", fontWeight: 600 }}>Model</th><th style={{ padding: "8px 12px", fontWeight: 600 }}>Req</th>
@@ -726,19 +723,18 @@ function RolesTab({ v }) {
             <tbody>
               {r.rows.map((m, i) => m.head ? (
                 <tr key={"h" + i} style={{ background: "var(--seg)" }}>
-                  <td colSpan={8} style={{ padding: "7px 12px" }}><span style={m.chip}>{m.role}</span> <span style={{ fontSize: 11.5, color: "var(--tx3)" }}>{m.desc}</span></td>
+                  <td colSpan={8} style={{ padding: "7px 12px" }}>{m.role === "direct" ? <strong style={{ fontSize: 11, letterSpacing: ".06em", color: "var(--tx2)" }}>DIRECT MODELS</strong> : <><span style={m.chip}>{m.role}</span> <span style={{ fontSize: 11, color: "var(--tx2)" }}>{m.desc}</span></>}</td>
                 </tr>
               ) : (
                 <tr key={"r" + i} style={{ borderTop: "1px solid var(--line)" }}>
-                  <td style={{ padding: "7px 12px" }}><span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: m.mc, marginRight: 5 }} />{m.model} <span style={{ color: "var(--tx3)", fontSize: 11 }}>· {m.prov}</span>
+                  <td style={{ padding: "7px 12px" }}><span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: m.mc, marginRight: 5 }} /><span className="r9-role-model-name">{m.model}</span> <span className="r9-role-provider">{m.prov}</span>
+                    {m.configError && <span className="r9-config-error"><b>Config error</b> <a href="/dashboard/combos">Fix in Combos</a></span>}
                     {m.fast && <span style={r.fastChip}><span className="material-symbols-outlined" style={{ fontSize: 12 }}>bolt</span>fastest</span>}
                     {m.rel && <span style={{ marginLeft: 4, ...r.relChip }}><span className="material-symbols-outlined" style={{ fontSize: 12 }}>verified</span>reliable</span>}
                   </td>
                   <td style={{ padding: "7px 12px" }}>{m.req}</td>
-                  <td style={{ padding: "7px 12px" }}><span style={{ display: "inline-block", width: 48, height: 5, borderRadius: 3, background: "var(--seg)", verticalAlign: "middle", marginRight: 6 }}><span style={{ display: "block", height: "100%", width: m.tpsW, borderRadius: 3, background: "var(--violet)" }} /></span>{m.tps}</td>
-                  <td style={{ padding: "7px 12px" }}>{m.ttft}</td>
-                  <td style={{ padding: "7px 12px" }}>{m.lat}</td>
-                  <td style={{ padding: "7px 12px" }}><span style={{ display: "inline-block", width: 48, height: 5, borderRadius: 3, background: "var(--seg)", verticalAlign: "middle", marginRight: 6 }}><span style={{ display: "block", height: "100%", width: m.sW, borderRadius: 3, background: m.sC }} /></span>{m.succ}</td>
+                  {m.noSamples ? <td colSpan={3} style={{ padding: "7px 12px" }}><span className="r9-nodata" title="Latency is logged since Nov 9. This row has no timed requests." aria-label="No samples"><span className="material-symbols-outlined" style={{ fontSize: 14 }}>info</span>No samples</span></td> : <><td style={{ padding: "7px 12px" }}><span className="r9-mini-track"><i style={{ width: m.tpsW, background: "var(--violet)" }} /></span>{m.tps}</td><td style={{ padding: "7px 12px" }}>{m.ttft}</td><td style={{ padding: "7px 12px" }}>{m.lat}</td></>}
+                  <td style={{ padding: "7px 12px" }}>{m.configError ? <span className="r9-nodata" title="This model is not routed.">Not routed</span> : <><span className="r9-mini-track"><i style={{ width: m.sW, background: m.sC }} /></span>{m.succ}</>}</td>
                   <td style={{ padding: "7px 12px" }}>{m.vpr}</td>
                   <td style={{ padding: "7px 12px", color: "var(--tx3)" }}>{m.samples}</td>
                 </tr>
@@ -765,16 +761,18 @@ function ToolsTab({ v, error, loading }) {
           <div style={{ ...card, flex: "2 1 560px" }}>
             <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
               <strong>TOOL CALLS</strong>
-              <div aria-label="Filter tools by role" style={{ display: "flex", flexWrap: "wrap", background: "var(--seg)", borderRadius: 9, padding: 3 }}>
+              <div aria-label="Filter tools by role" className="r9-tool-filters">
                 {t.roleBtns.map((b) => <button key={b.label} onClick={b.on} aria-pressed={b.on2} style={b.style}>{b.label}</button>)}
+                {t.directModelBtns.length > 0 && <><span className="r9-tool-filter-divider">Direct models</span>{t.directModelBtns.map((b) => <button key={b.label} onClick={b.on} aria-pressed={b.on2} style={b.style}>{b.label}</button>)}</>}
               </div>
             </div>
+            <div className="r9-tool-legend"><span>By role:</span>{t.legend.map((l) => <span key={l.role}><i style={{ background: l.c }} />{l.role}</span>)}{t.directLegend.length > 0 && <><span className="r9-tool-legend-divider">Direct models</span>{t.directLegend.map((l) => <span key={l.model}><i style={{ background: l.c }} /><code>{l.model}</code></span>)}</>}</div>
             <div style={{ overflowX: "auto" }}>
-              <table style={{ width: "100%", textAlign: "left", borderCollapse: "collapse", fontSize: 12 }}>
+              <table className="r9-tools-table" style={{ width: "100%", textAlign: "left", borderCollapse: "collapse", fontSize: 12 }}>
                 <thead><tr><th>Tool</th><th>Calls</th><th>Errors</th><th>Error %</th><th>By role</th><th>Top model (all roles)</th></tr></thead>
                 <tbody>{t.rows.map((r) => <tr key={r.name} style={{ borderTop: "1px solid var(--line)" }}>
-                  <td style={{ padding: "10px 8px 10px 0" }}>{r.name}</td><td>{r.calls}</td><td>{r.errors}</td><td>{r.pct}</td>
-                  <td><div aria-label={r.split.map((s) => `${s.role}: ${s.calls}`).join(", ")} style={{ display: "flex", width: 100, height: 7, overflow: "hidden", borderRadius: 5 }}>{r.split.map((s) => <span key={s.role} title={`${s.role}: ${s.calls}`} style={{ width: `${s.f}%`, background: s.c }} />)}</div></td>
+                  <td style={{ padding: "10px 8px 10px 0" }} title={r.name}>{r.name}</td><td>{r.calls}</td><td>{r.errors}</td><td>{r.pct}</td>
+                  <td><div title={r.split.map((s) => `${s.label}: ${s.calls}`).join(", ")} aria-label={r.split.map((s) => `${s.label}: ${s.calls}`).join(", ")} className="r9-tool-bar">{r.split.map((s) => <span key={`${s.role}-${s.model || ""}`} title={`${s.label}: ${s.calls}`} style={{ width: `${s.f}%`, background: s.c }} />)}</div></td>
                   <td>{r.topModel}</td>
                 </tr>)}</tbody>
               </table>

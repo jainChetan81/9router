@@ -170,7 +170,7 @@ export function buildView({ data, quota, ui, set, fit, range, feeRefs, saveFees 
   } else rowsSrc = G.provider.map((o) => mk(PROV[o.k] || o.k, SUBN[o.k] ? (o.k in { openrouter: 1, deepseek: 1 } ? "Pay per token" : SUBN[o.k] === "local" ? "Local · free" : "Subscription") : "Provider", o));
   if (["role", "client", "session"].includes(ui.group) && totals.nrReq > 0)
     rowsSrc.push({ name: "Not recorded", desc: "requests before " + loggedLabel, v: totals.nrList, real: 0, req: cnt(totals.nrReq), tok: cnt(totals.nrTok), nr: true });
-  rowsSrc.sort((a, b) => (ui.group === "session" ? (a.nr ? 2 : a.other ? 1 : 0) - (b.nr ? 2 : b.other ? 1 : 0) : 0) || b.v - a.v);
+  rowsSrc.sort((a, b) => (a.nr ? 1 : 0) - (b.nr ? 1 : 0) || (ui.group === "session" ? (a.other ? 1 : 0) - (b.other ? 1 : 0) : 0) || b.v - a.v);
   const rows = rowsSrc.map((x) => ({
     name: x.name, desc: x.desc, hasMix: !!x.mix, mix: x.mix || [], req: x.req, tok: x.tok,
     real: x.nr ? "not logged" : x.real >= 0.005 ? usd(x.real, 1) : x.real > 0 ? "<$0.01" : "—", realC: x.real > 0 && !x.nr ? "var(--acc)" : "var(--tx3)",

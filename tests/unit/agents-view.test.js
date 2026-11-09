@@ -182,6 +182,31 @@ describe("agents view", () => {
     expect(filtered.tl.rows[0].split.map((r) => r.role)).toEqual(["scout"]);
     expect(buildView({ ...args, tools: { tools: [], topToolsByRole: [] } }).tl).toMatchObject({ hasData: false, emptyTitle: "Tool tracking started Nov 9, 2026" });
   });
+  it("shares requests across roles and direct model segments (A25, A27, A28)", () => {
+    const analytics = { totalRequests: 10, sessionRequests: 7, byRole: [
+      { role: "implementer", requests: 4, tokens: 40, value: 4 }, { role: "direct", requests: 6, tokens: 60, value: 6 },
+    ], modelByRole: [
+      { role: "implementer", model: "gpt-6-luna", requests: 4, tokens: 40, value: 4, samples: 0 },
+      { role: "direct", model: "claude-opus-5-5", requests: 4, tokens: 40, value: 4, samples: 0 },
+      { role: "direct", model: "gpt-6-luna", requests: 2, tokens: 20, value: 2, samples: 1, tpsP50: 20, ttftP50: 300, totalP50: 500, totalP95: 800 },
+    ], delegationRate: 0.1, childrenPerSession: 0.5 };
+    const v = buildView({ analytics, range: { preset: "7D" }, ui: ui({ tab: "roles" }) });
+    expect(v.ro.totalRequests).toBe("10");
+    expect(v.ro.sessionRequests).toBe("7");
+    expect(v.ro.legendDirect.map((x) => x.model)).toEqual(["claude-opus-5-5", "gpt-6-luna"]);
+    expect(v.ro.share[0].segs.reduce((n, s) => n + Number(s.f), 0)).toBeCloseTo(1000, 0);
+    expect(v.ro.rows.find((r) => r.model === "claude-opus-5-5").noSamples).toBe(true);
+  });
+  it("groups direct model tool filters separately from roles (A32)", () => {
+    const tools = { tools: [{ name: "Read", calls: 12, errors: 1, byRole: [
+      { role: "implementer", calls: 9, errors: 0 }, { role: "direct", model: "claude-opus-5-5", calls: 3, errors: 1 },
+    ], topModel: { model: "claude-opus-5-5", calls: 3 } }] };
+    const args = { tools, range: { preset: "7D" }, ui: ui({ tab: "tools" }) };
+    const all = buildView(args);
+    expect(all.tl.roleBtns.map((b) => b.label)).toEqual(["All", "implementer"]);
+    expect(all.tl.directModelBtns.map((b) => b.label)).toEqual(["claude-opus-5-5"]);
+    expect(buildView({ ...args, ui: ui({ tab: "tools", toolRole: "claude-opus-5-5" }) }).tl.rows[0].calls).toBe(3);
+  });
 
   it("exposes page-state flags under v.v so the Sessions tab renders", () => {
     const sessions = [{ session: "aaaaaaaaaaaa", client: "Claude Code", firstTs: "2026-11-09T07:00:00Z", lastTs: "2026-11-09T07:59:00Z", requests: 3, tokens: 10, value: 0, errors: 0, roles: [{ role: "main", models: [{ model: "claude-opus-5-5", requests: 3, tokens: 10, value: 0 }] }], parent: null }];
