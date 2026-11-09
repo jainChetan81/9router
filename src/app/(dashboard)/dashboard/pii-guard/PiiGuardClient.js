@@ -1,7 +1,8 @@
 "use client";
 
 import { Fragment, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
+import { occurrences, parseUrlState, serialiseUrlState } from "./urlState";
 import RangeBar from "../spend/RangeBar";
 import { buildView, place, PAGE } from "./view";
 import "../spend/spend.css";
@@ -28,7 +29,10 @@ const toB64 = (file) => new Promise((ok, bad) => { const r = new FileReader(); r
 
 export default function PiiGuardClient() {
   const router = useRouter();
-  const [range, setRange] = useState({ preset: "24h" });
+  const searchParams = useSearchParams();
+  const search = searchParams.toString();
+  const urlState = useMemo(() => parseUrlState(new URLSearchParams(search)), [search]);
+  const range = urlState.range;
   const [data, setData] = useState(null);
   const [mode, setMode] = useState("loading");
   const [errorText, setErrorText] = useState("");
@@ -37,12 +41,46 @@ export default function PiiGuardClient() {
   const [evPage, setEvPage] = useState([]);
   const [evNext, setEvNext] = useState(null);
   const [evBusy, setEvBusy] = useState(false);
+  const [evLoaded, setEvLoaded] = useState(false);
   const [samples, setSamples] = useState([]);
   const [toastState, setToast] = useState(null);
   const [test, setTest] = useState({ result: null, image: null, error: "", busy: false });
-  const [ui, setUi] = useState({ tab: "overview", view: "value", openGroup: null, allLoc: false, q: "", fGroup: "", fAction: "", fClient: "", fModel: "", fSource: "", tests: false, sel: {}, page: 0, leakPage: 0, detail: null, pending: null, menu: null, showAllowed: false, session: "",
+  const [local, setLocal] = useState({ openGroup: null, allLoc: false, sel: {}, page: 0, leakPage: 0, pending: null, menu: null, showAllowed: false,
     testKind: "text", testText: "My mobile number is 9876543210 and PAN is ABCPE1234F.", testMode: "current", testWhere: "user", imgSel: 0, upload: null });
-  const set = useCallback((p) => setUi((u) => ({ ...u, ...(typeof p === "function" ? p(u) : p) })), []);
+  const [searchInput, setSearchInput] = useState(urlState.q);
+  const pendingUrl = useRef(urlState), searchTimer = useRef(null);
+  useEffect(() => { pendingUrl.current = urlState; setSearchInput(urlState.q); clearTimeout(searchTimer.current); }, [urlState]);
+  useEffect(() => () => clearTimeout(searchTimer.current), []);
+  const hit = rawEvents.find((e) => `${e.requestId}:${e.fullHash}` === urlState.detailHit);
+  const ui = useMemo(() => ({ ...local, ...urlState, q: searchInput, detail: urlState.at && urlState.view === "prompt" ? null : urlState.detailKey ? { kind: "value", key: urlState.detailKey } : hit ? { kind: "hit", hit } : null }), [local, urlState, searchInput, hit]);
+  const currentUi = useRef(ui); currentUi.current = ui;
+  const set = useCallback((update) => {
+    const p = typeof update === "function" ? update(currentUi.current) : update;
+    const keys = ["tab", "view", "q", "fGroup", "fAction", "fClient", "fModel", "fSource", "tests", "session", "at", "range", "detailKey", "detailHit"];
+    const next = { ...pendingUrl.current }, rest = {};
+    let changed = false, navigation = false;
+    for (const [key, value] of Object.entries(p)) {
+      if (key === "detail") {
+        next.detailKey = value?.kind === "value" ? value.key : null;
+        next.detailHit = value?.kind === "hit" ? `${value.hit.requestId}:${value.hit.fullHash}` : null;
+        changed = true; navigation = true;
+      } else if (keys.includes(key)) {
+        next[key] = value; changed = true;
+        if (["tab", "view", "session", "at", "range"].includes(key)) navigation = true;
+      } else rest[key] = value;
+    }
+    if (Object.keys(rest).length) setLocal((u) => ({ ...u, ...rest }));
+    if (!changed) return;
+    if ("q" in p) setSearchInput(p.q);
+    pendingUrl.current = next;
+    const go = () => {
+      const params = serialiseUrlState(pendingUrl.current, new URLSearchParams(search));
+      const query = params.toString();
+      router[navigation ? "push" : "replace"](`${window.location.pathname}${query ? `?${query}` : ""}`, { scroll: false });
+    };
+    clearTimeout(searchTimer.current);
+    if ("q" in p && !navigation) searchTimer.current = setTimeout(go, 300); else go();
+  }, [router, search]);
   const [theme, setTheme] = useState("light");
   useEffect(() => {
     const el = document.documentElement, sync = () => setTheme(el.classList.contains("dark") ? "dark" : "light");
@@ -100,9 +138,18 @@ export default function PiiGuardClient() {
     if (ui.tab !== "findings" || ui.view !== "hit") return;
     const ctl = new AbortController();
     setEvBusy(true);
-    fetchEvents(evCursor, ctl.signal).then(({ rows, next }) => { setRawEvents(rows); setEvNext(next); setEvBusy(false); }).catch(() => { if (!ctl.signal.aborted) setEvBusy(false); });
+    fetchEvents(evCursor, ctl.signal).then(({ rows, next }) => { setRawEvents(rows); setEvNext(next); setEvBusy(false); setEvLoaded(true); }).catch(() => { if (!ctl.signal.aborted) setEvBusy(false); });
     return () => { ctl.abort(); setEvBusy(false); };
   }, [ui.tab, ui.view, evTick, evCursor, fetchEvents]);
+  useEffect(() => {
+    if (!data) return;
+    const missingValue = urlState.detailKey && !(data.summary?.groups || []).some((v) => `${v.hash}:${v.rule}` === urlState.detailKey);
+    const missingHit = urlState.detailHit && ui.tab === "findings" && ui.view === "hit" && evLoaded && !evBusy && !hit;
+    if (!missingValue && !missingHit) return;
+    const next = { ...urlState, ...(missingValue && { detailKey: null }), ...(missingHit && { detailHit: null }) };
+    const query = serialiseUrlState(next, new URLSearchParams(search)).toString();
+    router.replace(`${window.location.pathname}${query ? `?${query}` : ""}`, { scroll: false });
+  }, [data, urlState, ui.tab, ui.view, evBusy, evLoaded, hit, search, router]);
   const loadOlder = evNext && !evBusy ? () => { setEvPage((p) => [...p, { cursor: evNext }]); set({ sel: {} }); } : null;
   const loadNewer = !evNewest && !evBusy ? () => { setEvPage((p) => p.slice(0, -1)); set({ sel: {} }); } : null;
   const loadNewest = !evNewest && !evBusy ? () => { setEvPage([]); set({ sel: {} }); } : null;
@@ -158,7 +205,7 @@ export default function PiiGuardClient() {
 
   const isLoading = mode === "loading" || (!v && mode !== "error"), isError = mode === "error";
   const preset = range.preset, customLabel = range.label || "";
-  const onRange = (r) => { setRange(r); set({ sel: {}, detail: null, pending: null, page: 0, leakPage: 0 }); };
+  const onRange = (r) => set({ range: r, sel: {}, detail: null, pending: null, page: 0, leakPage: 0 });
   const todayKey = new Date(Date.now() + IST).toISOString().slice(0, 10);
   const retry = () => { setMode("loading"); load(); };
   const openConsole = () => router.push("/dashboard/console-log");
@@ -466,7 +513,7 @@ export default function PiiGuardClient() {
               {(loadOlder) && (<button onClick={loadOlder} style={moreBtn}>Older 50</button>)}
             </div>
           </>)}
-          {(isPrompts) && <Prompts q={dq0} session={ui.session} range={range} tick={data} clearSession={() => set({ session: "" })} setSession={(id) => set({ session: id, q: "" })} />}</div>
+          {(isPrompts) && <Prompts q={dq0} session={ui.session} at={ui.at} mark={(data?.summary?.groups || []).find((v) => `${v.hash}:${v.rule}` === ui.detailKey)?.preview || ""} range={range} tick={data} clearSession={() => set({ session: "", at: "", detail: null })} setSession={(id) => set({ session: id, at: "", q: "" })} />}</div>
         </div>
       </>)}
 
@@ -602,9 +649,11 @@ function Sec({ label, children }) {
 }
 // Marks the masked value inside its masked context.
 function highlight(text, mark) {
-  const at = mark ? text.indexOf(mark) : -1;
-  if (at < 0) return text;
-  return <>{text.slice(0, at)}<span style={{ background: "var(--bluebg)", color: "var(--blue)", borderRadius: "4px", padding: "0 4px" }}>{mark}</span>{text.slice(at + mark.length)}</>;
+  const positions = occurrences(text, mark);
+  if (!positions.length) return text;
+  let end = 0;
+  const parts = positions.map((at) => { const before = text.slice(end, at); end = at + mark.length; return <Fragment key={at}>{before}<mark data-match style={{ background: "var(--bluebg)", color: "var(--blue)", borderRadius: "4px", padding: "0 4px" }}>{mark}</mark></Fragment>; });
+  return <>{parts}{text.slice(end)}</>;
 }
 
 // Snippet marks from SQLite (\u0001…\u0002) become <mark>; text renders as React text, never HTML.
@@ -620,6 +669,12 @@ const promptWhen = (ts) => new Date(ts + IST).toISOString().slice(5, 16).replace
 // Full masked message, loaded on demand; long text scrolls in a fixed box.
 function PromptText({ id, mark }) {
   const [m, setM] = useState(null);
+  const [match, setMatch] = useState(0);
+  const box = useRef(null);
+  useEffect(() => {
+    const el = box.current, target = el?.querySelectorAll("[data-match]")[match];
+    if (el && target) el.scrollTop += target.getBoundingClientRect().top - el.getBoundingClientRect().top - el.clientHeight / 2 + target.clientHeight / 2;
+  }, [m, match, mark]);
   useEffect(() => {
     const ctl = new AbortController();
     call(`/api/pii-guard/prompts?id=${id}`, null, ctl.signal).then(setM).catch((e) => { if (!ctl.signal.aborted) setM({ error: e.message }); });
@@ -627,10 +682,11 @@ function PromptText({ id, mark }) {
   }, [id]);
   if (!m) return <span style={{ fontSize: "12px", color: "var(--tx3)" }}>Loading…</span>;
   if (m.error) return <span style={{ fontSize: "12px", color: "var(--tx3)" }}>{m.error}</span>;
-  return <><pre style={{ margin: "0", maxHeight: "360px", overflow: "auto", whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontFamily: "var(--mono)", fontSize: "12px", padding: "8px 12px", borderRadius: "8px", border: "1px solid var(--line2)", background: "var(--card)" }}>{mark ? highlight(m.text, mark) : m.text}</pre>
+  const count = occurrences(m.text || "", mark).length;
+  return <>{count > 1 && <div style={{ display: "flex", gap: "8px", alignItems: "center", fontSize: "11px" }}><span>{match + 1} of {count}</span><button style={btn} onClick={() => setMatch((match + count - 1) % count)}>Previous</button><button style={btn} onClick={() => setMatch((match + 1) % count)}>Next</button></div>}<pre ref={box} style={{ margin: "0", maxHeight: "360px", overflow: "auto", whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontFamily: "var(--mono)", fontSize: "12px", padding: "8px 12px", borderRadius: "8px", border: "1px solid var(--line2)", background: "var(--card)" }}>{mark ? highlight(m.text, mark) : m.text}</pre>
     {m.cut ? <span style={{ fontSize: "11px", color: "var(--tx3)" }}>Cut at the size limit (1 MB, tool output 128 KB).</span> : null}</>;
 }
-function PromptPeek({ query, mark }) {
+function PromptPeek({ query, mark, openSession }) {
   const [res, setRes] = useState(null);
   useEffect(() => {
     const ctl = new AbortController();
@@ -639,17 +695,17 @@ function PromptPeek({ query, mark }) {
   }, [query]);
   if (!res) return <span style={{ fontSize: "12px", color: "var(--tx3)" }}>Loading…</span>;
   if (!res.rows?.length) return <span style={{ fontSize: "12px", color: "var(--tx3)" }}>No stored prompt. Prompts are kept 14 days, starting Nov 7, 2026.</span>;
-  return <>{res.rows.map((r) => <Fragment key={r.id}><span style={{ fontSize: "11px", color: "var(--tx3)" }}>{r.role}{KIND[r.kind] ? ` · ${KIND[r.kind]}` : ""} · {promptWhen(r.ts)}</span><PromptText id={r.id} mark={mark} /></Fragment>)}
+  return <>{res.rows.map((r) => <Fragment key={r.id}><span style={{ fontSize: "11px", color: "var(--tx3)" }}>{r.role}{KIND[r.kind] ? ` · ${KIND[r.kind]}` : ""} · {promptWhen(r.ts)}</span><PromptText id={r.id} mark={mark} />{openSession && <button onClick={() => openSession(r.id, r.sessionId)} style={{ ...btn, alignSelf: "flex-start" }}>Show whole conversation</button>}</Fragment>)}
     <span style={{ fontSize: "11px", color: "var(--tx3)" }}>Detected values are masked. Text the rules miss, like names, is stored as is.</span></>;
 }
 // Prompts view: server search, 300 ms after typing stops; a newer search cancels the older one.
-function Prompts({ q, session, range, tick, clearSession, setSession }) {
+function Prompts({ q, session, at, mark, range, tick, clearSession, setSession }) {
   const [state, setState] = useState({ rows: [], next: null, busy: true, error: "" });
   const [open, setOpen] = useState(null);
   // Page cursors belong to one filter; a new filter starts on the newest page.
   const fkey = `${q}\0${session}\0${JSON.stringify(range)}`;
   const [pageState, setPageState] = useState({ fkey, list: [] });
-  const pages = pageState.fkey === fkey ? pageState.list : [];
+  const pages = useMemo(() => pageState.fkey === fkey ? pageState.list : [], [pageState, fkey]);
   const setPages = (f) => setPageState({ fkey, list: f(pages) });
   const cursor = pages.at(-1) ?? null, pollTick = cursor ? null : tick;
   useEffect(() => {
@@ -663,15 +719,27 @@ function Prompts({ q, session, range, tick, clearSession, setSession }) {
     }, 300);
     return () => { clearTimeout(t); ctl.abort(); };
   }, [q, session, range, cursor, pollTick]);
+  const target = useRef(null), jumped = useRef("");
+  useEffect(() => { jumped.current = ""; }, [at, fkey]);
+  useEffect(() => {
+    if (!at || state.busy || jumped.current === at) return;
+    const timer = setTimeout(() => {
+      if (state.rows.some((r) => String(r.id) === at)) {
+        jumped.current = at; setOpen(state.rows.find((r) => String(r.id) === at).id);
+      } else if (state.next && pages.length < 9) { setState((s) => ({ ...s, busy: true })); setPageState({ fkey, list: [...pages, state.next] }); }
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [at, state, pages, fkey]);
+  useEffect(() => { if (at && String(open) === at) target.current?.scrollIntoView({ block: "center" }); }, [at, open]);
   return <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
     {session && <div style={{ display: "flex", gap: "8px", alignItems: "center", fontSize: "12px", color: "var(--tx2)", padding: "4px 0" }}>Conversation <span style={{ fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: "0" }}>{session}</span><button onClick={clearSession} style={btn}>Show all</button></div>}
     {state.error && <div style={{ padding: "16px 0", color: "var(--tx3)", textAlign: "center" }}>{state.error}</div>}
-    {state.rows.map((r) => <div key={r.id} style={{ borderTop: "1px solid var(--line)", padding: "8px 0", display: "flex", flexDirection: "column", gap: "4px" }}>
+    {state.rows.map((r) => <div key={r.id} ref={String(r.id) === at ? target : null} style={{ borderTop: "1px solid var(--line)", padding: "8px 0", display: "flex", flexDirection: "column", gap: "4px" }}>
       <button onClick={() => setOpen(open === r.id ? null : r.id)} aria-expanded={open === r.id} style={{ border: "0", background: "transparent", padding: "0", font: "inherit", color: "var(--tx)", textAlign: "left", cursor: "pointer", display: "flex", flexDirection: "column", gap: "2px" }}>
         <span style={{ fontSize: "11px", color: "var(--tx3)" }}>{promptWhen(r.ts)} · {r.role}{KIND[r.kind] ? ` · ${KIND[r.kind]}` : ""} · {r.client || "—"} · <span style={{ fontFamily: "var(--mono)" }}>{r.model || "—"}</span>{r.hashes ? " · has findings" : ""}</span>
-        <span style={{ fontFamily: "var(--mono)", fontSize: "12px", whiteSpace: "pre-wrap", overflowWrap: "anywhere", maxHeight: "3.6em", overflow: "hidden" }}>{marked(r.snip)}</span>
+        {open !== r.id && <span style={{ fontFamily: "var(--mono)", fontSize: "12px", whiteSpace: "pre-wrap", overflowWrap: "anywhere", maxHeight: "3.6em", overflow: "hidden" }}>{marked(r.snip)}</span>}
       </button>
-      {open === r.id && <><PromptText id={r.id} /><span style={{ display: "flex", gap: "8px", flexWrap: "wrap", fontSize: "11px", color: "var(--tx3)" }}>Request <span style={{ fontFamily: "var(--mono)" }}>{r.requestId}</span>{r.sessionId && !session && <button onClick={() => setSession(r.sessionId)} style={btn}>Show whole conversation</button>}</span></>}
+      {open === r.id && <><PromptText id={r.id} mark={String(r.id) === at ? mark : ""} /><span style={{ display: "flex", gap: "8px", flexWrap: "wrap", fontSize: "11px", color: "var(--tx3)" }}>Request <span style={{ fontFamily: "var(--mono)" }}>{r.requestId}</span>{r.sessionId && !session && <button onClick={() => setSession(r.sessionId)} style={btn}>Show whole conversation</button>}</span></>}
     </div>)}
     {!state.busy && !state.error && !state.rows.length && <div style={{ padding: "32px 0", textAlign: "center", color: "var(--tx3)" }}>{q ? "No stored prompt has these words." : "No prompts stored in this range yet."}</div>}
     <div style={{ display: "flex", gap: "8px", justifyContent: "center" }}>
@@ -711,7 +779,7 @@ function Drawer({ d }) {
               : <a href={d.image} target="_blank" rel="noreferrer">
                 {/* eslint-disable-next-line @next/next/no-img-element -- auth-checked API image */}
                 <img src={d.image} alt={d.imageLabel} onError={() => setBrokenSrc(d.image)} style={{ width: "100%", maxHeight: "320px", objectFit: "contain", borderRadius: "6px", background: "var(--seg)" }} /></a>}</Sec>)}
-          <Sec label="Prompt"><PromptPeek query={d.promptQuery} mark={d.preview} />{d.openSession && <button onClick={d.openSession} style={{ ...btn, alignSelf: "flex-start" }}>Show whole conversation</button>}</Sec>
+          <Sec label="Prompt"><PromptPeek query={d.promptQuery} mark={d.preview} openSession={d.openSession} /></Sec>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" }}>
             {row("Client", d.client)}{row("Model", d.model, true)}{row("Requests", d.reqs)}{row("First seen", d.first)}{row("Last seen", d.last)}{row("Hash", `#${d.hash}`, true)}{row("Request", d.request, true)}{row("Session", d.session, true)}
           </div>

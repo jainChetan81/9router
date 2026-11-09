@@ -279,7 +279,7 @@ export function buildView({ data, ui, set, act, range, fit, test, events, sample
       request: hit?.requestId || v?.requestId || "", session: hit?.sessionId || v?.sessionId || "", hash,
       // Prompt lookup: newest stored messages holding this value (each message is stored once per session).
       promptQuery: `hash=${hash}`,
-      openSession: (hit?.sessionId || v?.sessionId) ? () => set({ tab: "findings", view: "prompt", q: "", session: hit?.sessionId || v?.sessionId, detail: null }) : null,
+      openSession: (hit?.sessionId || v?.sessionId) ? (id, sessionId) => set({ tab: "findings", view: "prompt", q: "", session: sessionId || hit?.sessionId || v?.sessionId, at: String(id || ""), detailKey: `${hash}:${rule}`, detailHit: null }) : null,
       first: v ? stamp(v.firstSeen) : "—", last: v ? stamp(v.lastSeen) : hit ? stamp(hit.ts) : "—", reqs: v ? fmt(v.turns) : "—",
       image: image ? `/api/pii-guard/image?id=${image}` : null, imageLabel: image ? `Image #${(hit?.imageIndex ?? v?.imageIndex ?? 0) + 1}` : "",
       ruleBtns: rule ? ruleBtns(rule, "detail") : [], pending: pending("detail"),
