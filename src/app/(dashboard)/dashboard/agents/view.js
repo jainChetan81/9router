@@ -54,6 +54,17 @@ export function formatIdle(ms) {
   const seconds = Math.max(0, Math.floor(ms / 1000));
   return seconds < 60 ? `idle ${seconds} s` : `idle ${Math.floor(seconds / 60)} m`;
 }
+// Round shares to whole percents that add up to 100 (largest remainder).
+export function roundShares(shares) {
+  const total = shares.reduce((a, x) => a + x, 0);
+  if (!(total > 0)) return shares.map(() => 0);
+  const exact = shares.map((x) => (x / total) * 100);
+  const out = exact.map(Math.floor);
+  let left = 100 - out.reduce((a, x) => a + x, 0);
+  exact.map((x, i) => [x - Math.floor(x), i]).sort((a, b) => b[0] - a[0]).forEach(([, i]) => { if (left > 0) { out[i] += 1; left -= 1; } });
+  return out;
+}
+
 export function formatTps(value) { return Number.isFinite(value) ? `${Math.round(value)} t/s` : ""; }
 export function formatP50(value) { return Number.isFinite(value) ? `p50 ${fs(value / 1000)}` : ""; }
 export function stateChip(state, lastActivityMs, now = Date.now(), inFlight = 1, idleSeconds) {
@@ -353,7 +364,7 @@ export function buildView({ live, sessions, totalSessions, detail, detailsBySess
     const visible = raw.filter((x) => x.share >= 0.01);
     const other = raw.filter((x) => x.share < 0.01).reduce((a, x) => a + x.share, 0);
     if (other > 0) visible.push({ name: "Other", share: other, color: "var(--line2)" });
-    return { label, total, c, aria: label + " by role and direct model: " + aria.join(", "), segs: visible.map((x) => ({ f: (x.share * 1000).toFixed(2), c: x.color, t: x.name + " · " + p1(x.share) })) };
+    return { label, total, c, aria: label + " by role and direct model: " + aria.join(", "), segs: (() => { const pct = roundShares(visible.map((x) => x.share)); return visible.map((x, i) => ({ f: (x.share * 1000).toFixed(2), c: x.color, t: x.name + " · " + (pct[i] === 0 && x.share > 0 ? "<1" : pct[i]) + "%" })); })() };
   });
   const legendR = orderRoles.filter((r) => r !== "direct").map((r) => { const x = byRole.find((y) => y.role === r) || {}; return { role: r, chip: chip(r), c: barC(r), req: p1((x.requests || 0) / TR), tok: p1((x.tokens || 0) / TT), val: p1((x.value || 0) / TV) }; });
   const legendDirect = directRows.map((x) => ({ model: x.model || "Unknown", c: mc(x.model), req: p1((x.requests || 0) / TR), tok: p1((x.tokens || 0) / TT), val: p1((x.value || 0) / TV) }));

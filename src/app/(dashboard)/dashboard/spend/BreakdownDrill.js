@@ -47,7 +47,7 @@ export default function BreakdownDrill({ data, state, group, onGroup, onRetry, o
   const wide = w >= 640;
 
   const mv = (o) => (metric === "value" ? o.v : metric === "real" ? o.re : metric === "req" ? o.r : o.t);
-  const sortM = (a) => a.slice().sort((x, y) => (mv(y) ?? -1) - (mv(x) ?? -1) || y.v - x.v);
+  const sortM = (a) => a.slice().sort((x, y) => (x.muted ? 1 : 0) - (y.muted ? 1 : 0) || (mv(y) ?? -1) - (mv(x) ?? -1) || y.v - x.v);
   const fMetric = (v) => (v == null ? "—" : metric === "value" ? fV(v) : metric === "real" ? fR(v) : metric === "req" ? fN(v) : fT(v));
   const toggle = (k) => () => setExp((e) => ({ ...e, [k]: !e[k] }));
   const tokSplit = data?.groups?.tokenSplit || {};

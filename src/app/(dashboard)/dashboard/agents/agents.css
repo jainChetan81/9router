@@ -30,7 +30,6 @@
 [data-r9] .r9-tool-legend i { width:8px; height:8px; border-radius:50%; }
 [data-r9] .r9-tool-bar { display:flex; width:100%; min-width:0; height:8px; overflow:hidden; border-radius:4px; background:var(--seg); }
 [data-r9] .r9-tool-bar span { border-right:1px solid var(--card); }
-[data-r9] .r9-breakdown-model { overflow-wrap:anywhere !important; white-space:normal !important; color:var(--tx) !important; }
 [data-r9] button { white-space:nowrap; }
 [data-r9] .r9-sessions-layout { grid-template-columns: 380px minmax(0,1fr); gap: 16px; }
 [data-r9] .r9-client-filter { display: flex; gap: 2px; padding: 3px; border-radius: 9px; background: var(--seg); overflow-x: auto; scrollbar-width: none; }
@@ -85,19 +84,17 @@
   [data-r9] .r9-tools-table td:first-child { max-width:120px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   [data-r9] .r9-role-table thead { display:none; }
   [data-r9] .r9-role-table, [data-r9] .r9-role-table tbody { display:block; width:100%; }
-  [data-r9] .r9-role-table tbody tr:not(:has(td[colspan])) { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:3px 8px; min-height:64px; padding:8px 12px; box-sizing:border-box; }
-  [data-r9] .r9-role-table tbody tr:not(:has(td[colspan])) td { padding:0 !important; border:0; font-size:11px; }
-  [data-r9] .r9-role-table tbody tr:not(:has(td[colspan])) td:first-child { grid-column:1 / -1; font-size:12px; }
-  [data-r9] .r9-role-table tbody tr:not(:has(td[colspan])) td:nth-child(2)::before { content:"Req "; color:var(--tx2); }
-  [data-r9] .r9-role-table tbody tr:not(:has(td[colspan])) td:nth-child(3)::before { content:"TPS "; color:var(--tx2); }
-  [data-r9] .r9-role-table tbody tr:not(:has(td[colspan])) td:nth-child(4), [data-r9] .r9-role-table tbody tr:not(:has(td[colspan])) td:nth-child(5) { display:none; }
-  [data-r9] .r9-role-table tbody tr:not(:has(td[colspan])) td:nth-child(6)::before { content:"Success "; color:var(--tx2); }
-  [data-r9] .r9-role-table tbody tr:not(:has(td[colspan])) td:nth-child(7), [data-r9] .r9-role-table tbody tr:not(:has(td[colspan])) td:nth-child(8) { display:none; }
-  [data-r9] .r9-role-table tbody tr:has(td[colspan]) { display:block; }
-  [data-r9] .r9-role-table tbody tr:has(td[colspan]) td { display:block; }
+  [data-r9] .r9-role-table tbody tr:not(.r9-role-group) { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:3px 8px; min-height:64px; padding:8px 12px; box-sizing:border-box; }
+  [data-r9] .r9-role-table tbody tr:not(.r9-role-group) td { padding:0 !important; border:0; font-size:11px; }
+  [data-r9] .r9-role-table tbody tr:not(.r9-role-group) td:first-child { grid-column:1 / -1; font-size:12px; }
+  [data-r9] .r9-role-table tbody tr:not(.r9-role-group) td:nth-child(2)::before { content:"Req "; color:var(--tx2); }
+  [data-r9] .r9-role-table tbody tr:not(.r9-role-group) td:nth-child(3)::before { content:"TPS "; color:var(--tx2); }
+  [data-r9] .r9-role-table tbody tr:not(.r9-role-group) td:nth-child(4), [data-r9] .r9-role-table tbody tr:not(.r9-role-group) td:nth-child(5) { display:none; }
+  [data-r9] .r9-role-table tbody tr:not(.r9-role-group) td:nth-child(6)::before { content:"Success "; color:var(--tx2); }
+  [data-r9] .r9-role-table tbody tr:not(.r9-role-group) td:nth-child(7), [data-r9] .r9-role-table tbody tr:not(.r9-role-group) td:nth-child(8) { display:none; }
+  [data-r9] .r9-role-table tbody tr.r9-role-group { display:block; }
+  [data-r9] .r9-role-table tbody tr.r9-role-group td { display:block; }
   [data-r9] .r9-tool-bar { width:80px; }
-  [data-r9] .r9-breakdown-model { font-size:12.5px !important; }
-  [data-r9] .r9-breakdown-provider { font-size:11px !important; color:var(--tx2) !important; }
   [data-r9] .r9-agent-shell { padding-left: 16px !important; padding-right: 16px !important; }
   [data-r9] .r9-kpis > div > div:nth-child(2) { font-size: 20px !important; }
   [data-r9] .r9-segment button { height: 36px; }

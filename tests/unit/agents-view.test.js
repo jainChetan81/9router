@@ -280,11 +280,11 @@ describe("agents view", () => {
   });
 
   it("shows pending, active override, changed member, and effective card models", () => {
-    const overridesBySession = { aaaaaaaaaaaa: [
+    const overridesBySession = { aaaaaaaaaaaa: { revisions: {}, overrides: [
       { combo: "main", model: "gpt-6-luna", mode: "override", status: "active" },
       { combo: "scout", model: "ocg/glm-5.3", mode: "member", status: "active" },
       { combo: "background", model: "gpt-6.1-sol", mode: "override", status: "pending" },
-    ] };
+    ] } };
     const v = buildView({ live, sessions: [], analytics: null, range: { preset: "7D" }, ui: ui(), overridesBySession, now: NOW });
     const card = v.live.cards.find((c) => c.id === "s·aaaaaaaaaaaa");
     const rows = Object.fromEntries(card.rows.map((r) => [r.role, r]));
@@ -295,5 +295,14 @@ describe("agents view", () => {
     expect(card.hasOverride).toBe(true);
     expect(card.hasChanged).toBe(true);
     expect(card.hasPending).toBe(true);
+  });
+});
+
+describe("roundShares", () => {
+  it("makes whole percents add up to 100", async () => {
+    const { roundShares } = await import("@/app/(dashboard)/dashboard/agents/view.js");
+    expect(roundShares([1, 1, 1])).toEqual([34, 33, 33]);
+    expect(roundShares([0, 0])).toEqual([0, 0]);
+    expect(roundShares([0.5, 0.25, 0.25]).reduce((a, x) => a + x, 0)).toBe(100);
   });
 });

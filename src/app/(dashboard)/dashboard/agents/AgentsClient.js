@@ -786,7 +786,7 @@ function RolesTab({ v }) {
             </thead>
             <tbody>
               {r.rows.map((m, i) => m.head ? (
-                <tr key={"h" + i} style={{ background: "var(--seg)" }}>
+                <tr key={"h" + i} className="r9-role-group" style={{ background: "var(--seg)" }}>
                   <td colSpan={8} style={{ padding: "7px 12px" }}>{m.role === "direct" ? <strong style={{ fontSize: 11, letterSpacing: ".06em", color: "var(--tx2)" }}>DIRECT MODELS</strong> : <><span style={m.chip}>{m.role}</span> <span style={{ fontSize: 11, color: "var(--tx2)" }}>{m.desc}</span></>}</td>
                 </tr>
               ) : (
