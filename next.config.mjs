@@ -54,6 +54,12 @@ const nextConfig = {
         path: false,
       };
     }
+    // Server worker URLs (new Worker(new URL(..., import.meta.url))) must resolve
+    // against the chunk directory on disk. Without this, webpack prefixes the
+    // public path "/_next/" and Node looks for "file:///_next/<chunk>.js".
+    if (isServer) {
+      config.output = { ...config.output, workerPublicPath: "./" };
+    }
     // Exclude non-source dirs from watcher to reduce inotify load
     config.watchOptions = {
       ...config.watchOptions,
