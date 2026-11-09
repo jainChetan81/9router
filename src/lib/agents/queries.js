@@ -75,19 +75,19 @@ function createReadWorker() {
   readWorkers.push(slot);
   worker.on("message", (message) => {
     if (message?.ready === false) {
+      // Retry a job once on a fresh worker; if that worker also cannot open
+      // the database, fail the job. Unbounded requeues would start workers
+      // without end while the database stays unreadable.
       const error = new Error(message.error?.message || "Agents read worker failed to open the database");
-      if (slot.job && !slot.job.settled) {
-        clearTimeout(slot.job.timeout);
-        pendingReadJobs.unshift(slot.job);
+      const job = slot.job;
+      if (job && !job.settled && !job.openRetried) {
+        clearTimeout(job.timeout);
+        job.openRetried = true;
         slot.job = null;
+        pendingReadJobs.unshift(job);
       }
-      retireReadWorker(slot);
+      retireReadWorker(slot, error);
       slot.worker.terminate().catch(() => {});
-      // Keep the failure detail available when replacement capacity is exhausted.
-      if (pendingReadJobs.length && readWorkers.length >= READ_WORKER_LIMIT) {
-        const job = pendingReadJobs.shift();
-        settleReadJob(job, error);
-      }
       return;
     }
     if (message?.ready) {
@@ -261,8 +261,10 @@ export function inferParents(sessions) {
     const cLast = c.lastMs;
     const cSess = c.s.session;
     const cClient = c.s.client;
+    // Reuse a cached guess only while that parent is still a candidate, so a
+    // range without the parent never returns a dangling link.
     const cachedParent = inferredParentCache.get(cSess);
-    if (cachedParent) {
+    if (cachedParent && candidates.some((p) => p.s.session === cachedParent.session)) {
       map.set(cSess, cachedParent);
       continue;
     }
@@ -1036,7 +1038,9 @@ async function getLiveInline(db, nowMs = Date.now()) {
   const sessions = selectedSummaryRows.map((row) => {
     const samples = latencyBySession.get(row.sess) || { totals: [], tps: [] };
     const roles = [...(rolesBySession.get(row.sess)?.values() || [])]
-      .map(({ _lastTs, ...role }) => {
+      .map(({ _lastTs, ...rest }) => {
+        const lastMs = Date.parse(_lastTs);
+        const role = { ...rest, lastActivityMs: Number.isFinite(lastMs) ? lastMs : null };
         const roleSamples = latencyBySessionRole.get(`${row.sess}\u0000${role.role}`) || { totals: [], tps: [] };
         return { ...role, tps: percentile(roleSamples.tps, 50), p50Ms: percentile(roleSamples.totals, 50) };
       });

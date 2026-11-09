@@ -17,7 +17,10 @@ describe("Agents backend regressions", () => {
     ];
     const first = inferParents(sessions).get("child0000001");
     expect(first).toMatchObject({ session: "early0000001", inferred: true, parentGuessed: true });
-    const refreshed = inferParents([sessions[0], sessions[1]]).get("child0000001");
-    expect(refreshed).toEqual(first);
+    // Same candidates on refresh: the cached guess holds.
+    expect(inferParents(sessions).get("child0000001")).toEqual(first);
+    // Cached parent absent from this range: no dangling link; pick a present parent.
+    const withoutEarly = inferParents([sessions[0], sessions[1]]).get("child0000001");
+    expect(withoutEarly).toMatchObject({ session: "later0000001", parentGuessed: true });
   });
 });
