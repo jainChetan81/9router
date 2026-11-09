@@ -25,7 +25,7 @@ const SUBN = {
 const PLAN = { claude: "Max", codex: "Pro", antigravity: "Pro", ocgo: "Go", muse: "Basic" };
 const CLIENT_DESC = { "Claude Code": "Claude Code CLI", Codex: "Codex CLI", OpenCode: "OpenCode", "OpenCode Review": "open-code-review", "T3 Code": "T3 Code", Other: "other user-agents", Unknown: "no user-agent" };
 const ROLE_ORDER = ["main", "implementer", "reviewer", "thinker", "scout"];
-const RC = { main: ["var(--seg)", "var(--tx2)"], scout: ["var(--bluebg)", "var(--blue)"], implementer: ["var(--violetbg)", "var(--violet)"], reviewer: ["var(--greenbg)", "var(--green)"], thinker: ["var(--amberbg)", "var(--amber)"] };
+export const RC = { main: ["var(--seg)", "var(--tx2)"], scout: ["var(--bluebg)", "var(--chipscout)"], implementer: ["var(--violetbg)", "var(--chipimpl)"], reviewer: ["var(--greenbg)", "var(--chiprev)"], thinker: ["var(--amberbg)", "var(--chipthink)"], background: ["transparent", "var(--tx2)"] };
 const ROLEDESC = { main: "single model, direct", scout: "combo", implementer: "combo", reviewer: "combo", thinker: "combo · fusion" };
 
 export const usd = (n, force2) => {

@@ -15,7 +15,7 @@ import { handleBypassRequest } from "../utils/bypassHandler.js";
 import { trackPendingRequest, appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
 import { getExecutor } from "../executors/index.js";
 import { supportsGrokCliReasoningEffort } from "../config/grokCli.js";
-import { buildRequestDetail, extractRequestConfig } from "./chatCore/requestDetail.js";
+import { buildRequestDetail, extractRequestConfig, saveFailureUsage } from "./chatCore/requestDetail.js";
 import { handleForcedSSEToJson } from "./chatCore/sseToJsonHandler.js";
 import { handleNonStreamingResponse } from "./chatCore/nonStreamingHandler.js";
 import { handleStreamingResponse, buildOnStreamComplete } from "./chatCore/streamingHandler.js";
@@ -109,6 +109,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   });
   let providerDefaultApplied = false;
   const requestStartTime = Date.now();
+  const requestStartMonotonic = performance.now();
   // Stable per-session color so all lines of one CLI conversation share a tag
   const sessionSeed = (() => {
     try {
@@ -465,8 +466,26 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     onDisconnect: (reason) => {
       trackPendingRequest(model, provider, connectionId, false);
       if (onDisconnect) onDisconnect(reason);
+      if (clientRawRequest?.usageState?.responseCommitted || clientRawRequest?.usageResponseCommitted) {
+        try {
+          saveFailureUsage({
+            provider, model, connectionId, apiKey: clientRawRequest?.validatedApiKey || null, endpoint: clientRawRequest?.endpoint,
+            clientRawRequest, statusCode: 499, aborted: true, stream: true,
+          });
+        } catch { /* telemetry must not break a request */ }
+      }
     },
-    onError: () => trackPendingRequest(model, provider, connectionId, false),
+    onError: (error) => {
+      trackPendingRequest(model, provider, connectionId, false);
+      if (clientRawRequest?.usageState?.responseCommitted || clientRawRequest?.usageResponseCommitted) {
+        try {
+          saveFailureUsage({
+            provider, model, connectionId, apiKey: clientRawRequest?.validatedApiKey || null, endpoint: clientRawRequest?.endpoint,
+            clientRawRequest, error, aborted: error?.name === "AbortError", stream: true,
+          });
+        } catch { /* telemetry must not break a request */ }
+      }
+    },
     log, provider, model, reqTag
   });
 
@@ -656,7 +675,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     return createErrorResult(statusCode, errMsg, resetsAtMs, upstreamResponseHeaders(providerResponse.headers), quotaFailure);
   }
 
-  const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, pxpipe: pxpipeSummary, reqTag, log };
+  const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, requestStartMonotonic, connectionId, apiKey, clientRawRequest, onRequestSuccess, pxpipe: pxpipeSummary, reqTag, log };
   const appendLog = (extra) => appendRequestLog({ model, provider, connectionId, ...extra }).catch(() => { });
   const trackDone = () => trackPendingRequest(model, provider, connectionId, false);
 

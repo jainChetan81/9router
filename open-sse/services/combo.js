@@ -14,6 +14,7 @@ import {
   clearStickyComboSession,
   orderModelsByChoice,
 } from "./systemoneRouter.js";
+import { loadOverrides, resolveSessionOverride, markActive } from "@/lib/agents/overrideStore.js";
 
 // Peek a 2xx combo response for real content. Returns null for non-SSE responses (leave
 // them untouched). For SSE, returns { outcome: "content"|"empty", finishReason, response }
@@ -396,9 +397,27 @@ export async function handleComboChat({
   sessionSticky = true,
   confidenceThreshold = 0.8,
   resolveSmartChoice = null,
+  rawSession = null,
+  keyAccess = null,
+  ua = "",
 }) {
   let rotatedModels = models;
   let activeStickyModel = null;
+  let sessionOverride = null;
+  try {
+    await loadOverrides({ rawSession, combo: comboName, comboMembers: models });
+    sessionOverride = resolveSessionOverride({ rawSession, combo: comboName, comboMembers: models, keyAccess, ua });
+  } catch { /* routing controls must fail open */ }
+  if (sessionOverride?.models?.length) {
+    rotatedModels = sessionOverride.models;
+    try {
+      markActive(rawSession, comboName);
+      if (sessionOverride.override?.mode === "member" && sessionId) {
+        setStickyComboModel(comboName, sessionId, sessionOverride.override.model);
+      }
+    } catch { /* routing control state is best-effort */ }
+    log.info("COMBO", `session override [${sessionOverride.override.mode}] for ${comboName} → ${sessionOverride.override.model}`);
+  }
   const normalizedSmartPolicy = (typeof smartPolicy === "string" ? smartPolicy : "smart").toLowerCase();
   const canPinAcceptedResponse = Boolean(
     sessionSticky && sessionId && (
@@ -411,7 +430,9 @@ export async function handleComboChat({
     return response;
   };
 
-  if (comboStrategy === "smart") {
+  if (sessionOverride?.models?.length) {
+    // The override order is authoritative, including strict-mode fallback policy.
+  } else if (comboStrategy === "smart") {
     const policy = normalizedSmartPolicy;
     const isPerTurn = policy === "per-turn" || sessionSticky === false;
     const isStrict = policy === "strict";
@@ -497,7 +518,7 @@ export async function handleComboChat({
   }
 
   // Auto-switch: float models that satisfy the request's required capabilities to the front.
-  if (autoSwitch) {
+  if (autoSwitch && !sessionOverride?.models?.length) {
     const required = detectRequiredCapabilities(body);
     if (required.size > 0) {
       const reordered = reorderByCapabilities(rotatedModels, required);

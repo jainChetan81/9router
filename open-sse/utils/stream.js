@@ -8,6 +8,7 @@ import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE, ensureStream
 import { restoreToolNames } from "./opencodeFingerprint.js";
 import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
 import { dbg, isDebugEnabled } from "./debugLog.js";
+import { createToolAccumulator, collectToolNames, collectStateToolNames } from "./toolTelemetry.js";
 
 import { SSE_DONE, SSE_HEADERS, SSE_HEADERS_NO_BUFFER } from "./sseConstants.js";
 
@@ -29,6 +30,60 @@ const STREAM_MODE = {
 // that saw finish_reason without usage must not hold the client's terminal event
 // forever when the upstream stalls with no usage trailer and no [DONE].
 const PENDING_COMPLETION_FLUSH_MS = 3000;
+
+function hasNonEmptyText(value) {
+  return typeof value === "string" && value.length > 0;
+}
+
+function hasOpenAIChatToken(parsed) {
+  return (parsed?.choices || []).some((choice) => {
+    const delta = choice?.delta;
+    if (!delta) return false;
+    if ([delta.content, delta.reasoning, delta.reasoning_content, delta.thinking].some(hasNonEmptyText)) return true;
+    return Array.isArray(delta.tool_calls) && delta.tool_calls.some((call) =>
+      hasNonEmptyText(call?.function?.name) || hasNonEmptyText(call?.function?.arguments)
+    );
+  });
+}
+
+function hasClaudeToken(parsed) {
+  if (parsed?.type === "content_block_start") return parsed.content_block?.type === "tool_use";
+  if (parsed?.type !== "content_block_delta") return false;
+  const delta = parsed.delta;
+  return [delta?.text, delta?.thinking, delta?.partial_json].some(hasNonEmptyText);
+}
+
+function hasResponsesToken(parsed, eventName) {
+  const event = eventName || parsed?.type;
+  if (typeof event !== "string" || typeof parsed?.delta !== "string" || parsed.delta.length === 0) return false;
+  return event === "response.output_text.delta" ||
+    event === "response.function_call_arguments.delta" ||
+    (/^response\.reasoning_[a-z0-9_]+\.delta$/.test(event));
+}
+
+function hasGeminiToken(parsed) {
+  return (parsed?.candidates || []).some((candidate) =>
+    (candidate?.content?.parts || []).some((part) =>
+      hasNonEmptyText(part?.text) ||
+      hasNonEmptyText(part?.functionCall?.name) ||
+      (part?.functionCall?.args && typeof part.functionCall.args === "object" && Object.keys(part.functionCall.args).length > 0)
+    )
+  );
+}
+
+function hasSemanticToken(parsed, format, eventName) {
+  if (format === FORMATS.CLAUDE) return hasClaudeToken(parsed);
+  if (format === FORMATS.OPENAI_RESPONSES) return hasResponsesToken(parsed, eventName);
+  if ([FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.VERTEX, FORMATS.ANTIGRAVITY].includes(format)) return hasGeminiToken(parsed);
+  if ([FORMATS.OPENAI, FORMATS.OPENAI_RESPONSE].includes(format)) return hasOpenAIChatToken(parsed);
+  return false;
+}
+
+function markSemanticToken(parsed, format, eventName, getTTFT, setTTFT) {
+  try {
+    if (getTTFT() === null && hasSemanticToken(parsed, format, eventName)) setTTFT(performance.now());
+  } catch { /* timing telemetry must not break the stream */ }
+}
 
 /**
  * Create unified SSE transform stream
@@ -60,6 +115,9 @@ export function createSSEStream(options = {}) {
     apiKey = null,
     credentials = null
   } = options;
+  const semanticFormat = targetFormat || (
+    ["antigravity", "gemini", "gemini-cli", "vertex"].includes(provider) ? FORMATS.GEMINI : FORMATS.OPENAI
+  );
 
   let buffer = "";
   let usage = null;
@@ -69,6 +127,7 @@ export function createSSEStream(options = {}) {
   // client as-is: strict OpenAI-compatible SDKs abort the turn on a
   // tool_call without a string id (#4992).
   const seenToolCallIds = new Map();
+  const toolNames = createToolAccumulator();
 
   // Per-stream decoder with stream:true to correctly handle multi-byte chars split across chunks
   const decoder = new TextDecoder("utf-8", { fatal: false });
@@ -126,10 +185,14 @@ export function createSSEStream(options = {}) {
       appendRequestLog({ model, provider, connectionId, tokens: null, status: "200 OK" }).catch(() => { });
     }
 
+    if (!isPassthrough) collectStateToolNames(toolNames, state);
+
     if (onStreamComplete) {
+      const tools = toolNames.rows();
       onStreamComplete({
         content: accumulatedContent,
-        thinking: accumulatedThinking
+        thinking: accumulatedThinking,
+        ...(tools.length ? { tools } : {}),
       }, finalUsage, ttftAt);
     }
   };
@@ -150,7 +213,6 @@ export function createSSEStream(options = {}) {
 
   return new TransformStream({
     transform(chunk, controller) {
-      if (!ttftAt) ttftAt = Date.now();
       const text = decoder.decode(chunk, { stream: true });
       buffer += text;
       reqLogger?.appendProviderChunk?.(text);
@@ -169,7 +231,7 @@ export function createSSEStream(options = {}) {
         }
 
         // Capture Responses API event name to preserve framing in same-format passthrough
-        if (mode === STREAM_MODE.TRANSLATE && targetFormat === FORMATS.OPENAI_RESPONSES && trimmed.startsWith("event:")) {
+        if (targetFormat === FORMATS.OPENAI_RESPONSES && trimmed.startsWith("event:")) {
           currentOpenAIResponsesEvent = trimmed.slice(6).trim();
         }
 
@@ -182,6 +244,7 @@ export function createSSEStream(options = {}) {
           if (trimmed.startsWith("data:") && trimmed.slice(5).trim() !== "[DONE]") {
             try {
               let parsed = JSON.parse(trimmed.slice(5).trim());
+              collectToolNames(toolNames, parsed, currentOpenAIResponsesEvent);
 
               const idFixed = fixInvalidId(parsed);
 
@@ -202,6 +265,8 @@ export function createSSEStream(options = {}) {
                   toolNameRestored = true;
                 }
               }
+
+              markSemanticToken(parsed, semanticFormat, currentOpenAIResponsesEvent, () => ttftAt, (value) => { ttftAt = value; });
 
               // Ensure OpenAI-required fields are present on streaming chunks (Letta compat)
               let fieldsInjected = false;
@@ -319,6 +384,8 @@ export function createSSEStream(options = {}) {
 
         const parsed = parseSSELine(trimmed, targetFormat);
         if (!parsed) continue;
+        collectToolNames(toolNames, parsed, currentOpenAIResponsesEvent);
+        markSemanticToken(parsed, semanticFormat, currentOpenAIResponsesEvent, () => ttftAt, (value) => { ttftAt = value; });
 
         // Responses API same-format passthrough: preserve event framing + track terminal state
         const isOpenAIResponsesStream = targetFormat === FORMATS.OPENAI_RESPONSES;
@@ -478,6 +545,9 @@ export function createSSEStream(options = {}) {
 
         if (mode === STREAM_MODE.PASSTHROUGH) {
           if (buffer) {
+            if (ttftAt === null && buffer.startsWith("data:")) {
+              try { markSemanticToken(JSON.parse(buffer.slice(5).trim()), semanticFormat, currentOpenAIResponsesEvent, () => ttftAt, (value) => { ttftAt = value; }); } catch {}
+            }
             let output = buffer;
             if (buffer.startsWith("data:") && !buffer.startsWith("data: ")) {
               output = "data: " + buffer.slice(5);
@@ -507,6 +577,7 @@ export function createSSEStream(options = {}) {
           // accepts "data: " lines, so an NDJSON provider (Ollama) lost whatever
           // arrived without its closing newline.
           const parsed = parseSSELine(buffer.trim(), targetFormat);
+          if (parsed) markSemanticToken(parsed, semanticFormat, currentOpenAIResponsesEvent, () => ttftAt, (value) => { ttftAt = value; });
           // parseSSELine turns the SSE sentinel "data: [DONE]" into { done: true },
           // which must not be translated. An Ollama chunk also carries done:true,
           // but it is the real final chunk — it holds finish_reason and the token

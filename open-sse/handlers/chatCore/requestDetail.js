@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { saveRequestUsage, appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
 import { COLORS } from "../../utils/stream.js";
 import { canonicalizeUsage } from "../../utils/usageTracking.js";
+import { collectToolErrors } from "@/lib/agents/toolErrors.js";
+import { sanitizeToolName } from "../../utils/toolTelemetry.js";
 
 const OPTIONAL_PARAMS = [
   "temperature", "top_p", "top_k",
@@ -118,7 +120,7 @@ export function formatDoneLine({ usage, latency }) {
 }
 
 // Spend page attribution: client app, session hash and combo, from the raw client request.
-export function spendMeta(clientRawRequest, tokens) {
+export function spendMeta(clientRawRequest, tokens, telemetry = null) {
   const h = clientRawRequest?.headers || {};
   const meta = {
     clientEffort: typeof clientRawRequest?.effort?.clientEffort === "string" ? clientRawRequest.effort.clientEffort : null,
@@ -134,38 +136,166 @@ export function spendMeta(clientRawRequest, tokens) {
   if (clientRawRequest?.session) meta.session = createHash("sha256").update(String(clientRawRequest.session)).digest("hex").slice(0, 12);
   if (clientRawRequest?.combo) meta.combo = clientRawRequest.combo;
   if (Number.isFinite(tokens?.cost)) meta.realCost = tokens.cost;
+  if (telemetry && typeof telemetry === "object") {
+    if (typeof clientRawRequest?.reqId === "string") meta.reqId = clientRawRequest.reqId;
+    if (telemetry.latency && typeof telemetry.latency === "object") {
+      const { ttftMs, totalMs, stream } = telemetry.latency;
+      meta.latency = {
+        ttftMs: Number.isFinite(ttftMs) ? Math.max(0, Math.round(ttftMs)) : null,
+        totalMs: Number.isFinite(totalMs) ? Math.max(0, Math.round(totalMs)) : 0,
+        stream: Boolean(stream),
+      };
+    }
+    if (["ok", "error", "aborted"].includes(telemetry.status)) meta.status = telemetry.status;
+  }
+  if (Array.isArray(telemetry?.tools) && telemetry.tools.length) {
+    meta.tools = telemetry.tools.slice(0, 50).map(({ name, count }) => ({
+      name: sanitizeToolName(name), count: Math.min(50, Math.max(0, Number(count) || 0)),
+    }));
+  }
+  const toolErrors = collectToolErrors(clientRawRequest?.body);
+  if (toolErrors.length) meta.toolErrors = toolErrors;
   return meta;
 }
 
-export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, endpoint, clientRawRequest, label = "USAGE", silent = false }) {
-  if (!tokens || typeof tokens !== "object") return;
+function monotonicNow() {
+  return globalThis.performance?.now?.() ?? Date.now();
+}
 
-  const inTokens = tokens.input_tokens ?? tokens.prompt_tokens ?? 0;
-  const outTokens = tokens.output_tokens ?? tokens.completion_tokens ?? 0;
-
-  if (inTokens === 0 && outTokens === 0) return;
-
-  if (!silent) {
-    const time = new Date().toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
-    const accountSuffix = connectionId ? ` | account=${connectionId.slice(0, 8)}...` : "";
-    console.log(`${COLORS.green}[${time}] 📊 [${label}] ${provider.toUpperCase()} | in=${inTokens} | out=${outTokens}${accountSuffix}${COLORS.reset}`);
+export function buildUsageLatency(clientRawRequest, { stream = false, ttftAt = null } = {}) {
+  try {
+    const now = monotonicNow();
+    const startedAt = Number.isFinite(clientRawRequest?.usageStartedAt)
+      ? clientRawRequest.usageStartedAt
+      : now;
+    return {
+      ttftMs: stream && Number.isFinite(ttftAt) ? Math.max(0, Math.round(ttftAt - startedAt)) : null,
+      totalMs: Math.max(0, Math.round(now - startedAt)),
+      stream: Boolean(stream),
+    };
+  } catch {
+    return { ttftMs: null, totalMs: 0, stream: Boolean(stream) };
   }
+}
 
-  // Canonicalize to one storage convention (prompt_tokens cache-inclusive) so
-  // cached/cache-creation tokens survive to cost calc + stats. See canonicalizeUsage.
-  const normalized = canonicalizeUsage(tokens) || {
-    prompt_tokens: tokens.prompt_tokens ?? tokens.input_tokens ?? 0,
-    completion_tokens: tokens.completion_tokens ?? tokens.output_tokens ?? 0
-  };
+function classifyFailure({ statusCode, error, aborted, errorKind }) {
+  if (["bad_request", "auth", "blocked", "not_found"].includes(errorKind)) return errorKind;
+  if (aborted || statusCode === 499 || error?.name === "AbortError") return "aborted";
+  const errorText = `${error?.name || ""} ${error?.code || ""} ${error?.cause?.code || ""} ${error?.message || ""}`.toLowerCase();
+  if (statusCode === 408 || statusCode === 504 || /timeout|timed out|etimedout/.test(errorText)) return "timeout";
+  if (Number.isInteger(statusCode) && statusCode >= 400 && statusCode < 500) return "upstream_4xx";
+  if (Number.isInteger(statusCode) && statusCode >= 500 && statusCode <= 599) return "upstream_5xx";
+  if (/network|fetch failed|econnreset|econnrefused|ehostunreach|eai_again|und_err_socket/.test(errorText)) return "network";
+  return "other";
+}
 
-  saveRequestUsage({
-    provider: provider || "unknown",
-    model: model || "unknown",
-    tokens: normalized,
-    timestamp: new Date().toISOString(),
-    connectionId: connectionId || undefined,
-    apiKey: apiKey || undefined,
-    endpoint: endpoint || null,
-    meta: spendMeta(clientRawRequest, tokens)
-  }).catch(() => {});
+function reserveFailureOutcome(clientRawRequest, outcome) {
+  const state = clientRawRequest?.usageState;
+  if (state?.successRecorded || clientRawRequest?.usageSuccessRecorded || state?.failureRecorded || clientRawRequest?.usageFailureRecorded) return false;
+  if (state) {
+    state.outcomeRecorded = outcome;
+    state.failureRecorded = true;
+  } else if (clientRawRequest) {
+    clientRawRequest.usageOutcomeRecorded = outcome;
+    clientRawRequest.usageFailureRecorded = true;
+  }
+  return true;
+}
+
+function markLogicalSuccess(clientRawRequest) {
+  // Fusion panel calls are physical usage rows, but the judge owns the logical outcome.
+  if (!clientRawRequest || clientRawRequest.isFusionPanel) return;
+  const state = clientRawRequest.usageState;
+  if (state) {
+    if (!state.failureRecorded) {
+      state.successRecorded = true;
+      state.outcomeRecorded = "ok";
+    }
+  } else if (!clientRawRequest.usageFailureRecorded) {
+    clientRawRequest.usageSuccessRecorded = true;
+    clientRawRequest.usageOutcomeRecorded = "ok";
+  }
+}
+
+export function saveFailureUsage({ provider, model, tokens, connectionId, apiKey, endpoint, clientRawRequest, statusCode = null, error = null, aborted = false, stream = false, errorKind = null }) {
+  try {
+    // A fusion panel can fail while the overall request continues to its judge.
+    // Only the outer fusion request records the logical failure outcome.
+    if (clientRawRequest?.isFusionPanel) return Promise.resolve(false);
+    const outcome = aborted || statusCode === 499 || error?.name === "AbortError" ? "aborted" : "error";
+    if (!reserveFailureOutcome(clientRawRequest, outcome)) return Promise.resolve(false);
+
+    const classifiedErrorKind = classifyFailure({ statusCode, error, aborted, errorKind });
+    const status = Number.isInteger(statusCode) && statusCode >= 100 && statusCode <= 599
+      ? String(statusCode)
+      : "error";
+    const latency = buildUsageLatency(clientRawRequest, { stream });
+    const meta = spendMeta(clientRawRequest, tokens || {}, { latency, status: outcome });
+    // Failure rows keep the identifying fields explicit, including direct calls
+    // with no resolved session or combo.
+    meta.session ??= null;
+    meta.combo ??= null;
+    meta.ua ??= "";
+    meta.reqId ??= typeof clientRawRequest?.reqId === "string" ? clientRawRequest.reqId : null;
+    meta.errorKind = classifiedErrorKind;
+
+    const usageTarget = clientRawRequest?.usageTarget;
+    return Promise.resolve(saveRequestUsage({
+      provider: provider || usageTarget?.provider || "unknown",
+      model: model || usageTarget?.model || "invalid",
+      tokens: { prompt_tokens: 0, completion_tokens: 0 },
+      timestamp: new Date().toISOString(),
+      connectionId: connectionId || undefined,
+      apiKey: apiKey || undefined,
+      endpoint: endpoint || null,
+      status,
+      cost: 0,
+      meta,
+    })).then(() => true, () => false);
+  } catch {
+    return Promise.resolve(false);
+  }
+}
+
+export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, endpoint, clientRawRequest, latency = null, tools = [], label = "USAGE", silent = false }) {
+  try {
+    // Each physical upstream call writes its own row, including fusion panels and judge.
+    // The shared success flag only blocks a later abort/failure row for the logical request.
+    markLogicalSuccess(clientRawRequest);
+    if (!tokens || typeof tokens !== "object") return Promise.resolve(false);
+
+    const inTokens = tokens.input_tokens ?? tokens.prompt_tokens ?? 0;
+    const outTokens = tokens.output_tokens ?? tokens.completion_tokens ?? 0;
+
+    if (inTokens === 0 && outTokens === 0) return Promise.resolve(false);
+
+    if (!silent) {
+      const time = new Date().toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
+      const accountSuffix = connectionId ? ` | account=${connectionId.slice(0, 8)}...` : "";
+      console.log(`${COLORS.green}[${time}] 📊 [${label}] ${provider.toUpperCase()} | in=${inTokens} | out=${outTokens}${accountSuffix}${COLORS.reset}`);
+    }
+
+    // Canonicalize to one storage convention (prompt_tokens cache-inclusive) so
+    // cached/cache-creation tokens survive to cost calc + stats. See canonicalizeUsage.
+    const normalized = canonicalizeUsage(tokens) || {
+      prompt_tokens: tokens.prompt_tokens ?? tokens.input_tokens ?? 0,
+      completion_tokens: tokens.completion_tokens ?? tokens.output_tokens ?? 0
+    };
+    const usageLatency = latency || buildUsageLatency(clientRawRequest, {
+      stream: clientRawRequest?.body?.stream === true,
+    });
+
+    return Promise.resolve(saveRequestUsage({
+      provider: provider || "unknown",
+      model: model || "unknown",
+      tokens: normalized,
+      timestamp: new Date().toISOString(),
+      connectionId: connectionId || undefined,
+      apiKey: apiKey || undefined,
+      endpoint: endpoint || null,
+      meta: spendMeta(clientRawRequest, tokens, { latency: usageLatency, status: "ok", tools })
+    })).then(() => true, () => false);
+  } catch {
+    return Promise.resolve(false);
+  }
 }
