@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildView, chip, formatIdle, formatTps, formatP50, stateChip } from "../../src/app/(dashboard)/dashboard/agents/view.js";
+import { buildView, chip, formatIdle, formatTps, formatP50, stateChip, clientCategory, sessionMatchesFilters, sessionFilterCount, istDayStart } from "../../src/app/(dashboard)/dashboard/agents/view.js";
 
 const NOW = Date.parse("2026-11-09T08:00:00Z");
 const ui = (o = {}) => ({ tab: "live", mode: "ready", exp: {}, ...o });
@@ -14,6 +14,14 @@ const live = {
 };
 
 describe("agents view fixes", () => {
+  it("groups client names and filters direct models", () => {
+    expect(clientCategory("OpenCode Go")).toBe("OpenCode");
+    const session = { session: "abc123", client: "Claude Code", roles: [{ role: "main", models: [{ model: "claude-opus-5-5" }] }] };
+    expect(sessionMatchesFilters(session, { query: "s·abc", client: "Claude Code" })).toBe(true);
+    expect(sessionMatchesFilters(session, { role: "claude-opus-5-5" })).toBe(true);
+    expect(sessionFilterCount(17, 1748, true)).toBe("17 of 1748");
+    expect(sessionFilterCount(1748, 1748, false)).toBe("1748 in range");
+  });
   const sess = (id, lastTs, model = "claude-opus-5-5") => ({ session: id, client: "Claude Code", firstTs: lastTs, lastTs, requests: 1, tokens: 1, value: 0, errors: 0, roles: [{ role: "main", model, requests: 1, models: [] }] });
   const sessions = [sess("aaaaaaaaaaaa", "2026-11-09T07:59:00Z"), sess("bbbbbbbbbbbb", "2026-11-09T07:50:00Z")];
 
@@ -31,6 +39,19 @@ describe("agents view fixes", () => {
     expect(v.tree.count).toBe("0 of 1748");
     const all = buildView({ live: null, sessions, totalSessions: 1748, analytics: null, range: { preset: "7D" }, ui: ui({ tab: "sessions" }), now: NOW });
     expect(all.tree.count).toBe("1748 in range");
+  });
+  it("builds session facts and per-model totals from detail data", () => {
+    const row = { ...sess("aaaaaaaaaaaa", "2026-11-09T07:59:00Z"), firstTs: "2026-11-09T07:00:00Z", parent: { session: "bbbbbbbbbbbb", parentGuessed: true } };
+    const detail = { session: row.session, client: "Claude Code", firstTs: row.firstTs, lastTs: row.lastTs, agents: [{ role: "main", requests: [
+      { ts: row.firstTs, model: "claude-opus-5-5", promptTokens: 10, completionTokens: 20, value: 0.2, status: "ok" },
+      { ts: row.lastTs, model: "gpt-6-luna", promptTokens: 5, completionTokens: 10, value: 0.1, status: "aborted" },
+    ] }] };
+    const v = buildView({ live, sessions: [row], detail, analytics: null, range: { preset: "7D" }, ui: ui({ drawer: row.session, drawerMode: "details" }), now: NOW });
+    expect(v.dd.hasData).toBe(true);
+    expect(v.dd.roles.map((r) => r.model)).toEqual(["claude-opus-5-5", "gpt-6-luna"]);
+    expect(v.dd.stats[0]).toEqual(["Requests", "2", "1 failed"]);
+    expect(v.dd.facts.find(([label]) => label === "Project")[1]).toBe("Not recorded");
+    expect(v.dd.facts.find(([label]) => label === "Parent")[1]).toContain("likely");
   });
   it("uses the 4-column session row grid (A12)", () => {
     const v = buildView({ live: null, sessions, totalSessions: 2, analytics: null, range: { preset: "7D" }, ui: ui({ tab: "sessions" }), now: NOW });
@@ -73,6 +94,7 @@ describe("agents view fixes", () => {
     const v = buildView({ live: live2, sessions: [], analytics: null, range: { preset: "7D" }, ui: ui({ drawer: "aaaaaaaaaaaa" }), now: NOW, combos, models, overrides: [], draft });
     expect(v.dr.rows[0].warn).toContain("cost much more");
     expect(v.dr.changes[0].warn).toBe(true);
+    expect(v.dr.changes[0].expectedCurrent).toBe("glm-5.3-flash");
   });
   it("uses a 8 px minimum hit area for timeline bars (A20)", () => {
     const det = { session: "aaaaaaaaaaaa", client: "Claude Code", firstTs: "2026-11-09T07:00:00Z", lastTs: "2026-11-09T07:59:00Z",
@@ -81,14 +103,14 @@ describe("agents view fixes", () => {
     expect(v.g.lanes[0].bars[0].style.minWidth).toBe(8);
   });
 
-  it("clamps the 6h window end to now and labels Day ranges with dates (A18, A33)", () => {
+  it("clamps the 6h window and starts Day at IST midnight (A18, A33)", () => {
     const det = { session: "aaaaaaaaaaaa", client: "Claude Code", firstTs: "2026-11-09T07:00:00Z", lastTs: "2026-11-09T07:30:00Z",
       agents: [{ role: "main", requests: [{ ts: "2026-11-09T07:10:00Z", totalMs: 1000, model: "claude-opus-5-5", status: "ok" }] }] };
     const v = buildView({ live: null, sessions, detail: det, analytics: null, range: { preset: "7D" }, ui: ui({ tab: "sessions", sel: "aaaaaaaaaaaa", zoom: "6h" }), now: NOW });
     expect(v.g.window).toMatch(/IST · 6h view/);
     const day = buildView({ live: null, sessions, detail: det, analytics: null, range: { preset: "7D" }, ui: ui({ tab: "sessions", sel: "aaaaaaaaaaaa", zoom: "Day" }), now: NOW });
-    // Day view is 24 h ending at now (13:30 IST), so it starts on Nov 8.
-    expect(day.g.window).toMatch(/^Nov 8 13:30 – Nov 9 13:30 IST · Day view$/);
+    expect(day.g.window).toMatch(/^Nov 9 00:00 – 13:30 IST · Day view$/);
+    expect(istDayStart(NOW)).toBe(Date.parse("2026-11-08T18:30:00Z"));
   });
 
   it("drops the detail when its session is filtered out (A16)", () => {
@@ -96,6 +118,7 @@ describe("agents view fixes", () => {
       agents: [{ role: "main", requests: [{ ts: "2026-11-09T07:10:00Z", totalMs: 1000, model: "claude-opus-5-5", status: "ok" }] }] };
     const v = buildView({ live: null, sessions, detail: det, analytics: null, range: { preset: "7D" }, ui: ui({ tab: "sessions", sel: "aaaaaaaaaaaa", q: "bbbb" }), now: NOW });
     expect(v.g).toBe(null);
+    expect(v.noSelText).toBe("The selected session is hidden by the filters.");
   });
 });
 

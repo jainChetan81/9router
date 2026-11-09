@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import RangeBar from "../spend/RangeBar";
 import PageHeader from "../spend/PageHeader";
 import { buildView } from "./view";
@@ -23,6 +23,7 @@ export default function AgentsClient() {
   const [moreCursor, setMoreCursor] = useState(null);
   const [moreBusy, setMoreBusy] = useState(false);
   const [detail, setDetail] = useState(null);
+  const [detailLoad, setDetailLoad] = useState({ sid: null, status: "idle" });
   const [analytics, setAnalytics] = useState(null);
   const [tools, setTools] = useState(null);
   const [toolsError, setToolsError] = useState("");
@@ -34,12 +35,15 @@ export default function AgentsClient() {
   const [draft, setDraft] = useState({});
   const [cf, setCf] = useState(false);
   const [toast, setToast] = useState(null);
+  const [retryRouting, setRetryRouting] = useState(null);
   const [mode, setMode] = useState("loading");
   const [errorText, setErrorText] = useState("");
-  const [ui, setUi] = useState({ tab: "live", paused: false, ago: 0, q: "", fClient: "", fRole: "", sel: null, exp: {}, focus: null, hov: null, pick: null, zoom: null, gOff: 0, drawer: null });
+  const [ui, setUi] = useState({ tab: "live", paused: false, ago: 0, q: "", fClient: "", fRole: "", sel: null, exp: {}, focus: null, hov: null, pick: null, zoom: null, gOff: 0, drawer: null, drawerMode: "routing", conflict: null });
   const set = useCallback((p) => setUi((u) => ({ ...u, ...(typeof p === "function" ? p(u) : p) })), []);
   const [theme, setTheme] = useState("light");
   const [vw, setVw] = useState(1440);
+  const [tabsAtEnd, setTabsAtEnd] = useState(true);
+  const tabsScrollRef = useRef(null);
   const [tick, setTick] = useState(0); // bump to force live + range + detail reloads
 
   useEffect(() => {
@@ -61,16 +65,17 @@ export default function AgentsClient() {
       for (const change of changes) {
         const res = await fetch(`/api/agents/sessions/${encodeURIComponent(sid)}/overrides`, {
           method: "PUT", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ combo: change.role, model: change.to, mode: change.mode, fallback: change.mode === "member", expiry: change.expiry === "Session end" ? "session" : change.expiry, revision: revisions[change.role] ?? 0, confirmExpensive: !!change.warn }),
+          body: JSON.stringify({ combo: change.role, model: change.to, expectedCurrent: change.expectedCurrent, mode: change.mode, fallback: change.mode === "member", expiry: change.expiry === "Session end" ? "session" : change.expiry, revision: revisions[change.role] ?? 0, confirmExpensive: !!change.warn }),
         });
         const body = await res.json().catch(() => ({}));
-        if (res.status === 409) { await refreshOverrides(sid); setToast("Changed elsewhere. Reloaded."); return; }
+        if (res.status === 409) { setRetryRouting(null); set((u) => ({ ...u, conflict: { role: change.role, currentModel: body.currentModel || "unknown" } })); return; }
         if (!res.ok) throw new Error(body.error || "Unable to save routing");
         auditWarning ||= !!body.auditWarning;
       }
       await refreshOverrides(sid);
+      setRetryRouting(null);
       setToast(auditWarning ? "Routing saved, but the audit entry could not be recorded." : "Routing saved for s·" + sid + " · applies from the next request");
-    } catch (error) { setToast(error.message || "Unable to save routing."); }
+    } catch { setRetryRouting({ sid, changes }); setToast("Could not apply routing. Try again."); }
   }, [refreshOverrides, revisions]);
   const revertOverride = useCallback(async (sid, role, revision, entry) => {
     try {
@@ -115,6 +120,14 @@ export default function AgentsClient() {
     on();
     window.addEventListener("resize", on);
     return () => window.removeEventListener("resize", on);
+  }, []);
+  useEffect(() => {
+    const el = tabsScrollRef.current;
+    if (!el) return;
+    const update = () => setTabsAtEnd(el.scrollWidth <= el.clientWidth + 1 || el.scrollLeft + el.clientWidth >= el.scrollWidth - 1);
+    update(); el.addEventListener("scroll", update, { passive: true });
+    const resize = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(update); resize?.observe(el); if (el.firstElementChild) resize?.observe(el.firstElementChild);
+    return () => { el.removeEventListener("scroll", update); resize?.disconnect(); };
   }, []);
 
   const liveId = useRef(0);
@@ -187,19 +200,31 @@ export default function AgentsClient() {
 
   const detailId = useRef(0);
   const loadDetail = useCallback(async (sid) => {
-    if (!sid) { setDetail(null); return; }
+    if (!sid) { setDetail(null); setDetailLoad({ sid: null, status: "idle" }); return; }
     const id = ++detailId.current;
+    setDetailLoad({ sid, status: "loading" });
     try {
       const d = await getJson(`/api/agents/sessions/${encodeURIComponent(sid)}`);
       if (id !== detailId.current) return;
       setDetail(d);
-    } catch { setDetail(null); }
+      setDetailLoad({ sid, status: "ready" });
+    } catch { setDetail(null); setDetailLoad({ sid, status: "error" }); }
   }, []);
   // Select the first row only once, when nothing is selected. Live refreshes keep the selection (A15).
   const firstSid = sessions?.[0]?.session || null;
+  const selInit = useRef(false);
   useEffect(() => {
+    if (!selInit.current) {
+      selInit.current = true;
+      const fromUrl = new URLSearchParams(window.location.search).get("s");
+      if (fromUrl) { set({ sel: fromUrl }); return; }
+    }
     if (!ui.sel && firstSid) set({ sel: firstSid });
   }, [ui.sel, firstSid, set]);
+  useEffect(() => {
+    if (!ui.sel) return;
+    const url = new URL(window.location.href); url.searchParams.set("s", ui.sel); window.history.replaceState({}, "", url);
+  }, [ui.sel]);
   const sel = ui.sel || null;
   useEffect(() => {
     if (ui.tab !== "sessions" || !sel) return;
@@ -241,24 +266,30 @@ export default function AgentsClient() {
     setToolRole: (r) => set({ toolRole: r }),
     setPreset: (preset) => { setRange({ preset }); set({ hover: null, pick: null, focus: null }); },
     select: (rootId, sid) => { set((u) => ({ ...u, sel: sid, focus: null, hov: null, pick: null, exp: sid === rootId ? u.exp : { ...u.exp, [rootId]: true } })); setTick((x) => x + 1); },
+    toggleExpand: (sid) => set((u) => ({ ...u, exp: { ...u.exp, [sid]: !(u.exp[sid] ?? (u.sel === sid)) } })),
     focus: (f) => set((u) => ({ ...u, focus: f })),
     hover: (h) => set({ hov: h }),
     pick: (p) => set({ pick: p }),
     zoom: (k) => set({ zoom: k, gOff: 0 }),
     pan: (d) => set((u) => ({ ...u, gOff: Math.max(0, (u.gOff || 0) + d) })),
     // Every drawer opens from a clean draft, so no edit from another session or an earlier open leaks in (A6).
-    openDrawer: (sid) => { setDraft({}); setCf(false); set({ drawer: sid }); if (!sid) setOverrides([]); },
+    openDrawer: (sid, kind = "routing") => { setDraft({}); setCf(false); set({ drawer: sid, drawerMode: kind, conflict: null }); if (sid) loadDetail(sid); else setOverrides([]); },
+    openDetails: (sid) => { setDraft({}); setCf(false); set({ drawer: sid, drawerMode: "details", conflict: null }); loadDetail(sid); },
+    openRouting: (sid) => { setDraft({}); setCf(false); set({ drawer: sid, drawerMode: "routing", conflict: null }); loadDetail(sid); },
+    reloadRouting: async (sid) => { await refreshOverrides(sid); set({ conflict: null }); setDraft({}); },
+    reloadSession: loadDetail,
+    copySession: async (sid) => { try { await navigator.clipboard.writeText(sid); setToast("Copied"); } catch { setToast("Could not copy session ID."); } },
     loadMore,
     openTimeline: (sid) => { if (sid) { set({ tab: "sessions", sel: sid }); } else set({ tab: "sessions" }); setTick((x) => x + 1); },
-  }), [set, loadMore]);
+  }), [set, loadMore, loadDetail, refreshOverrides]);
 
-  const v = useMemo(() => buildView({ live, sessions, totalSessions, detail, analytics, tools, range, ui: { ...ui, mode, errorText }, act, vw, combos, models, overrides, overridesBySession, revisions, draft, cf, toast, moreCursor,
+  const v = useMemo(() => buildView({ live, sessions, totalSessions, detail, detailLoad, analytics, tools, range, ui: { ...ui, mode, errorText }, vw, combos, models, overrides, overridesBySession, revisions, draft, cf, toast, moreCursor,
     setDraft: (update) => setDraft((old) => ({ ...old, ...(typeof update === "function" ? update(old) : update) })),
     setCf, setToast, applyOverrides, reloadOverrides: refreshOverrides,
-    act: { ...act, applyOverrides, revertOverride } }), [live, sessions, totalSessions, detail, analytics, tools, range, ui, mode, errorText, act, vw, combos, models, overrides, overridesBySession, revisions, draft, cf, toast, moreCursor, applyOverrides, refreshOverrides, revertOverride]);
+    act: { ...act, applyOverrides, revertOverride } }), [live, sessions, totalSessions, detail, detailLoad, analytics, tools, range, ui, mode, errorText, act, vw, combos, models, overrides, overridesBySession, revisions, draft, cf, toast, moreCursor, applyOverrides, refreshOverrides, revertOverride]);
 
   const isLoading = mode === "loading", isError = mode === "error", ready = !isLoading && !isError;
-  const onRange = (r) => { setRange(r); set({ hov: null, pick: null, focus: null, sel: null }); setDetail(null); };
+  const onRange = (r) => { setRange(r); set({ hov: null, pick: null, focus: null, sel: null }); setDetail(null); const url = new URL(window.location.href); url.searchParams.delete("s"); window.history.replaceState({}, "", url); };
   const retry = act.retry;
 
   // Drawer: Escape closes, focus moves in on open, Tab stays inside, focus returns to the trigger on close (A9).
@@ -268,7 +299,7 @@ export default function AgentsClient() {
   useEffect(() => {
     if (!dOpen) return;
     returnFocus.current = document.activeElement;
-    const first = drawerRef.current?.querySelector("select, button, input, [href]");
+    const first = drawerRef.current?.querySelector('input[role="combobox"], input, select, button, [href]');
     first?.focus();
     const onKey = (e) => {
       if (e.key === "Escape") { e.preventDefault(); act.openDrawer(null); return; }
@@ -285,16 +316,7 @@ export default function AgentsClient() {
       const back = returnFocus.current;
       if (back && typeof back.focus === "function" && document.contains(back)) back.focus();
     };
-  }, [dOpen, act]);
-
-  // Timeline request popover: Escape closes it (A21).
-  const pickOpen = !!v.g?.pick;
-  useEffect(() => {
-    if (!pickOpen) return;
-    const onKey = (e) => { if (e.key === "Escape") act.pick(null); };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [pickOpen, act]);
+  }, [dOpen, ui.drawer, ui.drawerMode, act]);
 
   return (
     <div data-r9={theme}>
@@ -308,7 +330,7 @@ export default function AgentsClient() {
             </span>
           </div>
           <div className="r9-header-controls">
-            <div className="r9-scroll-x"><div className="r9-tablist" role="tablist" aria-label="Agent views" onKeyDown={(e) => {
+            <div ref={tabsScrollRef} className={`r9-scroll-x r9-header-tabs-scroll${tabsAtEnd ? " at-end" : ""}`}><div className="r9-tablist" role="tablist" aria-label="Agent views" onKeyDown={(e) => {
               if (!["ArrowLeft", "ArrowRight"].includes(e.key)) return;
               const buttons = [...e.currentTarget.querySelectorAll('[role="tab"]')];
               const index = buttons.indexOf(document.activeElement);
@@ -354,15 +376,17 @@ export default function AgentsClient() {
         {ready && !v.v.empty && ui.tab === "tools" && <ToolsTab v={v} error={toolsError} loading={!tools && !toolsError} />}
 
         {v.dr && (
-          <div role="dialog" aria-modal="true" aria-label={v.dr.aria} onClick={v.closeDrawer} style={{ position: "fixed", inset: 0, zIndex: 70, background: "rgba(20,12,8,.4)", display: "flex", justifyContent: "flex-end" }}>
-            <div ref={drawerRef} onClick={(e) => e.stopPropagation()} style={{ width: v.dr.w, maxWidth: "100vw", height: "100%", overflowY: "auto", background: "var(--card)", borderLeft: "1px solid var(--line2)", padding: "20px 22px 28px" }}>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+          <div role="dialog" aria-modal="true" aria-labelledby="r9-drawer-title" onClick={v.closeDrawer} style={{ position: "fixed", inset: 0, zIndex: 70, background: "rgba(0,0,0,.32)", display: "flex", justifyContent: "flex-end" }}>
+            <div ref={drawerRef} onClick={(e) => e.stopPropagation()} style={{ width: ui.drawerMode === "details" ? v.dd?.w || v.dr.w : v.dr.w, maxWidth: "100vw", height: "100%", overflowY: "auto", background: "var(--card)", borderLeft: "1px solid var(--line)", boxShadow: "var(--shadow)", padding: 0, display: "flex", flexDirection: "column" }}>
+              <div style={{ position: "sticky", top: 0, zIndex: 2, minHeight: 56, boxSizing: "border-box", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "0 16px", background: "var(--card)", borderBottom: "1px solid var(--line)" }}>
                 <div>
-                  <div style={{ fontSize: 15, fontWeight: 700 }}>Change routing · {v.dr.sid}</div>
-                  <div style={{ fontSize: 12, color: "var(--tx2)" }}>{v.dr.client} · started {v.dr.started}</div>
+                  <div id="r9-drawer-title" style={{ fontSize: 14, fontWeight: 600 }}>{ui.drawerMode === "details" ? "Session details" : "Change routing"} · {v.dr.sid}</div>
+                  <div style={{ fontSize: 11, color: "var(--tx2)" }}>{v.dr.client} · started {v.dr.started}</div>
                 </div>
-                <button onClick={v.closeDrawer} aria-label="Close routing panel" style={{ border: 0, background: "var(--seg)", borderRadius: 7, width: 30, height: 30, cursor: "pointer", fontFamily: "'Material Symbols Outlined'", fontSize: 18, color: "var(--tx2)" }}>close</button>
+                <button onClick={v.closeDrawer} aria-label="Close" style={{ border: 0, background: "var(--seg)", borderRadius: 7, width: 28, height: 28, cursor: "pointer", fontFamily: "'Material Symbols Outlined'", fontSize: 18, color: "var(--tx2)" }}>close</button>
               </div>
+              {ui.drawerMode === "details" ? <DetailsDrawer data={v.dd} onRoute={() => v.dd?.route()} onClose={v.closeDrawer} /> : <div onClickCapture={(e) => { if (!e.target.closest(".r9-model-picker")) v.dr.rows.forEach((row) => row.popup && row.onOpen(false)); }} style={{ padding: "0 16px 16px", overflowY: "auto", flex: 1 }}>
+              {v.dr.conflict && <div role="alert" style={{ margin: "12px 0", padding: 12, borderRadius: 8, background: "var(--redbg)", color: "var(--red)", fontSize: 12.5 }}><div><span className="material-symbols-outlined" style={{ fontSize: 16, verticalAlign: "middle", marginRight: 6 }}>sync_problem</span>Routing changed while this drawer was open. {v.dr.conflict.role} now uses {v.dr.conflict.currentModel}. Review and apply again.</div><button onClick={v.dr.reload} style={{ marginTop: 8, height: 28, border: "1px solid var(--line2)", borderRadius: 6, background: "var(--card)", color: "var(--tx)", cursor: "pointer" }}>Reload routing</button></div>}
               {v.dr.rows.map((r) => (
                 <div key={r.role} style={r.rowStyle}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
@@ -371,22 +395,36 @@ export default function AgentsClient() {
                   {r.status && <span style={r.statusStyle}>{r.status}</span>}
                   {r.canRevert && <button onClick={r.revert} style={{ marginLeft: "auto", height: 26, padding: "0 10px", borderRadius: 7, border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: 12, cursor: "pointer" }}>Revert</button>}
                   </div>
-                {r.locked ? <p style={{ margin: 0, fontSize: 12, color: "var(--tx2)" }}>🔒 {r.lockText}</p> : <>
-                  <label style={{ display: "flex", flexDirection: "column", gap: 4 }}><span style={{ fontSize: 11, fontWeight: 600, color: "var(--tx3)" }}>MODEL</span><select value={r.sel} onChange={r.onSel} style={{ height: 32, border: "1px solid var(--line2)", borderRadius: 7, background: "var(--bg)", color: "var(--tx)", fontFamily: "var(--mono)", fontSize: 12, padding: "0 8px" }}>{r.opts.map((o) => <option key={o.v} value={o.v}>{o.label}</option>)}</select></label>
-                  {r.isOther && (
-                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                      <input value={r.otherQ} onChange={r.onQ} placeholder="Search models…" aria-label={"Search models for " + r.role} style={{ height: 30, padding: "0 10px", borderRadius: 7, border: "1px solid var(--line2)", background: "var(--bg)", color: "var(--tx)", font: "inherit", fontSize: 12 }} />
-                      <label style={{ display: "flex", flexDirection: "column", gap: 4 }}><span style={{ fontSize: 11, fontWeight: 600, color: "var(--tx3)" }}>OTHER MODEL</span><select value={r.other} onChange={r.onOther} style={{ height: 32, border: "1px solid var(--line2)", borderRadius: 7, background: "var(--bg)", color: "var(--tx)", fontFamily: "var(--mono)", fontSize: 12, padding: "0 8px" }}>{r.otherGroups.map((g) => <optgroup key={g.label} label={g.label}>{g.opts.map((o) => <option key={o.v} value={o.v}>{o.label}</option>)}</optgroup>)}</select></label>
-                    </div>
-                  )}
-                  {r.warn && <div style={{ padding: "8px 12px", borderRadius: 8, background: "var(--amberbg)", fontSize: 12, color: "var(--tx)" }}>⚠ {r.warn}</div>}
-                  <div style={{ display: "flex", alignItems: "flex-end", gap: 12, flexWrap: "wrap" }}><div><div style={{ fontSize: 11, fontWeight: 600, color: "var(--tx3)", marginBottom: 4 }}>MODE</div><div role="group" aria-label={r.modeAria} style={{ display: "flex", gap: 2, padding: 2, borderRadius: 8, background: "var(--seg)" }}>{r.modes.map((m) => <button key={m.label} onClick={m.on} aria-pressed={m.on2} title={m.tip} style={m.style}>{m.label}</button>)}</div></div><label style={{ display: "flex", flexDirection: "column", gap: 4 }}><span style={{ fontSize: 11, fontWeight: 600, color: "var(--tx3)" }}>UNTIL</span><select value={r.expiry} onChange={r.onExp} style={{ height: 32, border: "1px solid var(--line2)", borderRadius: 7, background: "var(--bg)", color: "var(--tx)", font: "inherit", fontSize: 12 }}><option value="Session end">Session end</option><option value="1h">1 hour</option><option value="2h">2 hours</option></select></label></div>
+                  {r.locked ? <p style={{ margin: 0, fontSize: 12, color: "var(--tx2)" }}><span className="material-symbols-outlined" style={{ fontSize: 14 }}>lock</span> {r.lockText}</p> : <>
+                  {r.dirty && <div style={{ fontFamily: "var(--mono)", fontSize: 12, color: "var(--tx2)" }}><s>{r.from}</s> → <b style={{ color: "var(--tx)" }}>{r.to}</b></div>}
+                  <div className="r9-model-picker">
+                    <label style={{ display: "flex", flexDirection: "column", gap: 4 }}><span className="r9-caps">MODEL</span><input role="combobox" aria-expanded={r.popup} aria-controls={`models-${r.role}`} aria-autocomplete="list" value={r.query} onFocus={() => r.onOpen(true)} onChange={r.onQ} onKeyDown={(e) => {
+                      if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); r.onOpen(true); const opts = [...e.currentTarget.parentElement.parentElement.querySelectorAll('[role="option"]')]; (e.key === "ArrowDown" ? opts[0] : opts.at(-1))?.focus(); }
+                      if (e.key === "Home" || e.key === "End") { e.preventDefault(); r.onOpen(true); const opts = [...e.currentTarget.parentElement.parentElement.querySelectorAll('[role="option"]')]; (e.key === "Home" ? opts[0] : opts.at(-1))?.focus(); }
+                      if (e.key === "Escape") { e.stopPropagation(); r.onOpen(false); }
+                      if (e.key === "Enter") { e.preventDefault(); const first = r.otherGroups.flatMap((g) => g.opts)[0]; if (first) r.onChoose(first.v); }
+                    }} placeholder="Search models" aria-label={`Search models for ${r.role}`} style={{ height: 32, width: "100%", boxSizing: "border-box", padding: "0 10px", borderRadius: 8, border: "1px solid var(--line2)", background: "var(--bg)", color: "var(--tx)", fontFamily: "var(--mono)", fontSize: 12.5 }} /></label>
+                    {r.popup && <div id={`models-${r.role}`} role="listbox" className="r9-model-popup">
+                      {r.otherGroups.length ? r.otherGroups.map((g) => <div key={g.label}><div className="r9-model-group">{g.label}</div>{g.opts.map((o) => <button key={o.v} type="button" role="option" aria-selected={r.other === o.v || (!r.other && o.current)} onClick={() => r.onChoose(o.v)} onKeyDown={(e) => {
+                        const opts = [...e.currentTarget.closest('[role="listbox"]').querySelectorAll('[role="option"]')], i = opts.indexOf(e.currentTarget);
+                        if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); opts[Math.max(0, Math.min(opts.length - 1, i + (e.key === "ArrowDown" ? 1 : -1)))]?.focus(); }
+                        if (e.key === "Home") { e.preventDefault(); opts[0]?.focus(); }
+                        if (e.key === "End") { e.preventDefault(); opts.at(-1)?.focus(); }
+                        if (e.key === "Enter") { e.preventDefault(); r.onChoose(o.v); }
+                        if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); r.onOpen(false); e.currentTarget.closest(".r9-model-picker")?.querySelector('[role="combobox"]')?.focus(); }
+                      }} style={{ height: 32, width: "100%", display: "flex", alignItems: "center", gap: 8, border: 0, background: "transparent", color: "var(--tx)", padding: "0 10px", textAlign: "left", cursor: "pointer", fontFamily: "var(--mono)", fontSize: 12.5 }}><span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis" }}>{o.label}</span>{o.current && <small>current</small>}{o.expensive && <small style={{ color: "var(--amber)" }}>$$$</small>}</button>)}</div>) : <div style={{ padding: 12, color: "var(--tx2)", fontSize: 12 }}>No chat model matches “{r.otherQ}”.</div>}
+                    </div>}
+                    {r.role === "" && null}{v.dr.isCodex && <div style={{ fontSize: 11, color: "var(--tx2)" }}>Codex sessions can only use OpenAI models.</div>}
+                  </div>
+                  {r.warn && <div style={{ padding: "8px 12px", borderRadius: 8, background: "var(--amberbg)", fontSize: 12, color: "var(--amber)" }}><span className="material-symbols-outlined" style={{ fontSize: 16, verticalAlign: "middle", marginRight: 4 }}>warning</span>{r.warn}</div>}
+                  <div className="r9-routing-controls"><div><div className="r9-caps" style={{ marginBottom: 4 }}>MODE</div><div role="group" aria-label={r.modeAria} style={{ display: "flex", gap: 2, padding: 2, borderRadius: 8, background: "var(--seg)" }}>{r.modes.map((m) => <button key={m.label} onClick={m.on} aria-pressed={m.on2} title={m.tip} style={m.style}>{m.label}</button>)}</div></div><label style={{ display: "flex", flexDirection: "column", gap: 4 }}><span className="r9-caps">UNTIL</span><select value={r.expiry} onChange={r.onExp} style={{ height: 28, border: "1px solid var(--line2)", borderRadius: 7, background: "var(--bg)", color: "var(--tx)", font: "inherit", fontSize: 12.5 }}><option value="Session end">Session end</option><option value="1h">1 hour</option><option value="2h">2 hours</option></select></label></div>
                   {r.strict && <span style={{ fontSize: 11.5, color: "var(--tx2)" }}>No fallback. If this model fails, the request fails visibly.</span>}
                 </>}
                 </div>
               ))}
-            <div style={{ padding: "10px 12px", borderRadius: 8, background: "var(--seg)", fontSize: 12, color: "var(--tx2)" }}>Applies from the next request only. Requests in flight keep their model.{v.dr.isCodex && " Codex sessions can only use OpenAI models."} <a href="/dashboard/combos">Edit combo members for everyone →</a></div>
-            <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 8, paddingTop: 12, borderTop: "1px solid var(--line)" }}><span style={{ marginRight: "auto", fontSize: 12, color: "var(--tx3)" }}>{v.dr.changeText}</span><button onClick={v.closeDrawer} style={{ height: 32, padding: "0 16px", borderRadius: 8, border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: 12.5, cursor: "pointer" }}>Cancel</button><button onClick={v.dr.apply} disabled={v.dr.noChanges} style={v.dr.applyStyle}>Apply</button></div>
+            <div style={{ padding: "10px 12px", borderRadius: 8, background: "var(--seg)", fontSize: 12, color: "var(--tx2)" }}>Applies from the next request only. Requests in flight keep their model.{v.dr.isCodex && <span> Codex sessions can only use OpenAI models.</span>} <a href="/dashboard/combos">Edit combo members for everyone →</a></div>
+            </div>}
+            {ui.drawerMode === "routing" && <div style={{ position: "sticky", bottom: 0, display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 8, minHeight: 56, padding: "0 16px", borderTop: "1px solid var(--line)", background: "var(--card)" }}><span style={{ marginRight: "auto", fontSize: 12, color: "var(--tx2)" }}>{v.dr.conflict ? "Reload routing to continue" : v.dr.changeText}</span><button onClick={v.closeDrawer} style={{ height: 32, padding: "0 16px", borderRadius: 8, border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: 12.5, cursor: "pointer" }}>Cancel</button><button onClick={v.dr.apply} disabled={v.dr.noChanges || !!v.dr.conflict} style={{ ...v.dr.applyStyle, height: 32, opacity: v.dr.noChanges || v.dr.conflict ? 0.45 : 1 }}>Apply</button></div>}
             </div>
           </div>
         )}
@@ -397,7 +435,7 @@ export default function AgentsClient() {
             <span style={{ fontSize: 12.5, color: "var(--tx2)" }}>Applies from the next request. Requests in flight keep their model.</span><div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}><button onClick={v.cancelCf}>Cancel</button><button onClick={v.doCf}>Apply</button></div>
           </div>
         </>}
-        {v.toast && <div role="status" style={{ position: "fixed", left: "50%", bottom: 24, transform: "translateX(-50%)", zIndex: 99, display: "flex", alignItems: "center", gap: 16, minHeight: 40, padding: "0 8px 0 16px", borderRadius: 8, background: "var(--tx)", color: "var(--bg)", fontSize: 12.5, boxShadow: "var(--shadow)", maxWidth: "calc(100vw - 32px)" }}><span>{v.toast}</span><button onClick={v.closeToast} aria-label="Dismiss">×</button></div>}
+        {v.toast && <div role="status" style={{ position: "fixed", left: "50%", bottom: 24, transform: "translateX(-50%)", zIndex: 99, display: "flex", alignItems: "center", gap: 12, minHeight: 40, padding: "0 8px 0 16px", borderRadius: 8, background: "var(--tx)", color: "var(--bg)", fontSize: 12.5, boxShadow: "var(--shadow)", maxWidth: "calc(100vw - 32px)" }}><span>{v.toast}</span>{retryRouting && <button onClick={() => { const retry = retryRouting; setRetryRouting(null); applyOverrides(retry.sid, retry.changes); }} style={{ border: 0, background: "transparent", color: "var(--bg)", font: "inherit", fontWeight: 600, cursor: "pointer" }}>Retry</button>}<button onClick={() => { setRetryRouting(null); v.closeToast(); }} aria-label="Dismiss">×</button></div>}
       </div>
     </div>
   );
@@ -477,8 +515,9 @@ function LiveCard({ c, narrow }) {
         ))}
       </div>
       <div className="r9-card-footer" style={{ display: "flex", gap: 8, marginTop: "auto", borderTop: "1px solid var(--line)", padding: "8px 12px", justifyContent: "flex-end" }}>
-        <button onClick={c.route} style={{ height: 28, padding: "0 12px", borderRadius: 7, border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Change routing</button>
-        <button onClick={c.timeline} style={{ height: 28, padding: "0 12px", borderRadius: 7, border: 0, background: "transparent", color: "var(--tx2)", font: "inherit", fontSize: 12, cursor: "pointer" }}>Timeline</button>
+        <button onClick={c.details} style={{ height: 28, padding: "0 12px", borderRadius: 7, border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: 12, fontWeight: 600, cursor: "pointer" }}><span className="material-symbols-outlined" style={{ fontSize: 15, verticalAlign: "middle", marginRight: 4 }}>info</span>Details</button>
+        <button onClick={c.timeline} style={{ height: 28, padding: "0 12px", borderRadius: 7, border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx2)", font: "inherit", fontSize: 12, cursor: "pointer" }}><span className="material-symbols-outlined" style={{ fontSize: 15, verticalAlign: "middle", marginRight: 4 }}>timeline</span>Timeline</button>
+        <button onClick={c.route} style={{ height: 28, padding: "0 12px", borderRadius: 7, border: "1px solid var(--line2)", background: "var(--card)", color: "var(--acc)", font: "inherit", fontSize: 12, fontWeight: 600, cursor: "pointer" }}><span className="material-symbols-outlined" style={{ fontSize: 15, verticalAlign: "middle", marginRight: 4 }}>alt_route</span>Change routing</button>
       </div>
     </article>
   );
@@ -487,6 +526,7 @@ function LiveCard({ c, narrow }) {
 function SessionsTab({ v, ui, moreBusy }) {
   if (!v.v.sess) return null;
   const t = v.tree, g = v.g, sm = v.sm;
+  const detailRef = useRef(null);
   return (
     <div>
       {v.v.partial && (
@@ -494,52 +534,50 @@ function SessionsTab({ v, ui, moreBusy }) {
           <span className="material-symbols-outlined" style={{ fontSize: 16 }}>history</span>{v.v.partialText}
         </div>
       )}
-      <div style={{ display: "flex", gap: 16, flexWrap: "wrap", ...v.lay }}>
-        <div style={{ flex: v.lay.tf, maxWidth: v.lay.tmax, minWidth: 300 }}>
+      <div className="r9-sessions-layout" style={{ display: "grid", gridTemplateColumns: v.lay.tf === "1fr" ? "minmax(0,1fr)" : `${v.lay.tf} minmax(0,1fr)`, gap: 16, alignItems: "start" }}>
+        <div style={{ minWidth: 0 }}>
           <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: 12, boxShadow: "var(--shadow)" }}>
-            <div style={{ padding: "12px 14px 8px", display: "flex", flexDirection: "column", gap: 8 }}>
-              <input value={t.q} onChange={t.onQ} placeholder="Filter s·session id…" aria-label="Filter sessions" style={{ height: 30, padding: "0 10px", borderRadius: 7, border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: 12.5 }} />
-              <div style={{ display: "flex", gap: 8 }}>
-                <select value={t.fClient} onChange={t.onClient} aria-label="Filter by client" style={{ font: "inherit", fontSize: 12, height: 28, borderRadius: 7, border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)" }}>
-                  {t.clientOpts.map((o) => <option key={o.v} value={o.v}>{o.label}</option>)}
-                </select>
-                <select value={t.fRole} onChange={t.onRole} aria-label="Filter by role" style={{ font: "inherit", fontSize: 12, height: 28, borderRadius: 7, border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)" }}>
-                  {t.roleOpts.map((o) => <option key={o.v} value={o.v}>{o.label}</option>)}
-                </select>
-                <span style={{ marginLeft: "auto", fontSize: 11.5, color: "var(--tx3)", alignSelf: "center" }}>{t.count}</span>
-              </div>
+            <div style={{ padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+              <div className="r9-client-filter" role="group" aria-label="Filter by client">{t.clientOpts.map((o) => <button type="button" key={o.v} aria-pressed={t.fClient === o.v} onClick={() => t.onClient({ target: { value: o.v } })}>{o.label}</button>)}</div>
+              <select value={t.fRole} onChange={t.onRole} aria-label="Filter by role or direct model" style={{ font: "inherit", fontSize: 12.5, height: 28, borderRadius: 7, border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)" }}><option value="">All roles and models</option>{t.roleGroups.map((g) => <optgroup key={g.label} label={g.label}>{g.opts.map((o) => <option key={o.v} value={o.v}>{o.label}</option>)}</optgroup>)}</select>
+              <input value={t.q} onChange={t.onQ} placeholder="Search session ID" aria-label="Search session ID" style={{ height: 28, minWidth: 0, padding: "0 10px", borderRadius: 7, border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: 12.5 }} />
+              <div style={{ fontSize: 11, color: "var(--tx2)" }}>{t.count}</div>
             </div>
-            <div style={{ borderTop: "1px solid var(--line)", maxHeight: 560, overflowY: "auto" }}>
-              {t.none && <p style={{ padding: "24px 16px", fontSize: 12.5, color: "var(--tx3)", textAlign: "center" }}>No sessions match this filter.</p>}
+            <div role="listbox" aria-label="Sessions" style={{ borderTop: "1px solid var(--line)", maxHeight: 560, overflowY: "auto", overflowX: "hidden" }}>
+              {t.none && <p style={{ padding: "24px 16px", fontSize: 12.5, color: "var(--tx2)", textAlign: "center" }}>{t.noneText}{t.filtered && <> <button onClick={t.clear} style={{ border: 0, background: "none", color: "var(--acc)", cursor: "pointer", font: "inherit" }}>Clear filters</button></>}</p>}
               {t.rows.map((r, i) => (
-                <button key={(r.isSess ? "s" : r.isRole ? "r" : "m") + i + r.label} onClick={r.on} style={{ ...r.style, paddingLeft: `calc(8px + ${r.pad})` }}>
+                <div key={(r.isSess ? "s" : r.isRole ? "r" : "m") + i + r.label} className="r9-session-row" data-child={r.isKid ? "true" : undefined} data-guessed={r.inferred ? "true" : undefined} tabIndex={0} role="option" aria-selected={r.isSess && r.sid === ui.sel} aria-expanded={r.isSess ? r.exp : undefined} onClick={r.on} onKeyDown={(e) => {
+                  if (e.key === "Enter") { e.preventDefault(); r.on(); if (window.innerWidth <= 600) setTimeout(() => detailRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 0); }
+                  if (r.isSess && r.hasChildren && e.key === "ArrowRight" && !r.exp) { e.preventDefault(); r.toggle(); }
+                  if (r.isSess && r.hasChildren && e.key === "ArrowLeft" && r.exp) { e.preventDefault(); r.toggle(); }
+                  if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); const opts = [...e.currentTarget.parentElement.querySelectorAll('[role="option"]')]; const next = opts[Math.max(0, Math.min(opts.length - 1, opts.indexOf(e.currentTarget) + (e.key === "ArrowDown" ? 1 : -1)))]; next?.focus(); next?.click(); }
+                }} style={{ ...r.style, minHeight: 36, gridTemplateColumns: "16px minmax(0,1fr) 8px auto", padding: `6px 12px 6px ${12 + (r.isKid ? 16 : 0)}px`, boxShadow: r.sid === ui.sel ? "inset 2px 0 0 var(--acc)" : "none", position: "relative" }}>
                   <span style={{ gridColumn: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
-                    {r.isSess && <span className="material-symbols-outlined" style={{ fontSize: 16, color: "var(--tx3)" }}>{r.chev}</span>}
+                    {r.isSess && <button type="button" aria-label={r.exp ? "Collapse session" : "Expand session"} aria-expanded={r.exp} onClick={(e) => { e.stopPropagation(); r.toggle(); }} style={{ padding: 0, border: 0, background: "transparent", color: "var(--tx3)", fontFamily: "'Material Symbols Outlined'", fontSize: 16, cursor: "pointer" }}>{r.chev}</button>}
                     {r.isKid && <span className="material-symbols-outlined" style={{ fontSize: 14, color: "var(--tx3)" }} title="Delegated child (T3). Link inferred.">subdirectory_arrow_right</span>}
                   </span>
-                  <span style={{ gridColumn: 2, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  <span style={{ gridColumn: 2, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" }}>
                     {r.isRole && <span style={r.chip}>{r.label}</span>}
                     {r.isModel && <span><span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: r.mc, marginRight: 5 }} />{r.label}</span>}
-                    {r.isSess && <>{r.label}<span style={{ color: "var(--tx3)", fontSize: 11 }}> · {r.sub}</span></>}
+                    {r.isSess && <><span style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "var(--mono)", fontSize: 12.5 }}>{r.label}{r.inferred && <span className="r9-likely-child">likely child</span>}</span><span style={{ display: "block", color: "var(--tx2)", fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.sub}</span></>}
                   </span>
                   <span style={{ gridColumn: 3, display: "flex", justifyContent: "center" }}>
                     {r.live && <span style={{ width: 7, height: 7, borderRadius: "50%", background: "var(--green)" }} title="Live now" />}
                   </span>
-                  <span style={{ gridColumn: 4, justifySelf: "end", fontSize: 11.5, color: "var(--tx3)", fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>{r.req} · {r.tok} · {r.val}{+r.err > 0 && <span title={`${r.err} failed ${+r.err === 1 ? "request" : "requests"}`} style={{ color: "var(--red)" }}> · {r.err}✕</span>}</span>
-                </button>
+                  <span style={{ gridColumn: 4, justifySelf: "end", display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--tx2)", fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>{r.req} · {r.tok} · <span style={{ color: "var(--violet)" }}>{r.val}</span>{+r.err > 0 && <span title={`${r.err} failed ${+r.err === 1 ? "request" : "requests"}`} style={{ color: "var(--red)" }}> · {r.err} ✕</span>}{r.isSess && <button data-session-details type="button" aria-label={`Details for ${r.label}`} onClick={(e) => { e.stopPropagation(); r.details(); }} style={{ height: 24, padding: "0 5px", border: "1px solid var(--line2)", borderRadius: 5, background: "var(--card)", color: "var(--tx2)", font: "inherit", cursor: "pointer" }}>Details</button>}</span>
+                </div>
               ))}
             </div>
             {t.canMore && (
               <div style={{ padding: "10px 14px", borderTop: "1px solid var(--line)", display: "flex", alignItems: "center", gap: 10 }}>
-                <button onClick={t.onMore} disabled={moreBusy} style={{ height: 28, padding: "0 12px", borderRadius: 7, border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: 12, fontWeight: 600, cursor: moreBusy ? "default" : "pointer", whiteSpace: "nowrap" }}>{moreBusy ? "Loading…" : "Load more"}</button>
-                <span style={{ fontSize: 11.5, color: "var(--tx3)" }}>More sessions are in range</span>
+                <button onClick={t.onMore} disabled={moreBusy} style={{ height: 36, width: "100%", padding: "0 12px", borderRadius: 7, border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: 12, fontWeight: 600, cursor: moreBusy ? "default" : "pointer", whiteSpace: "nowrap" }}>{moreBusy ? <><span className="material-symbols-outlined" style={{ fontSize: 14, verticalAlign: "middle" }}>progress_activity</span> Loading…</> : `Load 100 more · showing ${t.loaded} of ${t.total}`}</button>
               </div>
             )}
           </div>
         </div>
-        <div style={{ flex: v.lay.rf, minWidth: 320 }}>
+        <div ref={detailRef} style={{ minWidth: 0 }}>
           {g && sm ? <Gantt v={v} ui={ui} /> : (
-            <div style={{ background: "var(--card)", border: "1px dashed var(--line2)", borderRadius: 12, padding: "40px 20px", textAlign: "center", color: "var(--tx2)", fontSize: 13 }}>{v.noSelText}</div>
+            <div style={{ background: "var(--card)", border: "1px dashed var(--line2)", borderRadius: 12, padding: "40px 20px", textAlign: "center", color: "var(--tx2)" }}><span className="material-symbols-outlined" style={{ fontSize: 22, color: "var(--tx3)" }}>left_click</span><div style={{ marginTop: 6, fontSize: 14, fontWeight: 600 }}>{v.noSelText.includes("hidden") ? "Select a session" : v.noSelText}</div>{v.noSelText.includes("hidden") && <div style={{ marginTop: 4, fontSize: 12, color: "var(--tx2)" }}>{v.noSelText}</div>}</div>
           )}
         </div>
       </div>
@@ -547,28 +585,49 @@ function SessionsTab({ v, ui, moreBusy }) {
   );
 }
 
+function DetailsDrawer({ data, onRoute, onClose }) {
+  if (!data?.hasData) return <div aria-busy="true" style={{ padding: 16, display: "flex", flexDirection: "column", gap: 16 }}>{Array.from({ length: 5 }, (_, i) => <section key={i} style={{ display: "flex", flexDirection: "column", gap: 8 }}><div style={{ width: 92, height: 11, borderRadius: 6, background: "var(--seg)" }} /><div style={{ height: i === 0 ? 24 : 56, borderRadius: 8, background: "var(--seg)" }} /></section>)}</div>;
+  const factValue = (label, value) => value === "Not recorded" ? <span className="r9-nodata" title={`${label} is not included in the session data.`} aria-label={`${label} is not recorded`}><span className="material-symbols-outlined" style={{ fontSize: 14 }}>info</span>Not recorded</span> : value;
+  return <>
+    <div style={{ padding: 16, display: "flex", flexDirection: "column", gap: 16, overflowY: "auto", flex: 1 }}>
+      <section>
+        <div style={{ fontSize: 20, lineHeight: 1.25, fontWeight: 700, overflowWrap: "anywhere" }}>{data.title}</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6, color: "var(--tx2)", fontFamily: "var(--mono)", fontSize: 12 }}>{data.sid}<button onClick={() => data.copy(data.sid.slice(2))} aria-label="Copy session ID" style={{ width: 28, height: 28, border: "1px solid var(--line2)", borderRadius: 6, background: "var(--card)", color: "var(--tx2)", cursor: "pointer", fontFamily: "'Material Symbols Outlined'" }}>content_copy</button></div>
+      </section>
+      <section><h3 className="r9-drawer-section-title">Facts</h3><dl className="r9-facts">{data.facts.map(([label, value]) => <React.Fragment key={label}><dt>{label}</dt><dd>{label === "Parent" && data.parentSession ? <button onClick={data.openParent} style={{ border: 0, background: "none", padding: 0, color: "var(--acc)", font: "12.5px var(--mono)", cursor: "pointer" }}>{value}</button> : factValue(label, value)}</dd></React.Fragment>)}</dl></section>
+      <section><h3 className="r9-drawer-section-title">Totals</h3><div className="r9-details-kpis">{data.stats.map(([label, value, sub]) => <div key={label}><div className="r9-caps">{label}</div><strong style={{ color: label === "Value" ? "var(--violet)" : "var(--tx)" }}>{value === "Not recorded" ? <span className="r9-nodata" title={`${label} is not available in the session data.`} aria-label={`${label} is not recorded`}><span className="material-symbols-outlined" style={{ fontSize: 14 }}>info</span>Not recorded</span> : value}</strong>{sub && <small>{sub}</small>}</div>)}</div></section>
+      <section><h3 className="r9-drawer-section-title">Roles and models</h3>{data.roles.length ? data.roles.map((r) => <div className="r9-detail-role" key={`${r.role}-${r.model}`}><span style={r.chip}>{r.role}</span><span className="r9-detail-model" title={r.model}>{r.model}</span><span>{r.requests} · {r.tokens}</span><span className="r9-share-track"><i style={{ width: `${r.share}%`, background: r.color }} /></span><b style={{ color: "var(--violet)" }}>{r.value}</b></div>) : <span className="r9-nodata" title="No role totals are available."><span className="material-symbols-outlined" style={{ fontSize: 14 }}>info</span>Not recorded</span>}</section>
+      <section><h3 className="r9-drawer-section-title">Tools</h3>{data.tools.length ? data.tools.slice(0, 8).map((tool) => <div className="r9-tool-row" key={tool.name}><code>{tool.name}</code><span>{tool.calls}{tool.errors > 0 && <b title={`${tool.errors} tool errors`} style={{ color: "var(--red)", marginLeft: 8 }}>{tool.errors} ✕</b>}</span></div>) : <span className="r9-nodata" title="Tool calls are not included in this session response."><span className="material-symbols-outlined" style={{ fontSize: 14 }}>info</span>Not recorded</span>}</section>
+    </div>
+    <div style={{ position: "sticky", bottom: 0, minHeight: 56, display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 8, padding: "0 16px", borderTop: "1px solid var(--line)", background: "var(--card)" }}><button onClick={onRoute} style={{ height: 32, border: 0, borderRadius: 7, padding: "0 12px", background: "var(--acc)", color: "#fff", font: "inherit", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Change routing</button><button onClick={onClose} style={{ height: 32, border: "1px solid var(--line2)", borderRadius: 7, padding: "0 12px", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: 12, cursor: "pointer" }}>Close</button></div>
+  </>;
+}
+
 function Gantt({ v, ui }) {
   const g = v.g, sm = v.sm;
+  const rootRef = useRef(null), triggerRef = useRef(null);
+  useEffect(() => {
+    if (!g.pick) return;
+    const close = () => { v.closePick(); triggerRef.current?.focus(); };
+    const key = (e) => { if (e.key === "Escape") { e.preventDefault(); close(); } };
+    const down = (e) => { if (!rootRef.current?.contains(e.target)) close(); };
+    document.addEventListener("keydown", key); document.addEventListener("mousedown", down);
+    return () => { document.removeEventListener("keydown", key); document.removeEventListener("mousedown", down); };
+  }, [g.pick, v]);
   return (
-    <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: 12, boxShadow: "var(--shadow)", padding: "14px 16px" }}>
+    <div ref={rootRef} style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: 12, boxShadow: "var(--shadow)", padding: 16 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
         <span style={{ fontSize: 14, fontWeight: 700 }}>{sm.id}</span>
         <span style={{ fontSize: 12, color: "var(--tx2)" }}>{sm.client} · {sm.when}</span>
         {sm.live && <span style={{ width: 7, height: 7, borderRadius: "50%", background: "var(--green)" }} title="Live now" />}
-        <span style={{ marginLeft: "auto", display: "flex", alignItems: "center", flexWrap: "nowrap", gap: 2, padding: 3, borderRadius: 8, background: "var(--seg)" }}>
-          {g.zooms.map((z) => <button key={z.label} onClick={z.on} style={z.style}>{z.label}</button>)}
-          <button onClick={g.prev} disabled={g.noPrev} aria-label="Pan earlier" style={{ ...g.prevStyle, width: 26, height: 26, flex: "none" }}>chevron_left</button>
-          <button onClick={g.next} disabled={g.noNext} aria-label="Pan later" style={{ ...g.nextStyle, width: 26, height: 26, flex: "none" }}>chevron_right</button>
-        </span>
+        <span style={{ marginLeft: "auto" }} />
       </div>
-      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", margin: "8px 0" }}>
-        {sm.stats.map((s) => (
-          <span key={s.l} title={s.s || ""} style={{ fontSize: 12, color: "var(--tx2)" }}>{s.l}: <b style={{ color: s.c }}>{s.v}</b></span>
-        ))}
-        <span style={{ fontSize: 12, color: "var(--tx2)" }}>Models: {sm.models.map((m, i) => <span key={m.m} title={m.m}><span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: m.c, marginRight: 3, marginLeft: i ? 6 : 0 }} />{m.m.split("-")[0]}</span>)}</span>
-        <button onClick={sm.route} style={{ height: 26, padding: "0 10px", borderRadius: 7, border: "1px solid var(--line2)", background: "var(--card)", font: "inherit", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Change routing</button>
+      <div className="r9-session-summary">
+        {sm.stats.map((s) => <div key={s.l} title={s.s || ""}><span>{s.l}</span><b style={{ color: s.c }}>{s.v}</b>{s.s && <small>{s.s}</small>}{s.l === "Value" && <small>estimate</small>}</div>)}
+        <button onClick={sm.details} style={{ height: 28, padding: "0 10px", borderRadius: 7, border: "1px solid var(--line2)", background: "var(--card)", font: "inherit", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Details</button>
+        <button onClick={sm.route} style={{ height: 28, padding: "0 10px", borderRadius: 7, border: "1px solid var(--line2)", background: "var(--card)", font: "inherit", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Change routing</button>
       </div>
-      <div style={{ fontSize: 11, color: "var(--tx3)", marginBottom: 4 }}>{g.window}</div>
+      <div className="r9-timeline-toolbar"><span>{g.window}</span><span className="r9-timeline-zooms"><button onClick={g.prev} disabled={g.noPrev} aria-label="Earlier" aria-disabled={g.noPrev} style={{ ...g.prevStyle, width: 28, height: 28, border: 0 }}>chevron_left</button>{g.zooms.map((z) => <button key={z.label} onClick={z.on} style={z.style}>{z.label}</button>)}<button onClick={g.next} disabled={g.noNext} aria-label="Later" aria-disabled={g.noNext} style={{ ...g.nextStyle, width: 28, height: 28, border: 0 }}>chevron_right</button></span></div>
       <div onMouseLeave={v.unhover} style={{ position: "relative" }}>
         <div style={{ display: "flex", position: "relative", height: 18 }}>
           {g.ticks.map((t, i) => <span key={i} style={{ position: "absolute", left: t.l, fontSize: 10.5, color: "var(--tx3)", transform: "translateX(-50%)", fontVariantNumeric: "tabular-nums" }}>{t.label}</span>)}
@@ -576,13 +635,18 @@ function Gantt({ v, ui }) {
         {g.gaps.map((gp, i) => <div key={i} title={"Idle gap: " + gp.label} style={{ position: "absolute", left: gp.l, width: gp.w, top: 24, bottom: 0, background: "repeating-linear-gradient(135deg,transparent 0 4px,var(--line) 4px 5px)", borderRadius: 4, pointerEvents: "none" }} />)}
         {g.now && <div style={{ position: "absolute", left: g.nowL, top: 20, bottom: 0, width: 1, background: "var(--green)" }} title="now" />}
         {g.lanes.map((l, li) => (
-          <div key={li} title={l.tip} style={{ display: "flex", alignItems: "center", gap: 8, height: 39, opacity: l.op }}>
+          <div key={li} className="r9-timeline-lane" role="group" aria-label={`${l.role} requests`} title={l.tip} style={{ display: "flex", alignItems: "center", gap: 8, height: 39, opacity: l.op }}>
             <button onClick={l.focus} style={{ width: 120, flex: "none", display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 1, border: 0, background: "transparent", padding: 0, font: "inherit", cursor: "pointer", textAlign: "left" }}>
               <span style={l.chip}>{l.role}</span>
               <span style={{ fontSize: 10.5, color: "var(--tx3)", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{l.model}</span>
             </button>
             <div style={{ position: "relative", flex: 1, height: 39 }}>
-              {l.bars.map((b, ri) => <button key={ri} title={b.aria} onMouseEnter={b.hover} onFocus={b.hover} onClick={b.pick} style={b.style} />)}
+              {l.bars.map((b, ri) => <button key={ri} type="button" aria-label={b.aria} title={b.aria} onMouseEnter={b.hover} onFocus={b.hover} onClick={(e) => { triggerRef.current = e.currentTarget; b.pick(); }} onKeyDown={(e) => {
+                if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key)) return;
+                e.preventDefault(); const lane = e.currentTarget.closest(".r9-timeline-lane");
+                if (e.key === "ArrowLeft" || e.key === "ArrowRight") { const buttons = [...lane.querySelectorAll("button[aria-label]")]; buttons[Math.max(0, Math.min(buttons.length - 1, buttons.indexOf(e.currentTarget) + (e.key === "ArrowRight" ? 1 : -1)))]?.focus(); }
+                else { const lanes = [...lane.parentElement.querySelectorAll(".r9-timeline-lane")]; const next = lanes[Math.max(0, Math.min(lanes.length - 1, lanes.indexOf(lane) + (e.key === "ArrowDown" ? 1 : -1)))]; next?.querySelector("button[aria-label]")?.focus(); }
+              }} style={b.style} />)}
             </div>
           </div>
         ))}
@@ -590,24 +654,25 @@ function Gantt({ v, ui }) {
           <div style={{ position: "absolute", ...g.hov, zIndex: 30, width: 260, background: "var(--card)", border: "1px solid var(--line2)", borderRadius: 10, boxShadow: "0 12px 32px rgba(40,20,10,.16)", padding: "10px 12px", pointerEvents: "none" }}>
             <div style={{ fontSize: 12.5, fontWeight: 700 }}>{g.hov.model}</div>
             <div style={{ fontSize: 11.5, color: "var(--tx2)", marginBottom: 6 }}>{g.hov.prov} · <span style={g.hov.stStyle}>{g.hov.status}</span></div>
-            {g.hov.facts.map((f) => <div key={f.l} style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5 }}><span style={{ color: "var(--tx3)" }}>{f.l}</span><b style={{ color: f.c }}>{f.v}</b></div>)}
+            {g.hov.facts.map((f) => <div key={f.l} style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5 }}><span style={{ color: "var(--tx2)" }}>{f.l}</span><b style={{ color: f.c }}>{f.v === "Not logged before Nov 9" ? <span className="r9-nodata" title="Latency was not logged before Nov 9.">{f.v}</span> : f.v}</b></div>)}
           </div>
         )}
         {g.pick && (
-          <div role="dialog" aria-label={"Request " + g.pick.rid} style={{ position: "absolute", ...g.pick, zIndex: 31, width: 300, background: "var(--card)", border: "1px solid var(--line2)", borderRadius: 10, boxShadow: "0 12px 32px rgba(40,20,10,.16)", padding: "12px 14px" }}>
+          <div role="dialog" aria-label={"Request " + g.pick.rid} style={{ position: "absolute", ...g.pick, zIndex: 31, width: 280, maxWidth: "calc(100% - 16px)", boxSizing: "border-box", background: "var(--card)", border: "1px solid var(--line2)", borderRadius: 10, boxShadow: "0 12px 32px rgba(40,20,10,.16)", padding: 12 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <span style={{ fontSize: 12.5, fontWeight: 700 }}>{g.pick.model}</span>
               <span style={g.pick.stStyle}>{g.pick.status}</span>
               <button onClick={v.closePick} aria-label="Close request details" style={{ marginLeft: "auto", border: 0, background: "var(--seg)", borderRadius: 6, width: 24, height: 24, cursor: "pointer", fontFamily: "'Material Symbols Outlined'", fontSize: 15, color: "var(--tx2)" }}>close</button>
             </div>
             <div style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--tx3)", margin: "2px 0 6px" }}>{g.pick.rid}</div>
-            {g.pick.facts.map((f) => <div key={f.l} style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5 }}><span style={{ color: "var(--tx3)" }}>{f.l}</span><b style={{ color: f.c, fontFamily: f.ff }}>{f.v}</b></div>)}
+            {g.pick.facts.map((f) => <div key={f.l} style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5 }}><span style={{ color: "var(--tx2)" }}>{f.l}</span><b style={{ color: f.c, fontFamily: f.ff }}>{["Not logged before Nov 9", "Not recorded"].includes(f.v) ? <span className="r9-nodata" title="This value is not available in the session data.">{f.v}</span> : f.v}</b></div>)}
           </div>
         )}
       </div>
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 8 }}>
         {g.legend.map((l) => <span key={l.m} title={l.m} style={{ fontSize: 11, color: "var(--tx2)" }}><span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: l.c, marginRight: 4 }} />{l.m}</span>)}
       </div>
+      <div className="r9-request-list"><div className="r9-request-head"><span>Time</span><span>Role</span><span>Model</span><span>TTFT</span><span>Total</span><span>Tokens in/out</span><span>Value</span><span>Status</span></div>{g.requests.map((r, i) => <div className="r9-request-row" key={`${r.time}-${i}`}><span>{r.time}</span><span>{r.role}</span><code>{r.model}</code><span>{r.ttft === "Not recorded" ? <span className="r9-nodata" title="Latency was not logged before Nov 9.">Not logged before Nov 9</span> : r.ttft}</span><span>{r.total === "Not recorded" ? <span className="r9-nodata" title="Latency was not logged before Nov 9.">Not logged before Nov 9</span> : r.total}</span><span>{r.tokens}</span><span style={{ color: "var(--violet)" }}>{r.value}</span><span style={r.statusStyle}>{r.status}</span></div>)}</div>
       <p style={{ fontSize: 11, color: "var(--tx3)", margin: "8px 0 0" }}>{g.note}</p>
     </div>
   );
