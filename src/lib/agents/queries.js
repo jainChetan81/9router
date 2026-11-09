@@ -74,6 +74,22 @@ function createReadWorker() {
   const slot = { worker, ready: false, retired: false, job: null, idleTimer: null };
   readWorkers.push(slot);
   worker.on("message", (message) => {
+    if (message?.ready === false) {
+      const error = new Error(message.error?.message || "Agents read worker failed to open the database");
+      if (slot.job && !slot.job.settled) {
+        clearTimeout(slot.job.timeout);
+        pendingReadJobs.unshift(slot.job);
+        slot.job = null;
+      }
+      retireReadWorker(slot);
+      slot.worker.terminate().catch(() => {});
+      // Keep the failure detail available when replacement capacity is exhausted.
+      if (pendingReadJobs.length && readWorkers.length >= READ_WORKER_LIMIT) {
+        const job = pendingReadJobs.shift();
+        settleReadJob(job, error);
+      }
+      return;
+    }
     if (message?.ready) {
       slot.ready = true;
       armWorkerIdle(slot);
@@ -198,6 +214,8 @@ const SUBAGENT_ROLES = new Set(["scout", "implementer", "reviewer", "background"
 function isMainRole(role) { return !SUBAGENT_ROLES.has(role); }
 const PARENT_WINDOW_MS = 60 * 60 * 1000;
 const PARENT_CANDIDATE_CAP = 200;
+const inferredParentCache = new Map();
+const INFERRED_PARENT_CACHE_CAP = 5000;
 export const SESSION_CAP = 2000;
 export const ANALYTICS_SAMPLE_CAP = 20_000;
 const GROUP_ROW_CAP = 20_000;
@@ -238,11 +256,16 @@ export function inferParents(sessions) {
     if (!candidates || candidates.length <= 1) continue;
 
     let best = null;
-    let bestSpan = Infinity;
+    let bestStart = Infinity;
     const cFirst = c.firstMs;
     const cLast = c.lastMs;
     const cSess = c.s.session;
     const cClient = c.s.client;
+    const cachedParent = inferredParentCache.get(cSess);
+    if (cachedParent) {
+      map.set(cSess, cachedParent);
+      continue;
+    }
 
     let checked = 0;
     for (const p of candidates) {
@@ -257,14 +280,20 @@ export function inferParents(sessions) {
         const uaDiffers = p.s.client !== cClient;
         if (!uaDiffers && !p.hasMain) continue;
         if (pFirst === cFirst && pLast === cLast) continue;
-        const span = pLast - pFirst;
-        if (span < bestSpan) {
-          bestSpan = span;
+        if (pFirst < bestStart || (pFirst === bestStart && best && String(p.s.session).localeCompare(String(best.session)) < 0)) {
+          bestStart = pFirst;
           best = p.s;
         }
       }
     }
-    if (best) map.set(cSess, { session: best.session, inferred: true });
+    if (best) {
+      const assignment = { session: best.session, inferred: true, parentGuessed: true };
+      if (inferredParentCache.size >= INFERRED_PARENT_CACHE_CAP) {
+        inferredParentCache.delete(inferredParentCache.keys().next().value);
+      }
+      inferredParentCache.set(cSess, assignment);
+      map.set(cSess, assignment);
+    }
   }
   return map;
 }
@@ -584,7 +613,7 @@ async function getSessionDetailInline(db, sessionId) {
         const parentMap = inferParents(candidates);
         children = [...parentMap.entries()]
           .filter(([, v]) => v.session === sessionId)
-          .map(([k]) => ({ session: k, inferred: true }));
+          .map(([k, parent]) => ({ session: k, inferred: true, parentGuessed: parent.parentGuessed === true }));
       }
     }
   } catch (e) { children = []; }
@@ -665,12 +694,24 @@ async function getAnalyticsInline(db, fromIso, toIso) {
   }
   for (const [role, entry] of byRoleMap) entry.sessions = roleSessionCounts.get(role) || 0;
 
-  const totalReqs = totalSessionRequests || 1;
-  const byRole = [...byRoleMap.values()].map((r) => ({
-    ...r,
-    value: num(r.value),
-    share: r.requests / totalReqs,
-  })).sort((a, b) => b.requests - a.requests);
+  const totalRequests = metricRows.reduce((sum, row) => sum + Number(row.requests || 0), 0);
+  const totalReqs = totalRequests || 1;
+  for (const row of metricRows) {
+    const role = row.role || "direct";
+    let roleEntry = byRoleMap.get(role);
+    if (!roleEntry) {
+      roleEntry = { role, sessions: 0, requests: 0, tokens: 0, value: 0 };
+      byRoleMap.set(role, roleEntry);
+    }
+    // Session-backed rows were added above. Add only rows without a session here.
+    if (!Number(row.hasSession)) {
+      roleEntry.requests += Number(row.requests || 0);
+      roleEntry.tokens += Number(row.tokens || 0);
+      roleEntry.value += num(row.value);
+    }
+  }
+  const allByRole = [...byRoleMap.values()].map((r) => ({ ...r, value: num(r.value), share: r.requests / totalReqs }))
+    .sort((a, b) => b.requests - a.requests);
 
   const delegationRate = spanResult.sessions.length ? delegatedSessions / spanResult.sessions.length : 0;
 
@@ -733,7 +774,9 @@ async function getAnalyticsInline(db, fromIso, toIso) {
   }).sort((a, b) => b.requests - a.requests);
 
   return {
-    byRole,
+    byRole: allByRole,
+    totalRequests,
+    sessionRequests: totalSessionRequests,
     delegationRate,
     childrenPerSession,
     modelByRole,
@@ -781,20 +824,41 @@ function mergeLiveSnapshot(result, activeBySession, nowMs) {
       }
       for (const [roleName, current] of currentByRole) {
         const role = roles.get(roleName) || { role: roleName, model: current.model || "unknown", requests: 0 };
-        role.inFlight = (role.inFlight || 0) + requests.filter((request) => roleOf({ combo: request.combo }) === roleName).length;
+        const roleRequests = requests.filter((request) => roleOf({ combo: request.combo }) === roleName);
+        role.inFlight = roleRequests.length;
         role.model = current.model || role.model || "unknown";
+        role.state = roleRequests.some((request) => request.firstTokenAt != null) ? "streaming" : "thinking";
+        role.lastActivityMs = nowMs;
+        role.idleSeconds = 0;
+        role.tps ??= null;
+        role.p50Ms ??= null;
         role.pulsing = true;
         roles.set(roleName, role);
       }
       const count = requests.length;
       session.roles = [...roles.values()];
       session.inFlight = (session.inFlight || 0) + count;
+      session.lastActivityMs = nowMs;
       session.pulsing = true;
       session.reqPerMin = ((session.reqPerMin || 0) * 5 + count) / 5;
       if (!session.lastTs || session.lastTs < nowIso) session.lastTs = nowIso;
     }
     sessions.sort((a, b) => String(b.lastTs || "").localeCompare(String(a.lastTs || "")));
-    return { ...(result || {}), sessions: sessions.slice(0, LIVE_SESSION_CAP) };
+    const inFlight = Object.values(activeBySession || {}).reduce((sum, requests) => sum + (Array.isArray(requests) ? requests.length : 0), 0);
+    for (const session of sessions) {
+      const lastActivityMs = session.lastActivityMs || (session.lastTs ? Date.parse(session.lastTs) : null);
+      session.lastActivityMs = Number.isFinite(lastActivityMs) ? lastActivityMs : null;
+      session.inFlight ||= 0;
+      for (const role of session.roles || []) {
+        role.inFlight ||= 0;
+        role.state ||= role.inFlight ? "thinking" : "idle";
+        role.lastActivityMs ||= session.lastActivityMs;
+        role.idleSeconds = role.inFlight ? 0 : (role.lastActivityMs ? Math.max(0, Math.floor((nowMs - role.lastActivityMs) / 1000)) : null);
+        role.tps ??= null;
+        role.p50Ms ??= null;
+      }
+    }
+    return { ...(result || {}), inFlight, sessions: sessions.slice(0, LIVE_SESSION_CAP) };
   } catch {
     return result || { sessions: [], sampled: { rows: 0, cap: LIVE_ROW_CAP } };
   }
@@ -919,7 +983,7 @@ async function getLiveInline(db, nowMs = Date.now()) {
   );
   const latencyRows = db.all(
     `${recentCte}
-     SELECT sess,
+     SELECT sess, ${roleCase} AS role,
             json_extract(meta, '$.latency.totalMs') AS totalMs,
             json_extract(meta, '$.latency.ttftMs') AS ttftMs,
             json_extract(meta, '$.latency.stream') AS stream,
@@ -946,15 +1010,25 @@ async function getLiveInline(db, nowMs = Date.now()) {
     }
   }
   const latencyBySession = new Map();
+  const latencyBySessionRole = new Map();
   for (const row of latencyRows) {
     let samples = latencyBySession.get(row.sess);
     if (!samples) { samples = { totals: [], tps: [] }; latencyBySession.set(row.sess, samples); }
+    const roleKey = `${row.sess}\u0000${row.role || "direct"}`;
+    let roleSamples = latencyBySessionRole.get(roleKey);
+    if (!roleSamples) { roleSamples = { totals: [], tps: [] }; latencyBySessionRole.set(roleKey, roleSamples); }
     const totalMs = row.totalMs != null ? Number(row.totalMs) : null;
     const ttftMs = row.ttftMs != null ? Number(row.ttftMs) : null;
-    if (totalMs != null && Number.isFinite(totalMs)) samples.totals.push(totalMs);
+    if (totalMs != null && Number.isFinite(totalMs)) {
+      samples.totals.push(totalMs);
+      roleSamples.totals.push(totalMs);
+    }
     if (Boolean(row.stream) && ttftMs != null && totalMs != null && totalMs > ttftMs && row.completionTokens > 0) {
       const tps = row.completionTokens / ((totalMs - ttftMs) / 1000);
-      if (Number.isFinite(tps)) samples.tps.push(tps);
+      if (Number.isFinite(tps)) {
+        samples.tps.push(tps);
+        roleSamples.tps.push(tps);
+      }
     }
   }
 
@@ -962,7 +1036,10 @@ async function getLiveInline(db, nowMs = Date.now()) {
   const sessions = selectedSummaryRows.map((row) => {
     const samples = latencyBySession.get(row.sess) || { totals: [], tps: [] };
     const roles = [...(rolesBySession.get(row.sess)?.values() || [])]
-      .map(({ _lastTs, ...role }) => role);
+      .map(({ _lastTs, ...role }) => {
+        const roleSamples = latencyBySessionRole.get(`${row.sess}\u0000${role.role}`) || { totals: [], tps: [] };
+        return { ...role, tps: percentile(roleSamples.tps, 50), p50Ms: percentile(roleSamples.totals, 50) };
+      });
     return {
       session: row.sess,
       client: clientOfUa(row.ua),
