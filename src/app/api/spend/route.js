@@ -110,7 +110,7 @@ export async function GET(request) {
       const keyName = keyName0;
       const client = meta.ua !== undefined ? clientOf(meta.ua) : null;
       const role = meta.ua !== undefined ? meta.combo || "main" : null;
-      drilldown.add({ provider: r.provider, model: r.model, tokens: r.tokens, promptTokens: r.promptTokens, completionTokens: r.completionTokens, effort: meta.sentEffort, cost, real: rReal, client, role });
+      drilldown.add({ provider: r.provider, model: r.model, tokens: r.tokens, promptTokens: r.promptTokens, completionTokens: r.completionTokens, effort: meta.sentEffort, cost, real: rReal, realEst: est ? rReal : 0, client, role });
       const add = (m, k) => { const o = bump(m, k, () => ({ ...acc(), clients: {}, keys: {}, mix: {}, n: 0, provider: r.provider })); o.v += cost; o.real += rReal; o.req++; o.tok += t; return o; };
       const ko = add(byKey, keyName); if (client) ko.clients[client] = (ko.clients[client] || 0) + cost;
       const mo = add(byModel, r.model || "unknown"); mo.keys[keyName] = (mo.keys[keyName] || 0) + cost; if (client) mo.clients[client] = (mo.clients[client] || 0) + cost;

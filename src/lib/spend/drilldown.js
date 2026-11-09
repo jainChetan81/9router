@@ -16,10 +16,11 @@ export function splitTokens(raw, promptFallback = 0, completionFallback = 0) {
   return { input: Math.max(0, prompt - cacheRead - cacheWrite), cacheRead, cacheWrite, output: Math.max(0, output) };
 }
 
-const node = () => ({ v: 0, real: 0, req: 0, tok: 0, tokSplit: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 } });
+const node = () => ({ v: 0, real: 0, realEst: 0, req: 0, tok: 0, tokSplit: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 } });
 function feed(target, row, split) {
   target.v += Number(row.cost) || 0;
   target.real += Number(row.real) || 0;
+  target.realEst += Number(row.realEst) || 0;
   target.req += 1;
   target.tok += Object.values(split).reduce((a, v) => a + v, 0);
   for (const k of Object.keys(split)) target.tokSplit[k] += split[k];
@@ -43,8 +44,8 @@ export function createSpendDrilldown() {
         const edges = [[`combo:${combo}`, `provider:${provider}`], [`provider:${provider}`, `model:${provider}:${model}`]];
         for (const [source, target] of edges) {
           const key = JSON.stringify([source, target]); let l = routes.get(key);
-          if (!l) routes.set(key, l = { source, target, req: 0, v: 0, real: 0, paid: PAID(provider) });
-          l.req++; l.v += Number(row.cost) || 0; l.real += Number(row.real) || 0;
+          if (!l) routes.set(key, l = { source, target, req: 0, v: 0, real: 0, realEst: 0, paid: PAID(provider) });
+          l.req++; l.v += Number(row.cost) || 0; l.real += Number(row.real) || 0; l.realEst += Number(row.realEst) || 0;
         }
       }
     },
@@ -67,8 +68,8 @@ export function createSpendDrilldown() {
         for (const link of models.slice(25)) {
           const otherId = `${providerId}:other-models`;
           let aggregate = mergeTargets.get(otherId);
-          if (!aggregate) mergeTargets.set(otherId, aggregate = { source: providerId, target: otherId, req: 0, v: 0, real: 0, paid: link.paid });
-          aggregate.req += link.req; aggregate.v += link.v; aggregate.real += link.real;
+          if (!aggregate) mergeTargets.set(otherId, aggregate = { source: providerId, target: otherId, req: 0, v: 0, real: 0, realEst: 0, paid: link.paid });
+          aggregate.req += link.req; aggregate.v += link.v; aggregate.real += link.real; aggregate.realEst += link.realEst;
           links.splice(links.indexOf(link), 1);
           routeNodes.delete(link.target);
         }

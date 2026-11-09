@@ -6,16 +6,18 @@ import { getUsageForProvider } from "open-sse/services/usage.js";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { USAGE_APIKEY_PROVIDERS } from "@/shared/constants/providers";
 import { normalizeQuotaRow, sortQuotaRows } from "@/lib/spend/quotaRunway.js";
+import { createRefreshDeduper, quotaUsageRows } from "@/lib/spend/quotaSnapshot.js";
 
 export const dynamic = "force-dynamic";
 const TTL = 60000, TIMEOUT = 8000;
 let cached = null;
 let inFlight = null;
-const refreshing = new Map();
+const refreshConnection = createRefreshDeduper();
 
 async function readConnection(connection, now) {
-  const deadline = new Promise((_, reject) => setTimeout(() => reject(new Error("Usage request timed out")), TIMEOUT));
-  return Promise.race([readConnectionWork(connection, now), deadline]);
+  let timer;
+  const deadline = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Usage request timed out")), TIMEOUT); });
+  return Promise.race([readConnectionWork(connection, now), deadline]).finally(() => clearTimeout(timer));
 }
 
 async function readConnectionWork(connection, now) {
@@ -25,18 +27,15 @@ async function readConnectionWork(connection, now) {
     const apikey = ["apikey", "api_key"].includes(connection.authType) && USAGE_APIKEY_PROVIDERS.includes(connection.provider);
     if (!oauth && !apikey) throw new Error("Usage not available for this connection");
     if (oauth) {
-      const refresh = refreshing.get(connection.id) || refreshAndUpdateCredentials(connection, false, proxyOptions);
-      refreshing.set(connection.id, refresh);
-      try { connection = (await refresh).connection; } finally { if (refreshing.get(connection.id) === refresh) refreshing.delete(connection.id); }
+      connection = (await refreshConnection(connection.id, () => refreshAndUpdateCredentials(connection, false, proxyOptions))).connection;
     }
     let usage = await getUsageForProvider(connection, proxyOptions);
     if (oauth && isAuthExpiredMessage(usage) && connection.refreshToken) {
-      const retry = await refreshAndUpdateCredentials(connection, true, proxyOptions);
+      const retry = await refreshConnection(connection.id, () => refreshAndUpdateCredentials(connection, true, proxyOptions));
       connection = retry.connection;
       usage = await getUsageForProvider(connection, proxyOptions);
     }
-    if (usage?.message && !usage?.quotas) throw new Error(usage.message);
-    return Object.entries(usage?.quotas || {}).map(([key, q]) => ({ ...normalizeQuotaRow({ provider: connection.provider, name: connection.name || connection.provider, quota: { ...q, name: key }, now }), window: q.displayName ? `${key} (${q.displayName})` : key }));
+    return quotaUsageRows({ usage, connection, now, normalize: normalizeQuotaRow });
 }
 
 async function fetchQuotaSnapshot() {

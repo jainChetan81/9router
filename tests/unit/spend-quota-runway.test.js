@@ -12,7 +12,7 @@ describe("spend quota runway", () => {
     expect(windowLength("session", "codex")).toBeNull();
     expect(windowLength("gemini-model-x")).toBeNull();
   });
-  it("forecasts linearly and marks exhaustion before reset", () => {
+  it("forecasts linearly and handles reset boundaries", () => {
     const now = 100000000;
     expect(forecastQuota({ usedPct: 50, resetAt: now + 3 * H, windowMs: 5 * H, now })).toEqual({ projectedPct: 125, runsOutAt: now + 2 * H });
     expect(forecastQuota({ usedPct: 20, resetAt: now + 4 * H, windowMs: 5 * H, now }).runsOutAt).toBeNull();
