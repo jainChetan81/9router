@@ -154,18 +154,17 @@ export default function AgentsClient() {
     const id = ++rangeId.current;
     const q = new URLSearchParams({ preset: range.preset });
     if (range.preset === "Custom") { q.set("from", range.from); q.set("to", range.to); }
-    setMode((m) => (m === "ready" || m === "stale" ? "stale" : "loading"));
     try {
       const [s, a] = await Promise.all([getJson(`/api/agents/sessions?${q}`), getJson(`/api/agents/analytics?${q}`)]);
       if (id !== rangeId.current) return;
       setSessions(s.sessions || []);
       setTotalSessions(s.total ?? (s.sessions || []).length);
       setAnalytics(a);
-      setMode((m) => (m === "loading" ? "ready" : m));
+      setMode("ready");
     } catch (e) {
       if (id !== rangeId.current) return;
       setErrorText(e.message || "Request failed");
-      setMode("error");
+      setMode((m) => (m === "ready" || m === "stale" ? "stale" : "error"));
     }
   }, [range]); // tick re-arms loadRange via the effect below, not the closure
   useEffect(() => { const t = setTimeout(loadRange, 0); return () => clearTimeout(t); }, [loadRange, tick]);
@@ -270,30 +269,30 @@ export default function AgentsClient() {
 
         {isLoading && <AgentsSkeleton v={v} />}
         {isError && (
-          <div style={{ background: "var(--card)", border: "1px solid var(--red)", borderRadius: 12, padding: "28px 24px", textAlign: "center", opacity: v.dim }}>
+          <div style={{ background: "var(--card)", border: "1px solid var(--red)", borderRadius: 12, padding: "28px 24px", textAlign: "center", opacity: v.v.dim }}>
             <span className="material-symbols-outlined" style={{ fontSize: 30, color: "var(--red)" }}>cloud_off</span>
-            <p style={{ fontSize: 14, fontWeight: 600 }}>{v.errTitle}</p>
-            <p style={{ fontSize: 12.5, color: "var(--tx2)" }}>{v.errBody}</p>
+            <p style={{ fontSize: 14, fontWeight: 600 }}>{v.v.errTitle}</p>
+            <p style={{ fontSize: 12.5, color: "var(--tx2)" }}>{v.v.errBody}</p>
             <button onClick={retry} style={{ marginTop: 8, height: 30, padding: "0 14px", borderRadius: 8, border: 0, background: "var(--acc)", color: "#fff", font: "inherit", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>Retry</button>
           </div>
         )}
-        {ready && v.empty && (
+        {ready && v.v.empty && (
           <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: 12, boxShadow: "var(--shadow)", padding: "48px 24px", textAlign: "center" }}>
-            <span className="material-symbols-outlined" style={{ fontSize: 34, color: "var(--tx3)" }}>{v.emptyIcon}</span>
-            <p style={{ fontSize: 14, fontWeight: 600, margin: "10px 0 4px" }}>{v.emptyTitle}</p>
-            <p style={{ fontSize: 12.5, color: "var(--tx2)", margin: "0 0 12px" }}>{v.emptyBody}</p>
-            <button onClick={v.emptyGo} style={{ height: 30, padding: "0 14px", borderRadius: 8, border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>{v.emptyBtn}</button>
+            <span className="material-symbols-outlined" style={{ fontSize: 34, color: "var(--tx3)" }}>{v.v.emptyIcon}</span>
+            <p style={{ fontSize: 14, fontWeight: 600, margin: "10px 0 4px" }}>{v.v.emptyTitle}</p>
+            <p style={{ fontSize: 12.5, color: "var(--tx2)", margin: "0 0 12px" }}>{v.v.emptyBody}</p>
+            <button onClick={v.v.emptyGo} style={{ height: 30, padding: "0 14px", borderRadius: 8, border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>{v.v.emptyBtn}</button>
           </div>
         )}
-        {ready && !v.empty && v.stale && (
+        {ready && !v.v.empty && v.v.stale && (
           <div role="status" style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--amber)", background: "var(--amberbg)", border: "1px solid var(--amber)", borderRadius: 8, padding: "8px 12px", marginBottom: 12 }}>
-            <span className="material-symbols-outlined" style={{ fontSize: 16 }}>warning</span>{v.staleText}
+            <span className="material-symbols-outlined" style={{ fontSize: 16 }}>warning</span>{v.v.staleText}
           </div>
         )}
-        {ready && !v.empty && ui.tab === "live" && <LiveTab v={v} />}
-        {ready && !v.empty && ui.tab === "sessions" && <SessionsTab v={v} ui={ui} />}
-        {ready && !v.empty && ui.tab === "roles" && <RolesTab v={v} />}
-        {ready && !v.empty && ui.tab === "tools" && <ToolsTab v={v} error={toolsError} loading={!tools && !toolsError} />}
+        {ready && !v.v.empty && ui.tab === "live" && <LiveTab v={v} />}
+        {ready && !v.v.empty && ui.tab === "sessions" && <SessionsTab v={v} ui={ui} />}
+        {ready && !v.v.empty && ui.tab === "roles" && <RolesTab v={v} />}
+        {ready && !v.v.empty && ui.tab === "tools" && <ToolsTab v={v} error={toolsError} loading={!tools && !toolsError} />}
 
         {v.dr && (
           <div role="dialog" aria-modal="true" aria-label={v.dr.aria} onClick={v.closeDrawer} style={{ position: "fixed", inset: 0, zIndex: 70, background: "rgba(20,12,8,.4)", display: "flex", justifyContent: "flex-end" }}>
@@ -354,7 +353,7 @@ function AgentsSkeleton({ v }) {
 }
 
 function LiveTab({ v }) {
-  if (!v.live) return null;
+  if (!v.v.live) return null;
   if (v.liveWide) {
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
@@ -418,13 +417,13 @@ function LiveCard({ c, narrow }) {
 }
 
 function SessionsTab({ v, ui }) {
-  if (!v.sess) return null;
+  if (!v.v.sess) return null;
   const t = v.tree, g = v.g, sm = v.sm;
   return (
     <div>
-      {v.partial && (
+      {v.v.partial && (
         <div role="status" style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--tx2)", background: "var(--seg)", borderRadius: 8, padding: "8px 12px", marginBottom: 12 }}>
-          <span className="material-symbols-outlined" style={{ fontSize: 16 }}>history</span>{v.partialText}
+          <span className="material-symbols-outlined" style={{ fontSize: 16 }}>history</span>{v.v.partialText}
         </div>
       )}
       <div style={{ display: "flex", gap: 16, flexWrap: "wrap", ...v.lay }}>

@@ -53,6 +53,16 @@ describe("agents view", () => {
     expect(buildView({ ...args, tools: { tools: [], topToolsByRole: [] } }).tl).toMatchObject({ hasData: false, emptyTitle: "Tool tracking started Nov 9, 2026" });
   });
 
+  it("exposes page-state flags under v.v so the Sessions tab renders", () => {
+    const sessions = [{ session: "aaaaaaaaaaaa", client: "Claude Code", firstTs: "2026-11-09T07:00:00Z", lastTs: "2026-11-09T07:59:00Z", requests: 3, tokens: 10, value: 0, errors: 0, roles: [{ role: "main", models: [{ model: "claude-opus-5-5", requests: 3, tokens: 10, value: 0 }] }], parent: null }];
+    for (const mode of ["ready", "stale"]) {
+      const v = buildView({ live, sessions, totalSessions: 1, analytics: null, range: { preset: "7D" }, ui: ui({ tab: "sessions", mode }), now: NOW });
+      expect(v.v.sess).toBe(true);
+      expect(v.v.empty).toBe(false);
+      expect(v.tree.rows.length).toBeGreaterThan(0);
+    }
+  });
+
   it("gives every role a chip style", () => {
     for (const r of ["main", "scout", "implementer", "reviewer", "thinker", "background", "direct"]) expect(chip(r)).toBeTruthy();
   });
