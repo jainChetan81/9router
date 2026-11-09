@@ -376,7 +376,7 @@ function safeActor(actor) {
 
 let auditFailureLogged = false;
 
-async function appendAudit({ action, session, combo, oldModel, newModel, mode, actor }) {
+async function appendAudit({ action, session, combo, oldModel, newModel, mode, actor, ip }) {
   const file = path.join(DATA_DIR, "agents", "overrides.jsonl");
   const directory = path.dirname(file);
   await fs.mkdir(directory, { recursive: true, mode: 0o700 });
@@ -393,6 +393,7 @@ async function appendAudit({ action, session, combo, oldModel, newModel, mode, a
     newModel: newModel || null,
     mode: mode || null,
     actor: safeActor(actor),
+    ...(typeof ip === "string" && ip ? { ip: ip.slice(0, 45) } : {}),
   });
   try {
     const fileStat = await fs.lstat(file);
@@ -745,6 +746,7 @@ export async function setOverride(session, combo, input, context = {}) {
       newModel: next.model,
       mode: next.mode,
       actor: context.actor,
+      ip: context.ip,
     });
     return { ...toPublic(next), ...(auditWarning ? { auditWarning: true } : {}) };
   });
@@ -788,6 +790,7 @@ export async function deleteOverride(session, combo, revision, options = {}) {
       newModel: null,
       mode: current.mode,
       actor: options.actor,
+      ip: options.ip,
     });
     return { session, combo, deleted: true, revision: tombstone.revision, ...(auditWarning ? { auditWarning: true } : {}) };
   });

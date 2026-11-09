@@ -12,7 +12,11 @@ vi.mock("node:worker_threads", async () => {
       this.messages = [];
       this.terminated = false;
       MockWorker.instances.push(this);
-      queueMicrotask(() => this.emit("message", { ready: true }));
+      const failOpen = globalThis.__agentsReadWorkerFailOpen === true;
+      globalThis.__agentsReadWorkerFailOpen = false;
+      queueMicrotask(() => this.emit("message", failOpen
+        ? { ready: false, error: { message: "database open failed" } }
+        : { ready: true }));
     }
 
     postMessage(message) { this.messages.push(message); }
@@ -71,4 +75,16 @@ describe("agents read worker pool", () => {
     await tick();
     expect(globalThis.__agentsReadWorkers.length).toBeGreaterThanOrEqual(2);
   }, 7000);
+
+  it("retires a worker that reports a database open failure and retries the read", async () => {
+    globalThis.__agentsReadWorkerFailOpen = true;
+    const queries = await import("@/lib/agents/queries.js");
+    const result = queries.listSessionsPage(db, "open-failure-from", "open-failure-to", { limit: 10 });
+    await tick();
+    await tick();
+    const failed = globalThis.__agentsReadWorkers.find((worker) => worker.terminated);
+    expect(failed).toBeDefined();
+    await Promise.all(globalThis.__agentsReadWorkers.filter((worker) => !worker.terminated).map(drainWorkerMessages));
+    await expect(result).resolves.toMatchObject({ sessions: [], total: 0 });
+  });
 });

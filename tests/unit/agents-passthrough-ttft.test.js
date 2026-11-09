@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { createPassthroughStreamWithLogger } from "../../open-sse/utils/stream.js";
+import { createPassthroughStreamWithLogger, createSSETransformStreamWithLogger } from "../../open-sse/utils/stream.js";
 
 const enc = new TextEncoder();
 const sse = (o) => `event: ${o.type}\ndata: ${JSON.stringify(o)}\n\n`;
@@ -28,5 +28,23 @@ describe("passthrough TTFT", () => {
   });
   it("keeps the old behavior when no event format is given", async () => {
     expect(await runClaudePassthrough(null)).toBe(null);
+  });
+});
+
+describe("translated Antigravity TTFT", () => {
+  it("marks the first semantic token in an Antigravity translated stream", async () => {
+    let ttftAt;
+    const transform = createSSETransformStreamWithLogger(
+      "antigravity", "openai", "antigravity", null, null, "gemini-2.5-pro", null, {},
+      (_content, _usage, value) => { ttftAt = value; },
+    );
+    const writer = transform.writable.getWriter();
+    const reader = transform.readable.getReader();
+    const drain = (async () => { while (!(await reader.read()).done); })();
+    await writer.write(enc.encode(`data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: "Hi" }] } }] })}\n\n`));
+    await writer.write(enc.encode(`data: ${JSON.stringify({ candidates: [{ finishReason: "STOP" }] })}\n\n`));
+    await writer.close();
+    await drain;
+    expect(Number.isFinite(ttftAt)).toBe(true);
   });
 });

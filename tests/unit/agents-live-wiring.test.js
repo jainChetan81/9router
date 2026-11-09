@@ -49,11 +49,15 @@ describe("agents live request wiring", () => {
     expect(result.sessions[0]).toMatchObject({
       session: sessionKey(rawSession),
       inFlight: 1,
+      lastActivityMs: expect.any(Number),
       pulsing: true,
       reqPerMin: 0.2,
     });
     expect(result.sessions[0].roles).toEqual([
-      expect.objectContaining({ role: "assistant", model: "openai/gpt-4o", inFlight: 1, pulsing: true }),
+      expect.objectContaining({
+        role: "assistant", model: "openai/gpt-4o", inFlight: 1, pulsing: true,
+        state: "thinking", idleSeconds: 0, lastActivityMs: expect.any(Number), tps: null, p50Ms: null,
+      }),
     ]);
   });
 

@@ -295,7 +295,7 @@ export async function saveRequestUsage(entry) {
         [
           entry.timestamp, entry.provider || null, entry.model || null,
           entry.connectionId || null, entry.apiKey || null, entry.endpoint || null,
-          promptTokens, completionTokens, entry.cost || 0, entry.status || "ok",
+          promptTokens, completionTokens, entry.cost || 0, entry.status === "success" ? "ok" : (entry.status || "ok"),
           stringifyJson(tokens), stringifyJson(entry.meta || {}), session,
         ]
       );

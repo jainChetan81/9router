@@ -111,6 +111,31 @@ async function resolveTargetModel(target, depth = 0) {
   }
 
   const slash = model.indexOf("/");
+  if (slash < 0) {
+    const [customModels, connections] = await Promise.all([getCustomModels(), getProviderConnections()]);
+    const matches = [];
+    for (const [prefix, entries] of Object.entries(PROVIDER_MODELS)) {
+      if ((entries || []).some((entry) => entry?.id === model && isChatModel(entry))) {
+        const info = targetProviderInfo(prefix);
+        matches.push({ model: `${prefix}/${model}`, modelId: model, provider: info.id });
+      }
+    }
+    for (const entry of customModels || []) {
+      if (entry?.id === model && isChatModel(entry) && entry.providerAlias) {
+        const info = targetProviderInfo(entry.providerAlias);
+        matches.push({ model: `${entry.providerAlias}/${model}`, modelId: model, provider: info.id });
+      }
+    }
+    for (const connection of connections || []) {
+      if (connection?.isActive === false || !connection?.provider) continue;
+      if (connection.providerSpecificData?.enabledModels?.includes(model)) {
+        const info = targetProviderInfo(connection.provider);
+        matches.push({ model: `${connection.provider}/${model}`, modelId: model, provider: info.id });
+      }
+    }
+    const unique = [...new Map(matches.map((entry) => [`${entry.provider}/${entry.modelId}`, entry])).values()];
+    return unique.length === 1 ? { exists: true, ...unique[0], combo: null, fusion: false } : null;
+  }
   if (slash <= 0 || slash === model.length - 1) return null;
   const prefix = model.slice(0, slash);
   const modelId = model.slice(slash + 1);
@@ -142,7 +167,16 @@ async function getSessionContext(session) {
   const db = await getAdapter();
   const detail = await getSessionDetail(db, session);
   if (!detail.firstTs) return null;
-  return { isCodex: detail.client === "Codex" };
+  const currentModels = Object.fromEntries((detail.agents || []).map((agent) => [
+    agent.role,
+    agent.requests?.at(-1)?.model || null,
+  ]));
+  return { isCodex: detail.client === "Codex", currentModels };
+}
+
+function callerIp(request) {
+  const forwarded = String(request.headers.get("x-forwarded-for") || "").split(",")[0].trim();
+  return /^[0-9a-fA-F.:]{2,45}$/.test(forwarded) ? forwarded : "local";
 }
 
 async function getWritableCombo(name) {
@@ -202,6 +236,13 @@ export async function PUT(request, context) {
     if (comboResult.error) return jsonError(comboResult.error, comboResult.status);
     if (!sessionContext) return jsonError("Session not found", 404);
 
+    if (Object.hasOwn(body, "expectedCurrent")) {
+      const current = sessionContext.currentModels[comboName] ?? null;
+      if (body.expectedCurrent !== current) {
+        return NextResponse.json({ error: "Current model changed", currentModel: current }, { status: 409 });
+      }
+    }
+
     const resolved = await resolveTargetModel(body.model);
     if (!resolved) return jsonError("Model not found", 404);
     if (resolved.fusion) return jsonError("Fusion combo cannot be used as a target", 400);
@@ -231,6 +272,7 @@ export async function PUT(request, context) {
       resolvedModel: resolved.modelId,
       comboMembers,
       actor: "dashboard",
+      ip: callerIp(request),
     });
     const { auditWarning, ...publicOverride } = override;
     return NextResponse.json({
@@ -264,7 +306,7 @@ export async function DELETE(request, context) {
     const sessionContext = await getSessionContext(session);
     if (!sessionContext) return jsonError("Session not found", 404);
     await loadOverrides();
-    const result = await deleteOverride(session, combo, revision, { actor: "dashboard" });
+    const result = await deleteOverride(session, combo, revision, { actor: "dashboard", ip: callerIp(request) });
     return NextResponse.json(result, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     if (error instanceof OverrideValidationError) return jsonError(error.message, 400);

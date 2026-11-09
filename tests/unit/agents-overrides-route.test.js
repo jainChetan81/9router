@@ -67,6 +67,13 @@ describe("agents session overrides route", () => {
     expect(saved.status).toBe(200);
     expect((await saved.json()).override).toMatchObject({ revision: 1, status: "pending" });
 
+    const staleCurrent = await handlers.PUT(request("http://localhost/api/agents/sessions/abcdef123456/overrides", "PUT", {
+      combo: "assistant", mode: "override", model: "openai/gpt-4o-mini", fallback: false,
+      expiry: "1h", revision: 1, expectedCurrent: "openai/stale-model",
+    }), context);
+    expect(staleCurrent.status).toBe(409);
+    expect(await staleCurrent.json()).toMatchObject({ error: "Current model changed", currentModel: "gpt-4o-mini" });
+
     const listed = await handlers.GET(new Request("http://localhost/api/agents/sessions/abcdef123456/overrides"), context);
     expect((await listed.json()).overrides).toHaveLength(1);
 
