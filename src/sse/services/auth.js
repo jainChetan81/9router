@@ -1,13 +1,51 @@
-import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, getProxyPools } from "@/lib/localDb";
+import crypto from "node:crypto";
+import {
+  getProviderConnections, validateApiKey, updateProviderConnection, getSettings, getProxyPools,
+  setOpenCodeGoPaidQuotaLockIfCredentialFingerprint, observeOpenCodeGoPaidQuotaLockIfGeneration,
+  updateOpenCodeGoPaidQuotaLockIfGeneration,
+  clearOpenCodeGoPaidQuotaLockIfGeneration,
+} from "@/lib/localDb";
+import { getOpenCodeGoCredentialFingerprint } from "@/lib/db/credentialFingerprint.js";
 import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/connectionProxy";
-import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
-import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
+import {
+  formatRetryAfter, checkFallbackError, buildModelLockUpdate,
+  getConnectionModelAvailability, OPENCODE_GO_PAID_QUOTA_LOCK,
+} from "open-sse/services/accountFallback.js";
+import {
+  MAX_RATE_LIMIT_COOLDOWN_MS, OPENCODE_GO_QUOTA_RECHECK_MS,
+  OPENCODE_GO_PROBE_LEASE_MS, OPENCODE_GO_QUOTA_LIMIT_NAMES, TRANSIENT_COOLDOWN_MS,
+} from "open-sse/config/errorConfig.js";
+import { getModelQuotaScope } from "open-sse/config/providerModels.js";
+import { getOpenCodeGoUsage } from "open-sse/services/usage/opencode-go.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import { getAntigravityQuotaCache, getAntigravityModelQuota } from "./antigravityQuota.js";
 import * as log from "../utils/logger.js";
 
 // Mutex to prevent race conditions during account selection
 let selectionMutex = Promise.resolve();
+const quotaProbeLeases = new Map();
+
+function setLatestBlocker(blockers, connectionId, retryAt) {
+  const retryAtMs = new Date(retryAt).getTime();
+  if (!Number.isFinite(retryAtMs)) return;
+  const previousMs = new Date(blockers.get(connectionId) || 0).getTime();
+  if (!Number.isFinite(previousMs) || retryAtMs > previousMs) {
+    blockers.set(connectionId, new Date(retryAtMs).toISOString());
+  }
+}
+
+function hasOpenCodeGoPaidQuotaLock(connection) {
+  return !!connection?.[OPENCODE_GO_PAID_QUOTA_LOCK];
+}
+
+function ownsOpenCodeGoQuotaProbeLease(connectionId, probe) {
+  const lease = quotaProbeLeases.get(connectionId);
+  return !!probe?.token
+    && !!probe?.generation
+    && lease?.token === probe.token
+    && lease.generation === probe?.generation
+    && lease.expiresAt > Date.now();
+}
 
 const GITHUB_MONTHLY_USAGE_LIMIT = "you've reached your additional usage limit for your plan";
 
@@ -32,6 +70,10 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     : (excludeConnectionIds ? new Set([excludeConnectionIds]) : new Set());
   const preferredConnectionId = options?.preferredConnectionId || null;
   const requestedModel = options?.requestedModel || model;
+  const allowQuotaProbe = options?.allowQuotaProbe === true;
+  const quotaProbeCandidates = new Map();
+  let selectedProbe = null;
+  let selectionReturned = false;
   // Acquire mutex to prevent race conditions
   const currentMutex = selectionMutex;
   let resolveMutex;
@@ -82,52 +124,73 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     // Antigravity quota cache is lazy: only populated after that account returns 409/429.
     const isAntigravity = providerId === "antigravity";
     const antigravityQuotaCache = isAntigravity && model ? getAntigravityQuotaCache() : null;
-
-    // Filter out model-locked, excluded, and Antigravity quota-exhausted connections.
-    const availableConnections = connections.filter(c => {
+    const isOpenCodeGo = providerId === "opencode-go";
+    const quotaScope = isOpenCodeGo ? getModelQuotaScope("opencode-go", model) : null;
+    const now = Date.now();
+    for (const [connectionId, lease] of quotaProbeLeases) {
+      if (lease.expiresAt <= now) quotaProbeLeases.delete(connectionId);
+    }
+    const eligibleConnections = connections.filter((c) => {
+      if (c.isActive === false) return false;
       if (excludeSet.has(c.id)) return false;
-      if (isModelLockActive(c, model)) return false;
       const enabled = c.providerSpecificData?.enabledModels;
-      if (providerId === "codex" && Array.isArray(enabled) && enabled.length && requestedModel && !enabled.includes(requestedModel)) return false;
-      // Antigravity: skip if live quota exhausted for this model
+      return !(providerId === "codex" && Array.isArray(enabled) && enabled.length && requestedModel && !enabled.includes(requestedModel));
+    });
+    const blockers = new Map();
+    const availableConnections = [];
+
+    for (const c of eligibleConnections) {
+      const availability = getConnectionModelAvailability(c, model, { now, quotaScope });
+      if (!availability.available) {
+        setLatestBlocker(blockers, c.id, availability.retryAt);
+        continue;
+      }
+
+      if (isOpenCodeGo && quotaScope === "paid" && hasOpenCodeGoPaidQuotaLock(c)) {
+        const quotaLock = c[OPENCODE_GO_PAID_QUOTA_LOCK];
+        const retryAtMs = new Date(quotaLock.retryAt).getTime();
+        if (!Number.isFinite(retryAtMs) || retryAtMs <= now) {
+          const lease = quotaProbeLeases.get(c.id);
+          if (!allowQuotaProbe) {
+            const deferUntil = lease?.expiresAt > now ? lease.expiresAt : now + OPENCODE_GO_PROBE_LEASE_MS;
+            setLatestBlocker(blockers, c.id, new Date(deferUntil).toISOString());
+            continue;
+          }
+          if (lease && lease.expiresAt > now) {
+            setLatestBlocker(blockers, c.id, Math.max(now + 1, lease.expiresAt));
+            continue;
+          }
+          if (lease) quotaProbeLeases.delete(c.id);
+          quotaProbeCandidates.set(c.id, quotaLock.generation);
+        }
+      }
+
+      // Antigravity: skip if live quota is exhausted for this model.
       if (isAntigravity && model && antigravityQuotaCache) {
         const connQuotas = antigravityQuotaCache.get(c.id);
         const quota = getAntigravityModelQuota(connQuotas, model) || connQuotas?.[model];
-        if (quota && quota.remainingPercentage <= 0 && quota.resetAt && new Date(quota.resetAt).getTime() > Date.now()) {
+        if (quota && quota.remainingPercentage <= 0 && quota.resetAt && new Date(quota.resetAt).getTime() > now) {
           const account = c.id?.slice(0, 8) || "unknown";
           log.info("AG_QUOTA", `${account} | CACHE_BLOCK ${model} — skip upstream until ${quota.resetAt}`);
-          return false;
+          setLatestBlocker(blockers, c.id, quota.resetAt);
+          continue;
         }
       }
-      return true;
-    });
+      availableConnections.push(c);
+    }
 
-    log.debug("AUTH", `${provider} | available: ${availableConnections.length}/${connections.length}`);
-    connections.forEach(c => {
-      const excluded = excludeSet.has(c.id);
-      const locked = isModelLockActive(c, model);
-      if (excluded || locked) {
-        const lockUntil = getEarliestModelLockUntil(c);
-        log.debug("AUTH", `  → ${c.id?.slice(0, 8)} | ${excluded ? "excluded" : ""} ${locked ? `modelLocked(${model}) until ${lockUntil}` : ""}`);
-      }
-    });
+    log.debug("AUTH", `${provider} | available: ${availableConnections.length}/${eligibleConnections.length}`);
 
     if (availableConnections.length === 0) {
-      // Find earliest persistent lock or lazy Antigravity quota-cache reset for retry timing.
-      const lockedConns = connections.filter(c => isModelLockActive(c, model));
-      const expiries = lockedConns.map(c => getEarliestModelLockUntil(c)).filter(Boolean);
-      if (isAntigravity && model && antigravityQuotaCache) {
-        connections.forEach((c) => {
-          const connQuotas = antigravityQuotaCache.get(c.id);
-          const quota = getAntigravityModelQuota(connQuotas, model) || connQuotas?.[model];
-          const resetAt = quota?.resetAt;
-          if (resetAt && new Date(resetAt).getTime() > Date.now()) expiries.push(resetAt);
-        });
-      }
-      const earliest = expiries.sort()[0] || null;
+      const retryTimes = [...blockers.values()].map((value) => new Date(value).getTime()).filter(Number.isFinite);
+      const allEligibleBlocked = eligibleConnections.length > 0 && blockers.size === eligibleConnections.length;
+      const earliest = allEligibleBlocked && retryTimes.length
+        ? new Date(Math.min(...retryTimes)).toISOString()
+        : null;
       if (earliest) {
-        const earliestConn = lockedConns[0];
-        log.warn("AUTH", `${provider} | all ${connections.length} accounts locked for ${model || "all"} (${formatRetryAfter(earliest)}) | lastError=${earliestConn?.lastError?.slice(0, 50)}`);
+        const earliestConn = eligibleConnections.find((c) => blockers.get(c.id) === earliest)
+          || eligibleConnections.find((c) => blockers.has(c.id));
+        log.warn("AUTH", `${provider} | all ${eligibleConnections.length} eligible accounts locked for ${model || "all"} (${formatRetryAfter(earliest)}) | lastError=${earliestConn?.lastError?.slice(0, 50)}`);
         return {
           allRateLimited: true,
           retryAfter: earliest,
@@ -136,7 +199,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
           lastErrorCode: earliestConn?.errorCode || null
         };
       }
-      log.warn("AUTH", `${provider} | all ${connections.length} accounts unavailable`);
+      log.warn("AUTH", `${provider} | all ${eligibleConnections.length} eligible accounts unavailable`);
       return null;
     }
 
@@ -199,9 +262,16 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       connection = availableConnections[0];
     }
 
+    const probeGeneration = quotaProbeCandidates.get(connection.id);
+    if (probeGeneration) {
+      const probe = { generation: probeGeneration, token: crypto.randomUUID() };
+      quotaProbeLeases.set(connection.id, { ...probe, expiresAt: Date.now() + OPENCODE_GO_PROBE_LEASE_MS });
+      selectedProbe = { connectionId: connection.id, probe };
+    }
+
     const resolvedProxy = await resolveConnectionProxyConfig(connection.providerSpecificData || {});
 
-    return {
+    const credentialResult = {
       authType: connection.authType,
       apiKey: connection.apiKey,
       accessToken: connection.accessToken,
@@ -227,28 +297,163 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       testStatus: connection.testStatus,
       lastError: connection.lastError,
       // Pass full connection for clearAccountError to read modelLock_* keys
-      _connection: connection
+      _connection: connection,
+      ...(selectedProbe?.connectionId === connection.id
+        ? { quotaProbe: selectedProbe.probe }
+        : {}),
+      ...(isOpenCodeGo
+        ? { quotaCredentialFingerprint: getOpenCodeGoCredentialFingerprint(connection) }
+        : {}),
     };
+    selectionReturned = true;
+    return credentialResult;
   } finally {
+    if (!selectionReturned) {
+      const lease = selectedProbe && quotaProbeLeases.get(selectedProbe.connectionId);
+      if (selectedProbe && lease?.token === selectedProbe.probe.token) {
+        quotaProbeLeases.delete(selectedProbe.connectionId);
+      }
+    }
     if (resolveMutex) resolveMutex();
   }
 }
 
+function resolveGoUsageResetAt(usage, limitName, now) {
+  const quotas = usage?.quotas;
+  if (!quotas || typeof quotas !== "object") return null;
+
+  let candidates = [];
+  const normalizedLimit = typeof limitName === "string" ? limitName.toLowerCase() : "";
+  if (normalizedLimit) {
+    const matchingName = Object.keys(quotas).find((name) => name.toLowerCase() === normalizedLimit);
+    if (matchingName) candidates = [quotas[matchingName]];
+  } else {
+    candidates = Object.values(quotas).filter((item) => Number(item?.used) >= 100);
+  }
+
+  for (const quota of candidates) {
+    const resetAtMs = quota?.resetAt ? new Date(quota.resetAt).getTime() : NaN;
+    if (Number.isFinite(resetAtMs) && resetAtMs > now) return new Date(resetAtMs).toISOString();
+  }
+  return null;
+}
+
+async function upgradeOpenCodeGoQuotaLockFromUsage(connection, lock, quotaFailure) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  try {
+    let usage = null;
+    if (typeof connection.apiKey === "string" && connection.apiKey.trim()) {
+      const proxyOptions = await resolveConnectionProxyConfig(connection.providerSpecificData || {});
+      usage = await getOpenCodeGoUsage(connection.apiKey, proxyOptions, { signal: controller.signal });
+    }
+    const now = Date.now();
+    const resetAt = resolveGoUsageResetAt(usage, lock.limitName, now)
+      || (Number.isFinite(quotaFailure?.resetAtMs) && quotaFailure.resetAtMs > now
+        ? new Date(quotaFailure.resetAtMs).toISOString()
+        : null);
+    if (!resetAt) return;
+    await updateOpenCodeGoPaidQuotaLockIfGeneration(connection.id, lock.generation, {
+      retryAt: resetAt,
+      resetAt,
+    });
+  } catch {
+    // The six-hour lock remains the safe fallback when usage lookup fails.
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/** Complete one request-driven paid quota probe using its observed generation. */
+export async function completeOpenCodeGoQuotaProbe(connectionId, probe, outcome) {
+  if (!connectionId || !probe?.generation || !probe?.token) return { updated: false, connection: null };
+  const ownsLease = ownsOpenCodeGoQuotaProbeLease(connectionId, probe);
+  let result = { updated: false, connection: null };
+  try {
+    if (outcome === "success" && ownsLease) {
+      result = await clearOpenCodeGoPaidQuotaLockIfGeneration(connectionId, probe.generation);
+    } else if (outcome === "inconclusive" && ownsLease) {
+      result = await updateOpenCodeGoPaidQuotaLockIfGeneration(connectionId, probe.generation, {
+        retryAt: new Date(Date.now() + TRANSIENT_COOLDOWN_MS).toISOString(),
+      });
+    }
+  } catch {
+    result = { updated: false, connection: null };
+  } finally {
+    const lease = quotaProbeLeases.get(connectionId);
+    if (lease?.token === probe.token) quotaProbeLeases.delete(connectionId);
+  }
+  return result;
+}
+
 /**
- * Mark account+model as unavailable — locks modelLock_${model} in DB.
- * All errors (429, 401, 5xx, etc.) lock per model, not per account.
+ * Mark an account unavailable. Typed OpenCode Go exhaustion uses its paid quota field;
+ * other errors keep the existing modelLock_${model} behavior.
  * @param {string} connectionId
  * @param {number} status - HTTP status code from upstream
  * @param {string} errorText
  * @param {string|null} provider
  * @param {string|null} model - The specific model that triggered the error
- * @returns {{ shouldFallback: boolean, cooldownMs: number }}
+ * @param {object|null} quotaFailure - Optional typed executor classification
+ * @param {object|null} quotaProbe - Optional generation identity for a paid probe
+ * @param {string|null} quotaCredentialFingerprint - Opaque API-key fingerprint captured at selection
+ * @returns {{ shouldFallback: boolean, cooldownMs: number, quotaLock?: object }}
  */
-export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, resetsAtMs = null) {
+export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, resetsAtMs = null, quotaFailure = null, quotaProbe = null, quotaCredentialFingerprint = null) {
   if (!connectionId || connectionId === "noauth") return { shouldFallback: false, cooldownMs: 0 };
-  const connections = await getProviderConnections({ provider });
+  const providerId = resolveProviderId(provider);
+  const connections = await getProviderConnections({ provider: providerId });
   const conn = connections.find(c => c.id === connectionId);
   const backoffLevel = conn?.backoffLevel || 0;
+
+  if (Number(status) === 429 && quotaFailure?.kind === "opencode-go-paid"
+    && providerId === "opencode-go" && getModelQuotaScope("opencode-go", model) === "paid") {
+    const now = Date.now();
+    const normalizedLimitName = typeof quotaFailure.limitName === "string"
+      ? quotaFailure.limitName.trim().toLowerCase()
+      : "";
+    const limitName = OPENCODE_GO_QUOTA_LIMIT_NAMES.includes(normalizedLimitName)
+      ? normalizedLimitName
+      : null;
+    const lock = {
+      version: 1,
+      reason: "GoUsageLimitError",
+      limitName,
+      observedAt: new Date(now).toISOString(),
+      retryAt: new Date(now + OPENCODE_GO_QUOTA_RECHECK_MS).toISOString(),
+      resetAt: null,
+      generation: crypto.randomUUID(),
+    };
+    // Typed quota errors store a fixed message: upstream free text must never reach persisted state.
+    const reason = limitName ? `Go usage limit exceeded (${limitName})` : "Go usage limit exceeded";
+    const healthPatch = {
+      testStatus: "unavailable",
+      lastError: reason,
+      errorCode: Number(status),
+      lastErrorAt: lock.observedAt,
+      backoffLevel: 0,
+    };
+    let observation = quotaProbe?.generation && ownsOpenCodeGoQuotaProbeLease(connectionId, quotaProbe)
+      ? await observeOpenCodeGoPaidQuotaLockIfGeneration(connectionId, quotaProbe.generation, lock, healthPatch)
+      : { updated: false, connection: null };
+    if (!observation?.updated && quotaCredentialFingerprint) {
+      observation = await setOpenCodeGoPaidQuotaLockIfCredentialFingerprint(
+        connectionId, quotaCredentialFingerprint, lock, healthPatch,
+      );
+    }
+    if (!observation?.updated) {
+      return { shouldFallback: true, cooldownMs: OPENCODE_GO_QUOTA_RECHECK_MS };
+    }
+    if (conn) void upgradeOpenCodeGoQuotaLockFromUsage(conn, lock, quotaFailure);
+    const connName = conn?.displayName || conn?.name || conn?.email || connectionId.slice(0, 8);
+    log.warn("AUTH", `${connName} locked ${OPENCODE_GO_PAID_QUOTA_LOCK} for ${Math.round(OPENCODE_GO_QUOTA_RECHECK_MS / 1000)}s [${status}]`);
+    return { shouldFallback: true, cooldownMs: OPENCODE_GO_QUOTA_RECHECK_MS, quotaLock: lock };
+  }
+
+  if (Number(status) === 429 && quotaFailure?.kind === "opencode-go-paid"
+    && providerId === "opencode-go" && getModelQuotaScope("opencode-go", model) === "free") {
+    log.warn("GO_QUOTA", `Typed Go quota failure came from free model ${model}; applying model backoff only`);
+  }
 
   // GitHub premium-request exhaustion is account-wide until the next UTC month.
   const githubResetAtMs = githubMonthlyResetMs(status, errorText, provider);
@@ -267,7 +472,7 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
       : Math.min(resetsAtMs - Date.now(), MAX_RATE_LIMIT_COOLDOWN_MS);
     newBackoffLevel = 0;
   } else {
-    ({ shouldFallback, cooldownMs, newBackoffLevel } = checkFallbackError(status, errorText, backoffLevel, resolveProviderId(provider)));
+    ({ shouldFallback, cooldownMs, newBackoffLevel } = checkFallbackError(status, errorText, backoffLevel, providerId));
   }
   if (!shouldFallback) return { shouldFallback: false, cooldownMs: 0 };
 
@@ -298,7 +503,7 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
  * Clear account error status on successful request.
  * - Clears modelLock_${model} (the model that just succeeded)
  * - Lazy-cleans any other expired modelLock_* keys
- * - Resets error state only if no active locks remain
+ * - Resets error state only if no model or paid quota lock remains
  * @param {string} connectionId
  * @param {object} currentConnection - credentials object (has _connection) or raw connection
  * @param {string|null} model - model that succeeded
@@ -308,8 +513,9 @@ export async function clearAccountError(connectionId, currentConnection, model =
   const conn = currentConnection._connection || currentConnection;
   const now = Date.now();
   const allLockKeys = Object.keys(conn).filter(k => k.startsWith("modelLock_"));
+  const hasQuotaLock = hasOpenCodeGoPaidQuotaLock(conn);
 
-  if (!conn.testStatus && !conn.lastError && allLockKeys.length === 0) return;
+  if (!conn.testStatus && !conn.lastError && allLockKeys.length === 0 && !hasQuotaLock) return;
 
   // Keys to clear: current model's lock + all expired locks
   const keysToClear = allLockKeys.filter(k => {
@@ -331,7 +537,7 @@ export async function clearAccountError(connectionId, currentConnection, model =
   const clearObj = Object.fromEntries(keysToClear.map(k => [k, null]));
 
   // Only reset error state if no active locks remain
-  if (remainingActiveLocks.length === 0) {
+  if (remainingActiveLocks.length === 0 && !hasQuotaLock) {
     Object.assign(clearObj, {
       testStatus: "active",
       lastError: null,

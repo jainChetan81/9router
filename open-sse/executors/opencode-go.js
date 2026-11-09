@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { DefaultExecutor } from "./default.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
+import { OPENCODE_GO_QUOTA_LIMIT_NAMES } from "../config/errorConfig.js";
 import { getModelTargetFormat } from "../config/providerModels.js";
 import { FORMATS } from "../translator/formats.js";
 import {
@@ -113,6 +114,44 @@ function sanitizeResponsesItems(body) {
 export class OpenCodeGoExecutor extends DefaultExecutor {
   constructor() {
     super("opencode-go");
+  }
+
+  parseError(response, bodyText) {
+    let body;
+    try {
+      body = JSON.parse(bodyText);
+    } catch {
+      return super.parseError(response, bodyText);
+    }
+
+    if (response?.status !== 429 || body?.error?.type !== "GoUsageLimitError") {
+      return super.parseError(response, bodyText);
+    }
+
+    const normalizedLimitName = typeof body.metadata?.limitName === "string"
+      ? body.metadata.limitName.trim().toLowerCase()
+      : "";
+    const limitName = OPENCODE_GO_QUOTA_LIMIT_NAMES.includes(normalizedLimitName)
+      ? normalizedLimitName
+      : null;
+    const resetAt = body.metadata?.resetAt ?? body.metadata?.reset_at;
+    const resetAtMs = typeof resetAt === "number"
+      ? resetAt
+      : typeof resetAt === "string"
+        ? Date.parse(resetAt)
+        : NaN;
+    const quotaFailure = {
+      kind: "opencode-go-paid",
+      limitName,
+      ...(Number.isFinite(resetAtMs) && resetAtMs > Date.now() ? { resetAtMs } : {}),
+    };
+
+    return {
+      status: response.status,
+      // Fixed text: upstream free text must not reach logs, request details, or clients.
+      message: limitName ? `Go usage limit exceeded (${limitName})` : "Go usage limit exceeded",
+      quotaFailure,
+    };
   }
 
   buildUrl(model, stream, urlIndex = 0, credentials = null) {

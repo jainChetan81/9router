@@ -1,6 +1,7 @@
 import { v4 as uuidv4 } from "uuid";
 import { getAdapter } from "../driver.js";
 import { parseJson, stringifyJson } from "../helpers/jsonCol.js";
+import { getOpenCodeGoCredentialFingerprint } from "../credentialFingerprint.js";
 
 const OPTIONAL_FIELDS = [
   "displayName", "email", "globalPriority", "defaultModel",
@@ -11,12 +12,20 @@ const OPTIONAL_FIELDS = [
 ];
 
 const MODEL_LOCK_PREFIX = "modelLock_";
+const OPENCODE_GO_PAID_QUOTA_LOCK = "quotaLock_opencodeGoPaid";
 
 function resetHealthStateOnActivation(existing, patch) {
-  if (patch?.testStatus !== "active") return patch;
+  const normalizedPatch = { ...patch };
+  if (existing?.provider === "opencode-go"
+    && typeof patch?.apiKey === "string"
+    && patch.apiKey.trim()
+    && patch.apiKey !== existing.apiKey) {
+    normalizedPatch[OPENCODE_GO_PAID_QUOTA_LOCK] = null;
+  }
+  if (patch?.testStatus !== "active") return normalizedPatch;
 
   const normalized = {
-    ...patch,
+    ...normalizedPatch,
     testStatus: "active",
     lastError: Object.hasOwn(patch, "lastError") ? patch.lastError : null,
     lastErrorAt: Object.hasOwn(patch, "lastErrorAt") ? patch.lastErrorAt : null,
@@ -272,6 +281,88 @@ export async function updateProviderConnection(id, data) {
     upsert(db, merged);
     if (data.priority !== undefined) reorderInTx(db, existing.provider);
     result = merged;
+  });
+  return result;
+}
+
+/** Persist a quota observation only if the request used the current API key. */
+export async function setOpenCodeGoPaidQuotaLockIfCredentialFingerprint(id, fingerprint, lock, healthPatch = {}) {
+  const db = await getAdapter();
+  let result = { updated: false, connection: null };
+  db.transaction(() => {
+    const row = db.get(`SELECT * FROM providerConnections WHERE id = ?`, [id]);
+    if (!row) return;
+    const existing = rowToConn(row);
+    if (getOpenCodeGoCredentialFingerprint(existing) !== fingerprint) return;
+    const connection = {
+      ...existing,
+      ...healthPatch,
+      [OPENCODE_GO_PAID_QUOTA_LOCK]: lock,
+      updatedAt: new Date().toISOString(),
+    };
+    upsert(db, connection);
+    result = { updated: true, connection };
+  });
+  return result;
+}
+
+/** Replace a quota observation only while the probe's generation is current. */
+export async function observeOpenCodeGoPaidQuotaLockIfGeneration(id, generation, lock, healthPatch = {}) {
+  const db = await getAdapter();
+  let result = { updated: false, connection: null };
+  db.transaction(() => {
+    const row = db.get(`SELECT * FROM providerConnections WHERE id = ?`, [id]);
+    if (!row) return;
+    const existing = rowToConn(row);
+    const currentLock = existing[OPENCODE_GO_PAID_QUOTA_LOCK];
+    if (!currentLock || currentLock.generation !== generation) return;
+    const connection = {
+      ...existing,
+      ...healthPatch,
+      [OPENCODE_GO_PAID_QUOTA_LOCK]: lock,
+      updatedAt: new Date().toISOString(),
+    };
+    upsert(db, connection);
+    result = { updated: true, connection };
+  });
+  return result;
+}
+
+/** Update a quota lock only while the observation generation still matches. */
+export async function updateOpenCodeGoPaidQuotaLockIfGeneration(id, generation, patch) {
+  const db = await getAdapter();
+  let result = { updated: false, connection: null };
+  db.transaction(() => {
+    const row = db.get(`SELECT * FROM providerConnections WHERE id = ?`, [id]);
+    if (!row) return;
+    const existing = rowToConn(row);
+    const lock = existing[OPENCODE_GO_PAID_QUOTA_LOCK];
+    if (!lock || lock.generation !== generation) return;
+    const connection = {
+      ...existing,
+      [OPENCODE_GO_PAID_QUOTA_LOCK]: { ...lock, ...patch },
+      updatedAt: new Date().toISOString(),
+    };
+    upsert(db, connection);
+    result = { updated: true, connection };
+  });
+  return result;
+}
+
+/** Clear a quota lock only when the successful probe observed its generation. */
+export async function clearOpenCodeGoPaidQuotaLockIfGeneration(id, generation) {
+  const db = await getAdapter();
+  let result = { updated: false, connection: null };
+  db.transaction(() => {
+    const row = db.get(`SELECT * FROM providerConnections WHERE id = ?`, [id]);
+    if (!row) return;
+    const connection = rowToConn(row);
+    const lock = connection[OPENCODE_GO_PAID_QUOTA_LOCK];
+    if (!lock || lock.generation !== generation) return;
+    delete connection[OPENCODE_GO_PAID_QUOTA_LOCK];
+    connection.updatedAt = new Date().toISOString();
+    upsert(db, connection);
+    result = { updated: true, connection };
   });
   return result;
 }

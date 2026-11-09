@@ -4,6 +4,7 @@ import {
   getProviderCredentials,
   markAccountUnavailable,
   clearAccountError,
+  completeOpenCodeGoQuotaProbe,
   extractApiKey,
   isValidApiKey,
 } from "../services/auth.js";
@@ -288,7 +289,10 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   let lastHeaders = null;
 
   while (true) {
-    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { requestedModel: requestedModel || model });
+    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, {
+      requestedModel: requestedModel || model,
+      allowQuotaProbe: true,
+    });
 
     // All accounts unavailable
     if (!credentials || credentials.allRateLimited) {
@@ -306,6 +310,8 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       return errorResponse(lastStatus || HTTP_STATUS.SERVICE_UNAVAILABLE, lastError || "All accounts unavailable", lastHeaders);
     }
 
+    let quotaProbeFinalized = false;
+    try {
     // Account selection shown in the unified "▶" line (acc:...)
     const refreshedCredentials = await checkAndRefreshToken(provider, credentials);
 
@@ -369,7 +375,16 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       }
     });
 
-    if (result.success) return result.response;
+    if (result.success) {
+      if (credentials.quotaProbe) {
+        const completion = await completeOpenCodeGoQuotaProbe(credentials.connectionId, credentials.quotaProbe, "success");
+        quotaProbeFinalized = true;
+        if (completion.updated) {
+          await clearAccountError(credentials.connectionId, { _connection: completion.connection }, model);
+        }
+      }
+      return result.response;
+    }
 
     // Antigravity 409/429: refresh live quota to get exact resetAt before locking
     let quotaResetMs = null;
@@ -384,9 +399,19 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
     // Exhausted Antigravity model is blocked only in RAM cache until upstream resetAt.
     // Do not persist a modelLock_* for this path.
-    const shouldFallback = provider === "antigravity" && quotaResetMs
+    const markResult = provider === "antigravity" && quotaResetMs
       ? true
-      : (await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model, resetsAtMs)).shouldFallback;
+      : await markAccountUnavailable(
+          credentials.connectionId, result.status, result.error, provider, model,
+          resetsAtMs, result.quotaFailure, credentials.quotaProbe, credentials.quotaCredentialFingerprint,
+        );
+    const shouldFallback = markResult === true || markResult.shouldFallback;
+
+    if (credentials.quotaProbe) {
+      const outcome = result.quotaFailure?.kind === "opencode-go-paid" ? "quota-error" : "inconclusive";
+      await completeOpenCodeGoQuotaProbe(credentials.connectionId, credentials.quotaProbe, outcome);
+      quotaProbeFinalized = true;
+    }
 
     if (shouldFallback) {
       log.warn("FALLBACK", `⇄ ACC:${credentials.connectionName} UNAVAILABLE (${result.status}) → NEXT ACCOUNT`);
@@ -398,5 +423,10 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     }
 
     return result.response;
+    } finally {
+      if (credentials.quotaProbe && !quotaProbeFinalized) {
+        await completeOpenCodeGoQuotaProbe(credentials.connectionId, credentials.quotaProbe, "inconclusive");
+      }
+    }
   }
 }

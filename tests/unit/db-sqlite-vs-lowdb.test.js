@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
+import { getOpenCodeGoCredentialFingerprint } from "@/lib/db/credentialFingerprint.js";
 
 const originalDataDir = process.env.DATA_DIR;
 let tempDir;
@@ -131,6 +132,84 @@ describe("DB SQLite layer — public API parity", () => {
       rateLimitedUntil: null,
       modelLock_modelA: null,
       modelLock_modelB: null,
+    });
+  });
+
+  it("providerConnections: paid Go quota locks persist and use generation CAS", async () => {
+    const c = await sqliteDb.createProviderConnection({
+      provider: "opencode-go",
+      authType: "apikey",
+      name: "quota-lock-cas",
+      apiKey: "test-key",
+    });
+    const lock = {
+      version: 1,
+      reason: "GoUsageLimitError",
+      limitName: "weekly",
+      observedAt: "2026-11-08T00:00:00.000Z",
+      retryAt: "2026-11-09T00:00:00.000Z",
+      resetAt: null,
+      generation: "quota-generation-1",
+    };
+
+    await sqliteDb.setOpenCodeGoPaidQuotaLockIfCredentialFingerprint(
+      c.id, getOpenCodeGoCredentialFingerprint(c), lock, { testStatus: "unavailable" },
+    );
+    await sqliteDb.updateProviderConnection(c.id, { testStatus: "active" });
+    expect(await sqliteDb.getProviderConnectionById(c.id)).toMatchObject({
+      testStatus: "active",
+      quotaLock_opencodeGoPaid: lock,
+    });
+
+    const renewedLock = { ...lock, generation: "quota-generation-2" };
+    await expect(sqliteDb.observeOpenCodeGoPaidQuotaLockIfGeneration(c.id, "stale", renewedLock))
+      .resolves.toMatchObject({ updated: false });
+    await expect(sqliteDb.observeOpenCodeGoPaidQuotaLockIfGeneration(c.id, lock.generation, renewedLock))
+      .resolves.toMatchObject({ updated: true });
+
+    await expect(sqliteDb.updateOpenCodeGoPaidQuotaLockIfGeneration(c.id, "stale", {
+      retryAt: "2026-11-10T00:00:00.000Z",
+    })).resolves.toMatchObject({ updated: false });
+    await expect(sqliteDb.updateOpenCodeGoPaidQuotaLockIfGeneration(c.id, renewedLock.generation, {
+      retryAt: "2026-11-10T00:00:00.000Z",
+    })).resolves.toMatchObject({ updated: true });
+    await expect(sqliteDb.clearOpenCodeGoPaidQuotaLockIfGeneration(c.id, "stale"))
+      .resolves.toMatchObject({ updated: false });
+    await expect(sqliteDb.clearOpenCodeGoPaidQuotaLockIfGeneration(c.id, renewedLock.generation))
+      .resolves.toMatchObject({ updated: true });
+    expect(await sqliteDb.getProviderConnectionById(c.id)).not.toHaveProperty("quotaLock_opencodeGoPaid");
+  });
+
+  it("providerConnections: replacing a Go API key clears its paid quota lock", async () => {
+    const c = await sqliteDb.createProviderConnection({
+      provider: "opencode-go",
+      authType: "apikey",
+      name: "quota-lock-key-replacement",
+      apiKey: "old-key",
+    });
+    const lock = {
+      version: 1,
+      reason: "GoUsageLimitError",
+      limitName: "weekly",
+      observedAt: "2026-11-08T00:00:00.000Z",
+      retryAt: "2026-11-09T00:00:00.000Z",
+      resetAt: null,
+      generation: "old-key-generation",
+    };
+    const dispatchedCredentialFingerprint = getOpenCodeGoCredentialFingerprint(c);
+    await sqliteDb.setOpenCodeGoPaidQuotaLockIfCredentialFingerprint(
+      c.id, dispatchedCredentialFingerprint, lock,
+    );
+
+    await sqliteDb.updateProviderConnection(c.id, { apiKey: "new-key" });
+    await expect(sqliteDb.setOpenCodeGoPaidQuotaLockIfCredentialFingerprint(
+      c.id,
+      dispatchedCredentialFingerprint,
+      { ...lock, generation: "stale-observation-generation" },
+    )).resolves.toMatchObject({ updated: false });
+    expect(await sqliteDb.getProviderConnectionById(c.id)).toMatchObject({
+      apiKey: "new-key",
+      quotaLock_opencodeGoPaid: null,
     });
   });
 

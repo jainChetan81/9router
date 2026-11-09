@@ -38,6 +38,12 @@ export const BACKOFF_CONFIG = {
 // Default cooldown for transient/unknown errors
 export const TRANSIENT_COOLDOWN_MS = 30 * 1000;
 
+// OpenCode Go paid quota exhaustion is account-scoped. Recheck after six hours
+// when the provider's usage API does not expose an authoritative reset time.
+export const OPENCODE_GO_QUOTA_RECHECK_MS = 6 * 60 * 60 * 1000;
+export const OPENCODE_GO_PROBE_LEASE_MS = 2 * 60 * 1000;
+export const OPENCODE_GO_QUOTA_LIMIT_NAMES = Object.freeze(["rolling", "weekly", "monthly"]);
+
 // Hard cap for provider-reported rate limit cooldown (e.g. codex resets_at can be 5-6h)
 export const MAX_RATE_LIMIT_COOLDOWN_MS = 30 * 60 * 1000;
 
