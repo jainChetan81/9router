@@ -3,6 +3,7 @@ import { getAdapter } from "@/lib/db/driver.js";
 import { getSettings, updateSettings } from "@/lib/localDb";
 import { clientOf } from "@/lib/spendClient.js";
 import { addModelEffortUsage } from "@/lib/spend/modelEffortGroups.js";
+import { PAID, createSpendDrilldown } from "@/lib/spend/drilldown.js";
 
 export const dynamic = "force-dynamic";
 
@@ -19,7 +20,6 @@ const SUBS = [
   { k: "muse", provider: "muse", name: "Muse" },
 ];
 const SUB_OF = Object.fromEntries(SUBS.map((s) => [s.provider, s.k]));
-const PAID = (p) => p === "openrouter" || p === "deepseek";
 const PRESET_DAYS = { "7D": 7, "30D": 30, "60D": 60 };
 const DAYKEY = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -63,7 +63,7 @@ export async function GET(request) {
     const keyNames = new Map(db.all(`SELECT key, name FROM apiKeys`).map((r) => [r.key, r.name]));
     // ponytail: loads every row in range (All = whole history) and aggregates in JS; move the sums to SQL GROUP BY when usageHistory passes ~500k rows.
     const rows = db.all(
-      `SELECT timestamp, provider, model, apiKey, promptTokens, completionTokens, cost, meta FROM usageHistory WHERE timestamp >= ? AND timestamp < ?`,
+      `SELECT timestamp, provider, model, apiKey, promptTokens, completionTokens, cost, meta, tokens FROM usageHistory WHERE timestamp >= ? AND timestamp < ?`,
       [new Date(range.from).toISOString(), new Date(range.to).toISOString()],
     );
 
@@ -84,6 +84,7 @@ export async function GET(request) {
     const subs = Object.fromEntries(SUBS.map((s) => [s.k, 0]));
     let value = 0, real = 0, realEst = 0, list = 0, req = 0, tok = 0, realOr = 0, realDs = 0, nrList = 0, nrReq = 0, nrTok = 0;
     const top = [];
+    const drilldown = createSpendDrilldown();
 
     for (const r of rows) {
       const ms = Date.parse(r.timestamp);
@@ -109,6 +110,7 @@ export async function GET(request) {
       const keyName = keyName0;
       const client = meta.ua !== undefined ? clientOf(meta.ua) : null;
       const role = meta.ua !== undefined ? meta.combo || "main" : null;
+      drilldown.add({ provider: r.provider, model: r.model, tokens: r.tokens, promptTokens: r.promptTokens, completionTokens: r.completionTokens, effort: meta.sentEffort, cost, real: rReal, realEst: est ? rReal : 0, client, role });
       const add = (m, k) => { const o = bump(m, k, () => ({ ...acc(), clients: {}, keys: {}, mix: {}, n: 0, provider: r.provider })); o.v += cost; o.real += rReal; o.req++; o.tok += t; return o; };
       const ko = add(byKey, keyName); if (client) ko.clients[client] = (ko.clients[client] || 0) + cost;
       const mo = add(byModel, r.model || "unknown"); mo.keys[keyName] = (mo.keys[keyName] || 0) + cost; if (client) mo.clients[client] = (mo.clients[client] || 0) + cost;
@@ -154,16 +156,18 @@ export async function GET(request) {
 
     const ds30 = db.get(`SELECT SUM(cost) AS c FROM usageHistory WHERE provider = 'deepseek' AND timestamp >= ?`, [new Date(now - 30 * DAY).toISOString()]);
     const settings = await getSettings();
+    const drilldownData = drilldown.result();
     return NextResponse.json({
       now, range: { ...range, first: bars[0]?.label, last: [...bars].reverse().find((b) => !b.future)?.label, days: range.hourly ? 1 : nB },
       loggedSince, loggedSinceLabel: loggedSince ? fmtDay(loggedSince) : null,
       bars: bars.map(({ t, keys, ...b }) => b),
-      totals: { value, real, realEst, list, req, tok, realOr, realDs, realDs30: ds30?.c || 0, subs, nrList, nrReq, nrTok },
+      totals: { value, real, realEst, list, req, tok, tokSplit: drilldownData.totalSplit, realOr, realDs, realDs30: ds30?.c || 0, subs, nrList, nrReq, nrTok },
       allLogged: loggedSince !== null && loggedSince <= range.from,
       subsMeta: SUBS,
       fees: settings.spendFees || {},
       groups: {
         key: pack(byKey), model: pack(byModel), modelEffort: [...byModelEffort.values()].sort((a, b) => b.v - a.v),
+        tokenSplit: drilldownData.tokenSplit, providerTree: drilldownData.providerTree, routes: drilldownData.routes,
         role: pack(byCombo), client: pack(byClient), provider: pack(byProv),
       },
       roleCount, sessionCount: sessions.length, sessionValue: sessions.reduce((a, s) => a + s.v, 0),

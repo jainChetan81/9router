@@ -10,7 +10,7 @@ import { USAGE_APIKEY_PROVIDERS } from "@/shared/constants/providers";
 
 // Detect auth-expired messages returned by usage providers instead of throwing
 const AUTH_EXPIRED_PATTERNS = ["expired", "authentication", "unauthorized", "401", "re-authorize"];
-function isAuthExpiredMessage(usage) {
+export function isAuthExpiredMessage(usage) {
   if (!usage?.message) return false;
   const msg = usage.message.toLowerCase();
   return AUTH_EXPIRED_PATTERNS.some((p) => msg.includes(p));
