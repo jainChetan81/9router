@@ -65,7 +65,8 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
   const rangeTitle = { Today: "Today", "24h": "Last 24 hours", "7D": "Last 7 days", "30D": "Last 30 days", "60D": "All time", Custom: range?.label || "Custom range", All: "All time" }[preset] || preset;
 
   // ---------- live KPIs and cards ----------
-  const liveSessions = live?.sessions || [];
+  // The live API sends successRate as a 0-1 fraction; the view works in percent.
+  const liveSessions = (live?.sessions || []).map((s) => (Number.isFinite(s?.successRate) && s.successRate <= 1 ? { ...s, successRate: s.successRate * 100 } : s));
   const topLevel = liveSessions.filter((s) => !s.parent);
   const kidOf = (id) => liveSessions.filter((s) => s.parent && (s.parent.session === id || s.parent === id));
   const allReq5 = liveSessions.reduce((a, s) => a + (s.reqPerMin || 0) * 5, 0);

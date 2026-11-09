@@ -63,6 +63,15 @@ describe("agents view", () => {
     }
   });
 
+  it("reads the live successRate as a 0-1 fraction", () => {
+    const frac = { sessions: [{ ...live.sessions[0], successRate: 1 }, { ...live.sessions[1], parent: null, successRate: 0.9 }] };
+    const v = buildView({ live: frac, sessions: [], analytics: null, range: { preset: "7D" }, ui: ui(), now: NOW });
+    const byLabel = Object.fromEntries(v.live.kpis.map((k) => [k.label, k]));
+    expect(v.live.cards[0].rows[0].succ).toBe("100%");
+    expect(v.live.cards[1].rows[0].succ).toBe("90.0%");
+    expect(byLabel["SUCCESS RATE"].value).not.toBe("1.0%");
+  });
+
   it("gives every role a chip style", () => {
     for (const r of ["main", "scout", "implementer", "reviewer", "thinker", "background", "direct"]) expect(chip(r)).toBeTruthy();
   });
