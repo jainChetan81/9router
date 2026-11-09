@@ -44,13 +44,31 @@ function open(file = promptsFile()) {
       CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text); END;
       CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.id, old.text); END;`);
     // Migration for rows a schema without the routing columns created: add them, old rows stay NULL.
-    try {
-      const cols = db.prepare("PRAGMA table_info(messages)").all().map(c => c.name);
-      for (const col of ["provider", "combo", "account", "tool"]) if (!cols.includes(col)) { db.exec(`ALTER TABLE messages ADD COLUMN ${col} TEXT`); chmodSync(file, 0o600); }
-    } catch {}
-    for (const f of [file, `${file}-wal`, `${file}-shm`]) try { chmodSync(f, 0o600); } catch {}
-    // Retention runs on a timer too, so it never depends on traffic.
-    if (!sweepTimer) { sweepTimer = setInterval(() => sweep(), 36e5); sweepTimer.unref(); }
+    // A lock or a lost race against another opener retries a few times; missing columns mean the
+    // connection is not used (prompts stay off) rather than INSERTs failing on every row.
+    const REQUIRED = new Set(["provider", "combo", "account", "tool"]);
+    let ok = false;
+    for (let attempt = 0; attempt < 5 && !ok; attempt++) {
+      let cols;
+      try { cols = db.prepare("PRAGMA table_info(messages)").all().map(c => c.name); } catch { db.close(); db = null; failed = true; break; }
+      const missing = [...REQUIRED].filter(c => !cols.includes(c));
+      if (!missing.length) { ok = true; break; }
+      try { for (const col of missing) db.exec(`ALTER TABLE messages ADD COLUMN ${col} TEXT`); ok = true; chmodSync(file, 0o600); }
+      catch (e) {
+        if (/duplicate column/i.test(String(e?.message))) { ok = true; break; } // another opener added it
+        if (!/busy|locked/i.test(String(e?.message)) || attempt === 4) { db.close(); db = null; failed = true; break; }
+        db.close();
+        db = new DatabaseSync(file);
+        db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA secure_delete=ON; PRAGMA busy_timeout=0;");
+        if (db.prepare("PRAGMA auto_vacuum").get().auto_vacuum !== 2) { db.exec("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;"); }
+      }
+    }
+    if (!ok) { failed = true; try { db?.close(); } catch {} db = null; }
+    if (ok) {
+      for (const f of [file, `${file}-wal`, `${file}-shm`]) try { chmodSync(f, 0o600); } catch {}
+      // Retention runs on a timer too, so it never depends on traffic.
+      if (!sweepTimer) { sweepTimer = setInterval(() => sweep(), 36e5); sweepTimer.unref(); }
+    }
   } catch { failed = true; db = null; return null; }
   sweep();
   return db;
@@ -67,18 +85,20 @@ const str = (v) => (typeof v === "string" ? v : "");
 // Roles come from the client; only known names are stored, so a role can never carry a value.
 const ROLES = new Set(["system", "developer", "user", "assistant", "tool", "function", "model"]);
 const json = (v) => { try { return v && typeof v === "object" ? JSON.stringify(v).slice(0, TOOL_CAP + 1) : str(v); } catch { return ""; } };
-function parts(content, role, path, out, kind = "text", toolById, toolId = null) {
-  if (typeof content === "string") return void out.push({ text: content, role, kind, path, ...(toolId && toolById?.get(toolId) && { tool: toolById.get(toolId) }) });
+function parts(content, role, path, out, kind = "text", toolById, toolId = null, resolvedName = null) {
+  // The tool name (resolved by the caller, or looked up from the call id) attaches to every node here.
+  const namedTool = resolvedName || (toolId && toolById?.get(String(toolId)));
+  if (typeof content === "string") return void out.push({ text: content, role, kind, path, ...(namedTool && { tool: namedTool }) });
   if (!Array.isArray(content)) return;
   content.forEach((b, j) => {
     const at = `${path}[${j}]`;
-    if (typeof b === "string") return void out.push({ text: b, role, kind, path: at });
+    if (typeof b === "string") return void out.push({ text: b, role, kind, path: at, ...(namedTool && { tool: namedTool }) });
     if (!b || typeof b !== "object") return;
     // Thinking, images and files are skipped: signed, binary, or scanned elsewhere.
-    if (b.type === "tool_result") return parts(b.content, role, `${at}.content`, out, "tool_result", toolById, toolId || str(b.tool_use_id) || null);
+    if (b.type === "tool_result") return parts(b.content, role, `${at}.content`, out, "tool_result", toolById, toolId || str(b.tool_use_id) || null, namedTool || null);
     if (b.type === "tool_use") return void out.push({ text: `${str(b.name)} ${json(b.input)}`, role, kind: "tool_use", path: at, ...(typeof b.name === "string" && b.name && { tool: str(b.name).slice(0, 100) }) });
     if (typeof b.text === "string" && b.type !== "thinking") {
-      const tool = toolById?.get(String(b.tool_use_id || ""));
+      const tool = namedTool || (toolId && toolById?.get(String(toolId))) || toolById?.get(String(b.tool_use_id || ""));
       out.push({ text: b.text, role, kind, path: `${at}.text`, ...(tool && { tool }) });
     }
   });
@@ -99,6 +119,8 @@ export function collect(body) {
   const toolById = new Map();
   for (const m of list[1]) {
     if (m?.type === "function_call" && str(m.call_id)) toolById.set(str(m.call_id), str(m.name).slice(0, 100));
+    // OpenAI chat tool_calls: the id pairs with a later tool-role message's tool_call_id.
+    if (Array.isArray(m?.tool_calls)) for (const c of m.tool_calls) if (str(c?.id) && str(c?.function?.name)) toolById.set(str(c.id), str(c.function.name).slice(0, 100));
     let content = m?.content;
     if (typeof content === "string" || !Array.isArray(content)) continue;
     for (const b of content) if (b?.type === "tool_use" && str(b.name)) toolById.set(str(b.id), str(b.name).slice(0, 100));
@@ -107,11 +129,13 @@ export function collect(body) {
     if (!m || typeof m !== "object") return;
     const at = `${list[0]}[${i}]`, role = ROLES.has(m.role) ? m.role : m.role === undefined ? "tool" : "other";
     if (m.type === "function_call") return out.push({ text: `${str(m.name)} ${str(m.arguments)}`, role: "assistant", kind: "tool_use", path: at, ...(str(m.name) && { tool: str(m.name).slice(0, 100) }) });
+    // A tool-role message's name (tool_call_id against toolById) is also its own text nodes' tool.
+    const onceTool = role === "tool" && toolById?.get(str(m.tool_call_id || str(m.call_id)));
     if (m.type === "function_call_output") {
-      const tool = toolById?.get(str(m.call_id ?? m.tool_call_id));
+      const tool = onceTool || toolById?.get(str(m.call_id ?? m.tool_call_id));
       return out.push({ text: json(m.output), role: "tool", kind: "tool_result", path: at, ...(tool && { tool }) });
     }
-    parts(m.content, role, `${at}.content`, out, role === "tool" ? "tool_result" : "text", toolById);
+    parts(m.content, role, `${at}.content`, out, role === "tool" ? "tool_result" : "text", toolById, role === "tool" ? str(m.tool_call_id || str(m.call_id)) || null : null, onceTool || null);
     if (Array.isArray(m.tool_calls)) m.tool_calls.forEach((c, k) => out.push({ text: `${str(c?.function?.name)} ${str(c?.function?.arguments)}`, role, kind: "tool_use", path: `${at}.tool_calls[${k}]`, ...(str(c?.function?.name) && { tool: str(c?.function?.name).slice(0, 100) }) }));
   });
   return out;
@@ -158,9 +182,20 @@ export function capture(meta, library, detector) {
   const file = promptsFile(); // resolved now; the write runs later
   setImmediate(() => { try { store({ ...meta, file }, library, detector); } catch { stats.errors++; } });
 }
-function store({ nodes, bodyFindings = [], requestId, sessionId, model, provider, combo, account: rawAccount, client, file }, library, detector) {
-  // An account label is a display name; an email (or any credential) never lands in the store.
-  const account = rawAccount && !String(rawAccount).includes("@") ? String(rawAccount).slice(0, 80) : null;
+const ID_RE = /^[A-Za-z0-9._:/\\/-]{1,64}$/;
+/** A routing label is an identifier, never a value. Scanner hits or an `@` fail closed: the field stores null. */
+function cleanRouting(v, detector) {
+  if (v === null || v === undefined) return null;
+  const s = String(v);
+  if (!ID_RE.test(s)) return null;
+  if (s.includes("@")) return null;
+  if (detector /** @type {any} */?.scan && typeof detector.scan === "function" && detector.scan(s).length) return null;
+  return s;
+}
+function store({ nodes, bodyFindings = [], requestId, sessionId, model, provider, combo, account: rawAccount, tool: rawTool, client, file }, library, detector) {
+  // Routing labels are identifiers, never values: validate each, fail closed to null.
+  const account = cleanRouting(rawAccount, detector);
+  const routing = { provider: cleanRouting(provider, detector), combo: cleanRouting(combo, detector), account, tool: cleanRouting(rawTool, detector) };
   for (const n of nodes) {
     // The request scan used context (sibling keys like "phone"); a rescan of the bare string may miss those.
     // Same path: reuse its spans. Inside the node but unmatched by hash: unsafe, so the node is not stored.
@@ -182,7 +217,7 @@ function store({ nodes, bodyFindings = [], requestId, sessionId, model, provider
       const [text, cut] = cap(library.maskText(n.text, n.findings), n.kind);
       // Fail closed: anything still detected after masking means a span was missed.
       if (detector.scan(text).length) { stats.unsafe++; continue; }
-      masked = { file, ts, requestId, sessionId: sessionId || null, model: model || null, provider: provider || null, combo: combo || null, account: account || null, client: client || null, role: n.role, kind: n.kind, path: n.path, digest: n.digest, tool: n.tool || null, text, cut, hashes: [...new Set(n.findings.map((f) => f.hash))].join(" ") };
+      masked = { file, ts, requestId, sessionId: sessionId || null, model: model || null, ...routing, client: client || null, role: n.role, kind: n.kind, path: n.path, digest: n.digest, tool: routing.tool || n.tool || null, text, cut, hashes: [...new Set(n.findings.map((f) => f.hash))].join(" ") };
     } catch { stats.errors++; continue; }
     if (queue.length >= QUEUE_MAX || queued + masked.text.length > QUEUE_BYTES) { stats.dropped++; continue; }
     queue.push(masked); queued += masked.text.length;

@@ -90,6 +90,70 @@ describe("prompt store", () => {
     expect(P.message(old2.id)).toMatchObject({ text: 'Bash {"cmd":"ls"}', provider: null, tool: null });
     expect(P.message(P.search({ requestId: "r2" }).rows[0].id)).toMatchObject({ text: "new after migration", tool: null, provider: "p2" });
   });
+  it("stores tool names from OpenAI tool_calls, and pairs tool-role results by tool_call_id", () => {
+    const nodes = P.collect({ messages: [
+      { role: "assistant", tool_calls: [
+        { id: "call_a", function: { name: "parallel_one", arguments: "1" } },
+        { id: "call_b", function: { name: "parallel_two", arguments: "2" } },
+      ] },
+      { role: "tool", tool_call_id: "call_b", content: "two done" },
+      { role: "tool", tool_call_id: "call_a", content: [{ type: "text", text: "one done" }] },
+      { role: "tool", tool_call_id: "call_missing", content: "unpaired" },
+    ] });
+    expect(nodes.map((n) => [n.kind, n.tool])).toEqual([
+      ["tool_use", "parallel_one"], ["tool_use", "parallel_two"],
+      ["tool_result", "parallel_two"], ["tool_result", "parallel_one"],
+      ["tool_result", undefined],
+    ]);
+  });
+  it("pairs Anthropic tool_result arrays and blocks whose name came earlier", () => {
+    const nodes = P.collect({ messages: [
+      { role: "assistant", content: [{ type: "tool_use", id: "tu1", name: "Read", input: {} }] },
+      { role: "user", content: [
+        { type: "tool_result", tool_use_id: "tu1", content: [{ type: "text", text: "file body" }] },
+      ] },
+    ] });
+    expect(nodes.filter((n) => n.kind === "tool_result").map((n) => n.tool)).toEqual(["Read"]);
+  });
+  it("fails routing fields closed: a detector hit or an @ never lands, valid ids do", async () => {
+    const secret = "synthetic-own-value-739201";
+    const det = library.createDetector({ known: [{ name: "secret", value: secret }], salt: "abcdef0123456789" });
+    await run({ messages: [{ role: "user", content: "hi" }] }, "s1", "r10", { provider: "good-provider", combo: "daily/combo.v2", account: mail, tool: `bash ${secret}` });
+    const m = P.message(P.search({ requestId: "r10" }).rows[0].id);
+    expect(m).toMatchObject({ provider: "good-provider", combo: "daily/combo.v2", account: null, tool: null });
+    expect(!m.account || !m.account.includes("@")).toBe(true);
+    expect(m.text).not.toContain(secret);
+  });
+  it("a failing migration leaves the store closed instead of failing every insert", async () => {
+    // Old schema without the routing columns, on a read-only file: ALTER fails and open() gives up.
+    const file = join(dir, "ro", "old.db");
+    await import("node:fs").then(async (fs) => {
+      fs.mkdirSync(join(dir, "ro"), { mode: 0o700 });
+      const sql = new (await import("node:sqlite")).DatabaseSync(file);
+      sql.exec("CREATE TABLE messages (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, request_id TEXT NOT NULL, session_id TEXT, model TEXT, client TEXT, role TEXT, kind TEXT, path TEXT, text TEXT NOT NULL, cut INTEGER NOT NULL, hashes TEXT NOT NULL, digest TEXT)");
+      sql.exec("INSERT INTO messages (ts, request_id, text, cut, hashes) VALUES (1, 'x', 'kept row', 0, '')");
+      sql.close();
+      fs.chmodSync(file, 0o400);
+    });
+    process.env.PII_GUARD_PROMPTS = file;
+    P._reset();
+    try {
+      await run({ messages: [{ role: "user", content: "new row" }] }, "s5", "r5");
+      const r = P.search({ q: "kept" });
+      expect(r.unavailable).toBe(true); // the connection is not used: status reads, writes do not happen
+      expect(P.search({ q: "new row" }).rows).toEqual([]);
+    } finally {
+      await import("node:fs").then((fs) => { fs.chmodSync(file, 0o600); });
+      process.env.PII_GUARD_PROMPTS = join(dir, "c", "prompts.db");
+      P._reset();
+    }
+  });
+  it("a prompt-row tool name goes through the same fail-closed validation as the account", async () => {
+    await run({ messages: [{ role: "assistant", content: [{ type: "tool_use", name: "weird name!!", input: {} }] }, { role: "user", content: "latest" }] }, "s1", "r11", { tool: "weird name!!" });
+    await tick(); P.flush();
+    const m = P.message(P.search({ requestId: "r11" }).rows[0].id);
+    expect(m.tool).toBeNull();
+  });
   it("wraps the account label: an email never stored", async () => {
     await run({ messages: [{ role: "user", content: "clean this" }] }, "s1", "r9", { account: mail });
     const m = P.message(P.search({ requestId: "r9" }).rows[0].id);
@@ -117,7 +181,8 @@ describe("prompt store", () => {
       const body = { model: "m", messages: [{ role: "user", content: `Repeat this to me: ${mail}` }] };
       await observeRequest(body, { endpoint: "/v1/messages", userAgent: "claude-cli/2", sessionId: "claude:abc" }, { mode: "redact", rules: {} });
       expect(body.messages[0].content).toMatch(/^Repeat this to me: \{\{pii:email#[0-9a-f]{6}\}\}$/);
-      await tick(); P.flush();
+      await new Promise((r) => setTimeout(r, 150)); // the deferred write settles
+      P.flush();
       const [row] = P.search({ q: "repeat" }).rows;
       expect(row).toMatchObject({ sessionId: expect.stringMatching(/^[0-9a-f]{24}$/), client: "Claude Code" });
       expect(P.message(row.id).text).toBe("Repeat this to me: •••••@corpmail.in");
@@ -155,7 +220,8 @@ describe("prompt store", () => {
         { model: "m", messages: [{ role: "assistant", content: [{ type: "tool_use", id: "t", name: "x", input: { first: `mobile ${num}`, padding: "x".repeat(100), value: num2 } }] }] },
       ];
       for (const [i, body] of bodies.entries()) await observeRequest(body, { endpoint: "/v1/messages", userAgent: "x/1", sessionId: `s${i}` }, { mode: "observe", rules: {} });
-      await tick(); P.flush();
+      await new Promise((r) => setTimeout(r, 150)); // the deferred write settles
+      P.flush();
       const all = P.search({}).rows.map((r) => P.message(r.id).text).join(" ");
       for (const v of [num, num2]) expect(all).not.toContain(v);
       expect(P.stats.unsafe).toBeGreaterThan(0); // unsafe nodes are dropped and counted, never stored

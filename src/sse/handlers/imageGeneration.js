@@ -70,10 +70,11 @@ export async function handleImageGeneration(request) {
   if (!modelStr) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing model");
   if (!body.prompt) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing required field: prompt");
 
-  let routing = null;
+  let routing = null, piiFinalize = null;
   if (process.env.PII_GUARD_MODULE) {
     routing = {};
     const guard = await observeRequest(body, { endpoint: url.pathname, userAgent: request.headers.get("user-agent"), model: body?.model, routing }, settings.piiGuard);
+    if (typeof guard?.finalize === "function") piiFinalize = guard.finalize;
     if (guard?.blocked) return errorResponse(HTTP_STATUS.BAD_REQUEST, blockMessage(guard.blocked, false));
     modelStr = body.model; // redaction may have rewritten it
   }
@@ -84,7 +85,7 @@ export async function handleImageGeneration(request) {
 
   // Combo expansion: model may be a combo name → run fallback/round-robin across models
   const comboModels = await getComboModels(modelStr);
-  if (comboModels) routing.combo = modelStr;
+  if (comboModels && routing) routing.combo = modelStr;
   else { const { provider, model } = await getModelInfo(modelStr); if (routing) { routing.provider = provider; if (modelStr !== `${provider}/${model}`) routing.resolvedModel = `${provider}/${model}`; } }
   if (comboModels) {
     const comboStrategies = settings.comboStrategies || {};
@@ -94,7 +95,7 @@ export async function handleImageGeneration(request) {
     return handleComboChat({
       body,
       models: comboModels,
-      handleSingleModel: (b, m) => handleSingleModelImage(b, m, { wantsStream, binaryOutput, preferredConnectionId, apiKey, endpoint: url.pathname }),
+      handleSingleModel: (b, m) => handleSingleModelImage(b, m, { wantsStream, binaryOutput, preferredConnectionId, apiKey, endpoint: url.pathname, piiFinalize }),
       log,
       comboName: modelStr,
       comboStrategy,
@@ -102,10 +103,10 @@ export async function handleImageGeneration(request) {
     });
   }
 
-  return handleSingleModelImage(body, modelStr, { wantsStream, binaryOutput, preferredConnectionId, apiKey, endpoint: url.pathname });
+  return handleSingleModelImage(body, modelStr, { wantsStream, binaryOutput, preferredConnectionId, apiKey, endpoint: url.pathname, piiFinalize });
 }
 
-async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutput, preferredConnectionId, apiKey, endpoint } = {}) {
+async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutput, preferredConnectionId, apiKey, endpoint, piiFinalize } = {}) {
   const modelInfo = await getModelInfo(modelStr);
   if (!modelInfo.provider) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid model format");
 
@@ -144,6 +145,7 @@ async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutpu
     }
 
     const refreshedCredentials = await checkAndRefreshToken(provider, credentials);
+    if (piiFinalize) piiFinalize({ account: credentials.connectionName });
 
     // Skip accounts the adapter knows cannot generate images (e.g. ChatGPT Free on codex)
     // without locking them: they stay usable for chat.

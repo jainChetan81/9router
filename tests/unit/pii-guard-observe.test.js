@@ -28,6 +28,7 @@ beforeEach(async () => {
   ({ observeRequest, health } = await import("../../src/lib/piiGuard/observe.js"));
 });
 afterEach(async () => {
+  await new Promise(resolve => setTimeout(resolve, 150)); // let a deferred finalize write land before teardown
   delete process.env.PII_GUARD_MODULE; delete process.env.PII_GUARD_KNOWN; delete process.env.PII_GUARD_EVENTS;
   vi.restoreAllMocks(); await rm(dir, { recursive: true, force: true });
 });
@@ -42,6 +43,7 @@ describe("PII observation", () => {
     const info = vi.spyOn(console, "info").mockImplementation(() => {});
     await observeRequest(body(value), meta);
     await observeRequest(body(value), meta);
+    await new Promise(resolve => setTimeout(resolve, 150));
     expect(warn).toHaveBeenCalledWith("[pii-guard] test /v1/messages: own-test=1 (new: own-test)");
     expect(info).toHaveBeenCalledWith("[pii-guard] test /v1/messages: own-test=1");
     expect(JSON.stringify([warn.mock.calls, info.mock.calls])).not.toContain(value);
@@ -94,7 +96,7 @@ describe("PII guard modes", () => {
   it("redacts all scanned strings, including system and assistant history", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     const req = { system: pii, messages: [{ role: "user", content: pii }, { role: "assistant", content: pii }] };
-    expect(await observeRequest(req, meta, { mode: "redact" })).toBeUndefined();
+    expect((await observeRequest(req, meta, { mode: "redact" }))?.finalize).toEqual(expect.any(Function));
     expect(req.messages[0].content).toMatch(/^call me on mobile \{\{pii:in_phone#[0-9a-f]{6}\}\}$/);
     expect(req.messages[1].content).toMatch(/^call me on mobile \{\{pii:in_phone#[0-9a-f]{6}\}\}$/);
     expect(req.system).toMatch(/^call me on mobile \{\{pii:in_phone#[0-9a-f]{6}\}\}$/);
@@ -108,13 +110,14 @@ describe("PII guard modes", () => {
   });
   it("blocks by rule override and logs an error", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    expect(await observeRequest(body(pii), meta, { mode: "observe", rules: { in_phone: "block" } })).toEqual({ blocked: ["in_phone"] });
+    expect(await observeRequest(body(pii), meta, { mode: "observe", rules: { in_phone: "block" } })).toEqual({ blocked: ["in_phone"], finalize: expect.any(Function) });
+    await new Promise(resolve => setTimeout(resolve, 150));
     expect(error.mock.calls[0][0]).toContain("BLOCKED: in_phone");
     expect(error.mock.calls[0][0]).not.toContain("9876543210");
   });
   it("lets a rule override turn one rule off", async () => {
     const req = body(pii);
-    expect(await observeRequest(req, meta, { mode: "block", rules: { in_phone: "off" } })).toBeUndefined();
+    expect((await observeRequest(req, meta, { mode: "block", rules: { in_phone: "off" } }))?.blocked).toBeUndefined();
     expect(req.messages[0].content[0].content).toBe(pii);
   });
 });
@@ -122,7 +125,7 @@ describe("PII guard block scope", () => {
   it("blocks a match in the system prompt too", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     const req = { system: "mobile 9876543210", messages: [{ role: "user", content: "hi" }] };
-    expect(await observeRequest(req, meta, { mode: "block" })).toEqual({ blocked: ["in_phone"] });
+    expect(await observeRequest(req, meta, { mode: "block" })).toEqual({ blocked: ["in_phone"], finalize: expect.any(Function) });
   });
 });
 describe("PII guard full-body coverage", () => {
@@ -153,10 +156,10 @@ describe("PII guard full-body coverage", () => {
   it("blocks unseen values once, then redacts same history", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     const first = body(value);
-    expect(await observeRequest(first, meta, { mode: "block" })).toEqual({ blocked: ["own-test"] });
+    expect(await observeRequest(first, meta, { mode: "block" })).toEqual({ blocked: ["own-test"], finalize: expect.any(Function) });
     expect(await lines(1)).toBeTruthy();
     const second = body(value);
-    expect(await observeRequest(second, meta, { mode: "block" })).toBeUndefined();
+    expect((await observeRequest(second, meta, { mode: "block" }))?.blocked).toBeUndefined();
     expect(JSON.stringify(second)).not.toContain(value);
   });
   it("reports health and readonly findings", async () => {
@@ -184,13 +187,13 @@ describe("PII guard full-body coverage", () => {
     vi.resetModules();
     ({ observeRequest } = await import("../../src/lib/piiGuard/observe.js"));
     const first = body(value);
-    expect(await observeRequest(first, meta, { mode: "block" })).toEqual({ blocked: ["own-test"] });
+    expect(await observeRequest(first, meta, { mode: "block" })).toEqual({ blocked: ["own-test"], finalize: expect.any(Function) });
     await lines(2);
     await new Promise(resolve => setTimeout(resolve, 5100));
     vi.resetModules();
     ({ observeRequest } = await import("../../src/lib/piiGuard/observe.js"));
     const retry = body(value);
-    expect(await observeRequest(retry, meta, { mode: "block" })).toBeUndefined();
+    expect((await observeRequest(retry, meta, { mode: "block" }))?.blocked).toBeUndefined();
     expect(JSON.stringify(retry)).not.toContain(value);
   }, 10_000);
   it("counts invalid known-list errors", async () => {
@@ -251,7 +254,7 @@ describe("PII guard test preview", () => {
     expect(first).toMatchObject({ blocked: ["own-test"] });
     expect(first.stuck).toBeUndefined();
     const b = thinking(false);
-    expect(await observeRequest(b, meta, { mode: "block" })).toBeUndefined();
+    expect((await observeRequest(b, meta, { mode: "block" }))?.blocked).toBeUndefined();
     expect(b.messages[1].content.map(c => c.type)).toEqual(["tool_use"]);
     expect(JSON.stringify(b)).not.toContain(value);
   });
@@ -298,16 +301,24 @@ describe("PII guard test preview", () => {
 
 describe("PII guard routing context", () => {
   it("records provider, combo, account and resolvedModel from the routing object", async () => {
-    const routing = { provider: "anthropic" };
+    const routing = {};
+    const meta = { endpoint: "/v1/messages", userAgent: "test/1", model: "test", routing };
+    const guard = await observeRequest(body(value), meta);
+    // Late binding: the scan is done, but the handler fills routing after observeRequest
+    // returns; finalize merges it and the written event still carries the fields.
+    guard.finalize({ provider: "anthropic" });
+    guard.finalize({ combo: "daily" });
+    guard.finalize({ account: "acc-1", resolvedModel: "claude-opus/opus-5-5" });
+    const event = JSON.parse((await lines(1)).trim());
+    expect(event).toMatchObject({ provider: "anthropic", combo: "daily", account: "acc-1", resolvedModel: "claude-opus/opus-5-5" });
+  });
+  it("still writes the event when the handler never calls finalize", async () => {
+    const routing = {};
     const meta = { endpoint: "/v1/messages", userAgent: "test/1", model: "test", routing };
     await observeRequest(body(value), meta);
-    let event = JSON.parse((await lines(1)).trim());
-    expect(event.provider).toBe("anthropic");
-    // Fields filled after the scan still land in the same event.
-    Object.assign(routing, { combo: "daily", account: "acc-1", resolvedModel: "claude-opus/opus-5-5" });
-    await observeRequest(body(value), meta);
-    event = JSON.parse((await lines(2)).trim().split("\n")[1]);
-    expect(event).toMatchObject({ provider: "anthropic", combo: "daily", account: "acc-1", resolvedModel: "claude-opus/opus-5-5" });
+    // No finalize call: the safety timer writes the event later.
+    const text = await lines(1);
+    expect(JSON.parse(text.trim()).requestId).toBeTruthy();
   });
   it("skips an account label that holds an email and trims empty routing", async () => {
     const meta = { endpoint: "/v1/messages", userAgent: "test/1", model: "test", routing: { provider: "p", account: "user@corpmail.in" } };
@@ -321,6 +332,26 @@ describe("PII guard routing context", () => {
     expect(second.provider).toBeUndefined();
     expect(second.combo).toBeUndefined();
     expect(second.account).toBeUndefined();
+  });
+  it("fails routing fields closed on the event: bad charset, a scanner hit, or a too-long value never land", async () => {
+    const meta = { endpoint: "/v1/charset-check", userAgent: "test/1", model: "test", routing: { provider: "bad id!", combo: "a".repeat(65), account: `acc@value-${Date.now()}`, resolvedModel: "x/1" } };
+    const guard = await observeRequest(body(value), meta);
+    guard.finalize({ provider: "bad id!", combo: "a".repeat(65), account: "has space", resolvedModel: "x/1" });
+    // Wait for the debounced write, then read the one event with this marker endpoint.
+    const text = await (async () => {
+      for (let i = 0; i < 100; i++) {
+        const lines = (await readFile(events, "utf8").catch(() => "")).trim().split("\n").filter(Boolean);
+        const mine = lines.map((l) => JSON.parse(l)).find((e) => e.endpoint === "/v1/charset-check");
+        if (mine) return JSON.stringify(mine);
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      throw new Error("Event not written");
+    })();
+    const event = JSON.parse(text);
+    expect(event.provider).toBeUndefined();
+    expect(event.combo).toBeUndefined();
+    expect(event.account).toBeUndefined();
+    expect(event.resolvedModel).toBe("x/1");
   });
   it("writes old events without routing fields and stays backward compatible", async () => {
     await observeRequest(body(value), { endpoint: "/v1/messages", userAgent: "test/1", model: "test" });

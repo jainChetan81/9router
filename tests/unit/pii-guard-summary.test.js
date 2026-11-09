@@ -97,6 +97,15 @@ describe("summary routing context", () => {
     // An empty combo string never lands in the group.
     expect(events.some((e) => e.combo === "" && r.groups.some((g) => g.combo === ""))).toBe(false);
   });
+  it("the latest event clears stale provider and combo when it carries none", () => {
+    const now = Date.parse("2026-01-02T00:00:00.000Z");
+    const hit = { hash: "aaaaaaaaaaaa", rule: "email", source: "user/text", action: "redact" };
+    const r = summarize([
+      { ts: "2026-01-01T22:00:00.000Z", provider: "old-provider", combo: "old-combo", hits: [hit] },
+      { ts: "2026-01-01T23:00:00.000Z", hits: [hit], model: "solo-model" },
+    ], { now });
+    expect(r.groups[0]).toMatchObject({ provider: null, combo: null, model: "solo-model" });
+  });
 });
 
 describe("summary OCR recent list", () => {

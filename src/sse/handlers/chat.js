@@ -56,11 +56,13 @@ export async function handleChat(request, clientRawRequest = null) {
   }
   // Resolved before the scan so PII Guard can link stored prompts to the conversation.
   const session = resolveSessionIdentity({ headers: clientRawRequest?.headers, body });
-  // Routing fields (provider/combo/account) fill in after resolution; observe reads them when it writes.
-  const piiRouting = {};
+  // Routing fields (provider/combo/account) fill in after resolution; observeFinalize writes when they are known.
+  let piiRouting = null;
   if (process.env.PII_GUARD_MODULE) {
-    const guard = await observeRequest(body, { endpoint: clientRawRequest.endpoint, userAgent: clientRawRequest.headers?.["user-agent"], model: body?.model, sessionId: session?.random ? null : session?.sessionId, routing: piiRouting }, (await getSettings()).piiGuard);
+    const routing = {};
+    const guard = await observeRequest(body, { endpoint: clientRawRequest.endpoint, userAgent: clientRawRequest.headers?.["user-agent"], model: body?.model, sessionId: session?.random ? null : session?.sessionId, routing }, (await getSettings()).piiGuard);
     if (guard?.blocked) return errorResponse(HTTP_STATUS.BAD_REQUEST, blockMessage(guard.blocked, true, guard.stuck));
+    piiRouting = guard.finalize;
   }
   // Claude Code marks a 1M-context request as `<model>[1m]`; the marker matches
   // no combo, alias or provider/model pair, so it must not reach resolution.
@@ -120,7 +122,7 @@ export async function handleChat(request, clientRawRequest = null) {
   const comboModels = await getComboModels(modelStr);
   if (comboModels) {
     clientRawRequest.combo = modelStr;
-    if (process.env.PII_GUARD_MODULE) piiRouting.combo = modelStr;
+    if (piiRouting) piiRouting({ combo: modelStr });
     // Check for combo-specific strategy first, fallback to global
     const comboStrategies = settings.comboStrategies || {};
     const comboSpecificStrategy = comboStrategies[modelStr]?.fallbackStrategy;
@@ -281,9 +283,10 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   const { provider, model } = modelInfo;
 
   // Record routing for PII Guard when it observed this request (identifiers only, never credentials).
-  if (clientRawRequest) {
-    clientRawRequest.piiRouting = { provider };
-    if (requestedModel || modelStr !== `${provider}/${model}`) Object.assign(clientRawRequest.piiRouting, { resolvedModel: `${provider}/${model}` });
+  if (piiRouting) {
+    const r = { provider };
+    if (requestedModel || modelStr !== `${provider}/${model}`) r.resolvedModel = `${provider}/${model}`;
+    piiRouting(r);
   }
   // Routing shown in the unified "▶" line (client model → provider/model)
 
@@ -325,7 +328,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
     // Record the account label for PII Guard: a connection display name, never a credential.
     // Observe drops a value containing "@" when the event is written.
-    if (clientRawRequest?.piiRouting) clientRawRequest.piiRouting.account = credentials.connectionName;
+    if (piiRouting) piiRouting({ account: credentials.connectionName });
 
     // Ensure real project ID is available for providers that need it (P0 fix: cold miss)
     if ((provider === "antigravity" || provider === "gemini-cli") && !refreshedCredentials.projectId) {

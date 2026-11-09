@@ -80,7 +80,9 @@ export function summarize(events, { since, until, now = Date.now(), ignore = [],
         group = { hash: hit.hash, rule: hit.rule, name: hit.name, kind: hit.kind, sources: [], actions: [], action, actionTs: ts, leakedWhere: [], firstSeen: event.ts, lastSeen: event.ts, turns: new Set(), ignored: false };
         groups.set(key, group);
       }
-      if (ts >= Date.parse(group.lastSeen)) { if (typeof event.ua === "string") group.ua = event.ua.slice(0, 80); if (typeof event.model === "string") group.model = event.model.slice(0, 80); if (typeof event.provider === "string" && event.provider) group.provider = event.provider.slice(0, 80); if (typeof event.combo === "string" && event.combo) group.combo = event.combo.slice(0, 80); }
+      if (ts >= Date.parse(group.lastSeen)) { if (typeof event.ua === "string") group.ua = event.ua.slice(0, 80); if (typeof event.model === "string") group.model = event.model.slice(0, 80); // Latest event wins, even absent: a mixed session clears a stale provider/combo.
+        group.provider = typeof event.provider === "string" && event.provider ? event.provider.slice(0, 80) : null;
+        group.combo = typeof event.combo === "string" && event.combo ? event.combo.slice(0, 80) : null; }
       if (!group.name && hit.name) group.name = hit.name;
       if (!group.kind && hit.kind) group.kind = hit.kind;
       if (!group.sources.includes(source)) group.sources.push(source);
