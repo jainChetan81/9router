@@ -49,9 +49,26 @@ describe("agents view fixes", () => {
     const v = buildView({ live, sessions: [row], detail, analytics: null, range: { preset: "7D" }, ui: ui({ drawer: row.session, drawerMode: "details" }), now: NOW });
     expect(v.dd.hasData).toBe(true);
     expect(v.dd.roles.map((r) => r.model)).toEqual(["claude-opus-5-5", "gpt-6-luna"]);
-    expect(v.dd.stats[0]).toEqual(["Requests", "2", "1 failed"]);
+    expect(v.dd.stats[0]).toEqual(["Requests", "1", ""]);
     expect(v.dd.facts.find(([label]) => label === "Project")[1]).toBe("Not recorded");
     expect(v.dd.facts.find(([label]) => label === "Parent")[1]).toContain("likely");
+  });
+  it("keeps aggregate session totals when detail requests are sampled", () => {
+    const row = { ...sess("aaaaaaaaaaaa", "2026-11-09T07:59:00Z"), requests: 2505, tokens: 90000, value: 42, errors: 5 };
+    const detail = { session: row.session, truncated: true, agents: [{ role: "main", requests: [
+      { ts: row.lastTs, model: "claude-opus-5-5", promptTokens: 10, completionTokens: 20, value: 0.2, status: "ok" },
+    ] }] };
+    const v = buildView({ live: null, sessions: [row], detail, detailsBySession: { [row.session]: detail }, analytics: null, range: { preset: "7D" }, ui: ui({ drawer: row.session, drawerMode: "details" }), now: NOW });
+    expect(v.dd.stats[0]).toEqual(["Requests", "2,505", "5 failed"]);
+    expect(v.dd.stats[1][1]).toBe("90.0k");
+    expect(v.dd.stats[2][1]).toBe("$42.00");
+    expect(v.dd.roleSampled).toBe(true);
+  });
+  it("uses the drawer session detail when routing a different session", () => {
+    const other = { ...sess("bbbbbbbbbbbb", "2026-11-09T07:50:00Z"), roles: [] };
+    const detail = { session: other.session, client: "Claude Code", agents: [{ role: "reviewer", requests: [{ model: "gpt-6-luna" }] }] };
+    const v = buildView({ live: null, sessions: [...sessions, other], detailsBySession: { [other.session]: detail }, analytics: null, range: { preset: "7D" }, ui: ui({ drawer: other.session, drawerMode: "routing" }), combos: [{ name: "reviewer", models: ["gpt-6-luna"] }], now: NOW });
+    expect(v.dr.rows.map((row) => row.role)).toContain("reviewer");
   });
   it("uses the 4-column session row grid (A12)", () => {
     const v = buildView({ live: null, sessions, totalSessions: 2, analytics: null, range: { preset: "7D" }, ui: ui({ tab: "sessions" }), now: NOW });

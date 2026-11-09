@@ -96,7 +96,7 @@ function statusOf(q) {
   return [s, "var(--red)", "var(--redbg)"];
 }
 
-export function buildView({ live, sessions, totalSessions, detail, detailLoad = {}, analytics, tools, range, ui, act = {}, vw = 1440, now = Date.now(), combos = [], models = [], overrides = [], overridesBySession = {}, revisions = {}, draft = {}, cf = false, toast = null, moreCursor = null, setDraft = () => {}, setCf = () => {}, setToast = () => {}, applyOverrides = async () => {}, reloadOverrides = async () => {} }) {
+export function buildView({ live, sessions, totalSessions, detail, detailsBySession = {}, detailLoad = {}, analytics, tools, range, ui, act = {}, vw = 1440, now = Date.now(), combos = [], models = [], overrides = [], overridesBySession = {}, revisions = {}, draft = {}, cf = false, toast = null, moreCursor = null, setDraft = () => {}, setCf = () => {}, setToast = () => {}, applyOverrides = async () => {}, reloadOverrides = async () => {} }) {
   const tab = ui.tab || "live";
   const mode = ui.mode || "loading"; // loading | ready | empty | error | stale
   const ok = mode === "ready" || mode === "stale";
@@ -130,7 +130,7 @@ export function buildView({ live, sessions, totalSessions, detail, detailLoad = 
   const card = (s, isChild, more) => {
     const lastMs = Date.parse(s.lastTs);
     const activityMs = Number.isFinite(s.lastActivityMs) ? s.lastActivityMs : lastMs;
-    const routeOverrides = overridesBySession[s.session] || [];
+    const routeOverrides = overridesBySession[s.session]?.overrides || [];
     const rows = (s.roles || []).map((r) => {
       const isBg = r.role === "background";
       const entry = routeOverrides.find((e) => e.combo === r.role);
@@ -452,26 +452,27 @@ export function buildView({ live, sessions, totalSessions, detail, detailLoad = 
   let dr = null;
   const dId = ui.drawer;
   const dLive = dId && liveSessions.find((s) => s.session === dId);
-  const dDet = dId && det && det.session === dId ? det : null;
+  const dDet = dId ? (detailsBySession[dId] || (detail?.session === dId ? detail : det && det.session === dId ? det : null)) : null;
   const drawerSession = dId && sessList.find((s) => s.session === dId);
   const dRoles = dLive ? (dLive.roles || []) : dDet ? (dDet.agents || []).map((a) => ({ role: a.role, model: latestModel(a) })) : [];
-  const drawerDetail = dId && detail?.session === dId ? detail : null;
+  const drawerDetail = dDet;
   let dd = null;
   if (dId && ui.drawerMode === "details") {
     const reqs = (drawerDetail?.agents || []).flatMap((a) => (a.requests || []).map((q) => ({ ...q, role: a.role })));
-    const detailTokens = reqs.reduce((n, q) => n + (q.promptTokens || 0) + (q.completionTokens || 0), 0);
-    const tokens = drawerDetail ? detailTokens : drawerSession?.tokens;
-    const value = drawerDetail ? reqs.reduce((n, q) => n + (q.value || 0), 0) : drawerSession?.value;
-    const errors = drawerDetail ? reqs.filter((q) => String(q.status || "ok") !== "ok").length : drawerSession?.errors || 0;
-    const requestCount = drawerDetail ? reqs.length : drawerSession?.requests;
+    const roleTokenTotal = reqs.reduce((n, q) => n + (q.promptTokens || 0) + (q.completionTokens || 0), 0);
+    const tokens = drawerSession?.tokens;
+    const value = drawerSession?.value;
+    const errors = drawerSession?.errors || 0;
+    const requestCount = drawerSession?.requests;
+    const sampled = !!drawerDetail?.truncated;
     const byRole = drawerDetail ? (drawerDetail.agents || []).flatMap((a) => {
       const models = new Map();
       (a.requests || []).forEach((q) => {
         const model = q.model || "Unknown"; if (!models.has(model)) models.set(model, []); models.get(model).push(q);
       });
-      return [...models].map(([model, qs]) => {
+        return [...models].map(([model, qs]) => {
         const tok = qs.reduce((n, q) => n + (q.promptTokens || 0) + (q.completionTokens || 0), 0), val = qs.reduce((n, q) => n + (q.value || 0), 0);
-        return { role: a.role, chip: chip(a.role), model, requests: qs.length, tokens: cnt(tok), value: usd(val), share: tokens ? tok / tokens * 100 : 0, color: barC(a.role) };
+        return { role: a.role, chip: chip(a.role), model, requests: qs.length, tokens: cnt(tok), value: usd(val), share: roleTokenTotal ? tok / roleTokenTotal * 100 : 0, color: barC(a.role) };
       });
     }) : (drawerSession?.roles || []).flatMap((a) => (a.models || []).map((m) => ({ role: a.role, chip: chip(a.role), model: m.model || "Unknown", requests: m.requests || 0, tokens: cnt(m.tokens || 0), value: usd(m.value || 0), share: tokens ? (m.tokens || 0) / tokens * 100 : 0, color: barC(a.role) })));
     const firstTs = drawerDetail?.firstTs || drawerSession?.firstTs, lastTs = drawerDetail?.lastTs || drawerSession?.lastTs;
@@ -480,7 +481,7 @@ export function buildView({ live, sessions, totalSessions, detail, detailLoad = 
     dd = { sid: "s·" + dId, title: "s·" + dId, client: drawerDetail?.client || drawerSession?.client || dLive?.client || "Unknown", firstTs, lastTs,
       facts: [["Thread title", "Not recorded"], ["Project", "Not recorded"], ["Directory", "Not recorded"], ["Device", "Not recorded"], ["Client", drawerDetail?.client || drawerSession?.client || dLive?.client || "Not recorded"], ["Client version", drawerDetail?.clientVersion || versionFromUA(drawerDetail?.ua || drawerDetail?.userAgent) || "Not recorded"], ["Started", Number.isFinite(first) ? dayLabel(first) + ", " + hm(first) + " IST" : "Not recorded"], ["Duration", Number.isFinite(first) && Number.isFinite(last) ? durF(last - first) : "Not recorded"], ["Parent", drawerSession?.parent ? "s·" + (drawerSession.parent.session || drawerSession.parent) + (drawerSession.parent.parentGuessed ? " · likely" : "") : "None"]],
       stats: [["Requests", Number.isFinite(requestCount) ? requestCount.toLocaleString("en-US") : "Not recorded", errors ? errors + " failed" : ""], ["Tokens", Number.isFinite(tokens) ? cnt(tokens) : "Not recorded", "in + out"], ["Value", Number.isFinite(value) ? usd(value) : "Not recorded", "estimate"], ["Real spend", "Not recorded", ""], ["Success", success, "of finished requests"]],
-      roles: byRole, tools: drawerDetail?.toolCalls || drawerDetail?.tools || [], hasData: !!drawerDetail || (detailLoad.sid === dId && detailLoad.status === "error"), parentSession: drawerSession?.parent?.session || drawerSession?.parent || null, parentGuessed: !!drawerSession?.parent?.parentGuessed,
+      roles: byRole, roleSampled: sampled, tools: drawerDetail?.toolCalls || drawerDetail?.tools || [], hasData: !!drawerDetail || (detailLoad.sid === dId && detailLoad.status === "error"), parentSession: drawerSession?.parent?.session || drawerSession?.parent || null, parentGuessed: !!drawerSession?.parent?.parentGuessed,
       openParent: () => drawerSession?.parent && act.openDetails?.(drawerSession.parent.session || drawerSession.parent), route: () => act.openRouting?.(dId), close: () => act.openDrawer?.(null), copy: () => act.copySession?.(dId),
       w: vw <= 600 ? "100vw" : "480px" };
   }

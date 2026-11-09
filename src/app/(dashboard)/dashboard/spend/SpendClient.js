@@ -9,6 +9,7 @@ import BreakdownDrill from "./BreakdownDrill";
 import RoutingMap from "./RoutingMap";
 import { buildView } from "./view";
 import "./spend.css";
+import "./shared-page.css";
 
 async function getJson(url, opts) {
   const res = await fetch(url, { cache: "no-store", ...opts });

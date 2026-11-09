@@ -5,7 +5,11 @@ import RangeBar from "../spend/RangeBar";
 import PageHeader from "../spend/PageHeader";
 import { buildView } from "./view";
 import "../spend/spend.css";
+import "../spend/shared-page.css";
 import "./agents.css";
+
+let detailRequestSequence = 0;
+const overrideRequestIds = new Map();
 
 async function getJson(url) {
   const res = await fetch(url, { cache: "no-store" });
@@ -23,15 +27,14 @@ export default function AgentsClient() {
   const [moreCursor, setMoreCursor] = useState(null);
   const [moreBusy, setMoreBusy] = useState(false);
   const [detail, setDetail] = useState(null);
+  const [detailsBySession, setDetailsBySession] = useState({});
   const [detailLoad, setDetailLoad] = useState({ sid: null, status: "idle" });
   const [analytics, setAnalytics] = useState(null);
   const [tools, setTools] = useState(null);
   const [toolsError, setToolsError] = useState("");
   const [combos, setCombos] = useState([]);
   const [models, setModels] = useState([]);
-  const [overrides, setOverrides] = useState([]);
   const [overridesBySession, setOverridesBySession] = useState({});
-  const [revisions, setRevisions] = useState({});
   const [draft, setDraft] = useState({});
   const [cf, setCf] = useState(false);
   const [toast, setToast] = useState(null);
@@ -40,6 +43,7 @@ export default function AgentsClient() {
   const [errorText, setErrorText] = useState("");
   const [ui, setUi] = useState({ tab: "live", paused: false, ago: 0, q: "", fClient: "", fRole: "", sel: null, exp: {}, focus: null, hov: null, pick: null, zoom: null, gOff: 0, drawer: null, drawerMode: "routing", conflict: null });
   const set = useCallback((p) => setUi((u) => ({ ...u, ...(typeof p === "function" ? p(u) : p) })), []);
+  const closeDrawer = useCallback(() => { setDraft({}); setCf(false); set({ drawer: null, conflict: null }); }, [set]);
   const [theme, setTheme] = useState("light");
   const [vw, setVw] = useState(1440);
   const [tabsAtEnd, setTabsAtEnd] = useState(true);
@@ -54,29 +58,54 @@ export default function AgentsClient() {
 
   const refreshOverrides = useCallback(async (sid) => {
     if (!sid) return {};
+    const requestId = (overrideRequestIds.get(sid) || 0) + 1;
+    overrideRequestIds.set(sid, requestId);
     const data = await getJson(`/api/agents/sessions/${encodeURIComponent(sid)}/overrides`);
-    setOverrides(data.overrides || []);
-    setRevisions(data.revisions || {});
+    if (overrideRequestIds.get(sid) === requestId) {
+      setOverridesBySession((old) => ({ ...old, [sid]: { overrides: data.overrides || [], revisions: data.revisions || {} } }));
+    }
     return data;
   }, []);
   const applyOverrides = useCallback(async (sid, changes) => {
+    const saved = [];
+    let auditWarning = false;
     try {
-      let auditWarning = false;
+      let failure = null;
       for (const change of changes) {
         const res = await fetch(`/api/agents/sessions/${encodeURIComponent(sid)}/overrides`, {
           method: "PUT", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ combo: change.role, model: change.to, expectedCurrent: change.expectedCurrent, mode: change.mode, fallback: change.mode === "member", expiry: change.expiry === "Session end" ? "session" : change.expiry, revision: revisions[change.role] ?? 0, confirmExpensive: !!change.warn }),
+          body: JSON.stringify({ combo: change.role, model: change.to, expectedCurrent: change.expectedCurrent, mode: change.mode, fallback: change.mode === "member", expiry: change.expiry === "Session end" ? "session" : change.expiry, revision: overridesBySession[sid]?.revisions?.[change.role] ?? 0, confirmExpensive: !!change.warn }),
         });
         const body = await res.json().catch(() => ({}));
-        if (res.status === 409) { setRetryRouting(null); set((u) => ({ ...u, conflict: { role: change.role, currentModel: body.currentModel || "unknown" } })); return; }
-        if (!res.ok) throw new Error(body.error || "Unable to save routing");
+        if (!res.ok) { failure = { status: res.status, role: change.role, currentModel: body.currentModel || "unknown", message: body.error || "Unable to save routing" }; break; }
+        saved.push(change.role);
         auditWarning ||= !!body.auditWarning;
       }
-      await refreshOverrides(sid);
+      if (saved.length) await refreshOverrides(sid);
+      const unsaved = changes.filter((change) => !saved.includes(change.role));
+      if (failure) {
+        setDraft((old) => Object.fromEntries(Object.entries(old).filter(([role]) => unsaved.some((change) => change.role === role))));
+        setRetryRouting(null);
+        if (failure.status === 409) set((u) => ({ ...u, conflict: { role: failure.role, currentModel: failure.currentModel } }));
+        setToast(saved.length ? `${saved.join(", ")} saved; ${unsaved.map((change) => change.role).join(", ")} still need saving.` : failure.message);
+        return;
+      }
+      setDraft({});
       setRetryRouting(null);
       setToast(auditWarning ? "Routing saved, but the audit entry could not be recorded." : "Routing saved for s·" + sid + " · applies from the next request");
-    } catch { setRetryRouting({ sid, changes }); setToast("Could not apply routing. Try again."); }
-  }, [refreshOverrides, revisions]);
+    } catch {
+      const unsaved = changes.filter((change) => !saved.includes(change.role));
+      if (saved.length) {
+        setDraft((old) => Object.fromEntries(Object.entries(old).filter(([role]) => unsaved.some((change) => change.role === role))));
+        await refreshOverrides(sid).catch(() => {});
+        setRetryRouting(null);
+        setToast(`${saved.join(", ")} saved; ${unsaved.map((change) => change.role).join(", ")} still need saving.`);
+      } else {
+        setRetryRouting({ sid, changes });
+        setToast("Could not apply routing. Try again.");
+      }
+    }
+  }, [refreshOverrides, overridesBySession, set]);
   const revertOverride = useCallback(async (sid, role, revision, entry) => {
     try {
       const q = new URLSearchParams({ combo: role, revision: String(revision ?? entry?.revision ?? 0) });
@@ -102,9 +131,15 @@ export default function AgentsClient() {
     lastOverridePoll.current = now;
     let cancelled = false;
     Promise.all(ids.map(async (sid) => {
-      try { const d = await getJson(`/api/agents/sessions/${encodeURIComponent(sid)}/overrides`); return [sid, d.overrides || []]; }
-      catch { return [sid, null]; }
-    })).then((entries) => { if (!cancelled) setOverridesBySession((old) => ({ ...old, ...Object.fromEntries(entries.filter(([, value]) => value !== null)) })); });
+      try {
+        const requestId = (overrideRequestIds.get(sid) || 0) + 1;
+        overrideRequestIds.set(sid, requestId);
+        const d = await getJson(`/api/agents/sessions/${encodeURIComponent(sid)}/overrides`);
+        return [sid, { overrides: d.overrides || [], revisions: d.revisions || {}, requestId }];
+      } catch { return [sid, null]; }
+    })).then((entries) => {
+      if (!cancelled) setOverridesBySession((old) => ({ ...old, ...Object.fromEntries(entries.filter(([sid, value]) => value !== null && overrideRequestIds.get(sid) === value.requestId).map(([sid, value]) => [sid, { overrides: value.overrides, revisions: value.revisions }])) }));
+    });
     return () => { cancelled = true; };
   }, [live]);
 
@@ -198,28 +233,35 @@ export default function AgentsClient() {
     return () => { cancelled = true; };
   }, [range]);
 
-  const detailId = useRef(0);
   const loadDetail = useCallback(async (sid) => {
     if (!sid) { setDetail(null); setDetailLoad({ sid: null, status: "idle" }); return; }
-    const id = ++detailId.current;
+    const id = ++detailRequestSequence;
     setDetailLoad({ sid, status: "loading" });
     try {
       const d = await getJson(`/api/agents/sessions/${encodeURIComponent(sid)}`);
-      if (id !== detailId.current) return;
+      if (id !== detailRequestSequence) return;
       setDetail(d);
+      setDetailsBySession((old) => ({ ...old, [sid]: d }));
       setDetailLoad({ sid, status: "ready" });
-    } catch { setDetail(null); setDetailLoad({ sid, status: "error" }); }
+    } catch { if (id !== detailRequestSequence) return; setDetail(null); setDetailLoad({ sid, status: "error" }); }
   }, []);
   // Select the first row only once, when nothing is selected. Live refreshes keep the selection (A15).
   const firstSid = sessions?.[0]?.session || null;
   const selInit = useRef(false);
+  const initialSelPending = useRef(false);
   useEffect(() => {
     if (!selInit.current) {
       selInit.current = true;
       const fromUrl = new URLSearchParams(window.location.search).get("s");
-      if (fromUrl) { set({ sel: fromUrl }); return; }
+      if (fromUrl) {
+        initialSelPending.current = true;
+        const timer = setTimeout(() => { initialSelPending.current = false; set({ sel: fromUrl }); }, 0);
+        return () => clearTimeout(timer);
+      }
     }
-    if (!ui.sel && firstSid) set({ sel: firstSid });
+    if (initialSelPending.current || ui.sel || !firstSid) return;
+    const timer = setTimeout(() => set({ sel: firstSid }), 0);
+    return () => clearTimeout(timer);
   }, [ui.sel, firstSid, set]);
   useEffect(() => {
     if (!ui.sel) return;
@@ -283,10 +325,11 @@ export default function AgentsClient() {
     openTimeline: (sid) => { if (sid) { set({ tab: "sessions", sel: sid }); } else set({ tab: "sessions" }); setTick((x) => x + 1); },
   }), [set, loadMore, loadDetail, refreshOverrides]);
 
-  const v = useMemo(() => buildView({ live, sessions, totalSessions, detail, detailLoad, analytics, tools, range, ui: { ...ui, mode, errorText }, vw, combos, models, overrides, overridesBySession, revisions, draft, cf, toast, moreCursor,
+  const drawerOverrideState = overridesBySession[ui.drawer] || {};
+  const v = buildView({ live, sessions, totalSessions, detail, detailsBySession, detailLoad, analytics, tools, range, ui: { ...ui, mode, errorText }, vw, combos, models, overrides: drawerOverrideState.overrides || [], overridesBySession, revisions: drawerOverrideState.revisions || {}, draft, cf, toast, moreCursor,
     setDraft: (update) => setDraft((old) => ({ ...old, ...(typeof update === "function" ? update(old) : update) })),
     setCf, setToast, applyOverrides, reloadOverrides: refreshOverrides,
-    act: { ...act, applyOverrides, revertOverride } }), [live, sessions, totalSessions, detail, detailLoad, analytics, tools, range, ui, mode, errorText, act, vw, combos, models, overrides, overridesBySession, revisions, draft, cf, toast, moreCursor, applyOverrides, refreshOverrides, revertOverride]);
+    act: { ...act, applyOverrides, revertOverride } });
 
   const isLoading = mode === "loading", isError = mode === "error", ready = !isLoading && !isError;
   const onRange = (r) => { setRange(r); set({ hov: null, pick: null, focus: null, sel: null }); setDetail(null); const url = new URL(window.location.href); url.searchParams.delete("s"); window.history.replaceState({}, "", url); };
@@ -294,6 +337,8 @@ export default function AgentsClient() {
 
   // Drawer: Escape closes, focus moves in on open, Tab stays inside, focus returns to the trigger on close (A9).
   const drawerRef = useRef(null);
+  const confirmRef = useRef(null);
+  const modelOptionFocusReturn = useRef(false);
   const returnFocus = useRef(null);
   const dOpen = !!v.dr;
   useEffect(() => {
@@ -302,7 +347,8 @@ export default function AgentsClient() {
     const first = drawerRef.current?.querySelector('input[role="combobox"], input, select, button, [href]');
     first?.focus();
     const onKey = (e) => {
-      if (e.key === "Escape") { e.preventDefault(); act.openDrawer(null); return; }
+      if (confirmRef.current) return;
+      if (e.key === "Escape") { e.preventDefault(); closeDrawer(); return; }
       if (e.key !== "Tab" || !drawerRef.current) return;
       const items = [...drawerRef.current.querySelectorAll("button:not([disabled]), select, input, a[href]")];
       if (!items.length) return;
@@ -316,7 +362,25 @@ export default function AgentsClient() {
       const back = returnFocus.current;
       if (back && typeof back.focus === "function" && document.contains(back)) back.focus();
     };
-  }, [dOpen, ui.drawer, ui.drawerMode, act]);
+  }, [dOpen, closeDrawer]);
+  const confirmOpen = !!v.cm;
+  useEffect(() => {
+    if (!confirmOpen || !confirmRef.current) return;
+    const dialog = confirmRef.current;
+    const first = dialog.querySelector("button");
+    first?.focus();
+    const onKey = (e) => {
+      if (e.key === "Escape") { e.preventDefault(); setCf(false); return; }
+      if (e.key !== "Tab") return;
+      const items = [...dialog.querySelectorAll("button:not([disabled]), input, select, a[href]")];
+      if (!items.length) return;
+      const firstItem = items[0], lastItem = items.at(-1);
+      if (e.shiftKey && document.activeElement === firstItem) { e.preventDefault(); lastItem.focus(); }
+      else if (!e.shiftKey && document.activeElement === lastItem) { e.preventDefault(); firstItem.focus(); }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [confirmOpen, setCf]);
 
   return (
     <div data-r9={theme}>
@@ -398,10 +462,10 @@ export default function AgentsClient() {
                   {r.locked ? <p style={{ margin: 0, fontSize: 12, color: "var(--tx2)" }}><span className="material-symbols-outlined" style={{ fontSize: 14 }}>lock</span> {r.lockText}</p> : <>
                   {r.dirty && <div style={{ fontFamily: "var(--mono)", fontSize: 12, color: "var(--tx2)" }}><s>{r.from}</s> → <b style={{ color: "var(--tx)" }}>{r.to}</b></div>}
                   <div className="r9-model-picker">
-                    <label style={{ display: "flex", flexDirection: "column", gap: 4 }}><span className="r9-caps">MODEL</span><input role="combobox" aria-expanded={r.popup} aria-controls={`models-${r.role}`} aria-autocomplete="list" value={r.query} onFocus={() => r.onOpen(true)} onChange={r.onQ} onKeyDown={(e) => {
+                    <label style={{ display: "flex", flexDirection: "column", gap: 4 }}><span className="r9-caps">MODEL</span><input role="combobox" aria-expanded={r.popup} aria-controls={`models-${r.role}`} aria-autocomplete="list" value={r.query} onFocus={(e) => { if (modelOptionFocusReturn.current || e.relatedTarget?.matches('[role="option"]')) { modelOptionFocusReturn.current = false; return; } r.onOpen(true); }} onChange={r.onQ} onKeyDown={(e) => {
                       if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); r.onOpen(true); const opts = [...e.currentTarget.parentElement.parentElement.querySelectorAll('[role="option"]')]; (e.key === "ArrowDown" ? opts[0] : opts.at(-1))?.focus(); }
                       if (e.key === "Home" || e.key === "End") { e.preventDefault(); r.onOpen(true); const opts = [...e.currentTarget.parentElement.parentElement.querySelectorAll('[role="option"]')]; (e.key === "Home" ? opts[0] : opts.at(-1))?.focus(); }
-                      if (e.key === "Escape") { e.stopPropagation(); r.onOpen(false); }
+                      if (e.key === "Escape" && r.popup) { e.preventDefault(); e.stopPropagation(); r.onOpen(false); }
                       if (e.key === "Enter") { e.preventDefault(); const first = r.otherGroups.flatMap((g) => g.opts)[0]; if (first) r.onChoose(first.v); }
                     }} placeholder="Search models" aria-label={`Search models for ${r.role}`} style={{ height: 32, width: "100%", boxSizing: "border-box", padding: "0 10px", borderRadius: 8, border: "1px solid var(--line2)", background: "var(--bg)", color: "var(--tx)", fontFamily: "var(--mono)", fontSize: 12.5 }} /></label>
                     {r.popup && <div id={`models-${r.role}`} role="listbox" className="r9-model-popup">
@@ -411,7 +475,7 @@ export default function AgentsClient() {
                         if (e.key === "Home") { e.preventDefault(); opts[0]?.focus(); }
                         if (e.key === "End") { e.preventDefault(); opts.at(-1)?.focus(); }
                         if (e.key === "Enter") { e.preventDefault(); r.onChoose(o.v); }
-                        if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); r.onOpen(false); e.currentTarget.closest(".r9-model-picker")?.querySelector('[role="combobox"]')?.focus(); }
+                        if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); modelOptionFocusReturn.current = true; r.onOpen(false); e.currentTarget.closest(".r9-model-picker")?.querySelector('[role="combobox"]')?.focus(); }
                       }} style={{ height: 32, width: "100%", display: "flex", alignItems: "center", gap: 8, border: 0, background: "transparent", color: "var(--tx)", padding: "0 10px", textAlign: "left", cursor: "pointer", fontFamily: "var(--mono)", fontSize: 12.5 }}><span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis" }}>{o.label}</span>{o.current && <small>current</small>}{o.expensive && <small style={{ color: "var(--amber)" }}>$$$</small>}</button>)}</div>) : <div style={{ padding: 12, color: "var(--tx2)", fontSize: 12 }}>No chat model matches “{r.otherQ}”.</div>}
                     </div>}
                     {r.role === "" && null}{v.dr.isCodex && <div style={{ fontSize: 11, color: "var(--tx2)" }}>Codex sessions can only use OpenAI models.</div>}
@@ -430,7 +494,7 @@ export default function AgentsClient() {
         )}
         {v.cm && <>
           <div onClick={v.cancelCf} style={{ position: "fixed", inset: 0, zIndex: 95, background: "rgba(20,10,5,.28)" }} />
-          <div role="dialog" aria-modal="true" aria-label={v.cm.title} style={{ position: "fixed", top: "50%", left: "50%", transform: "translate(-50%,-50%)", zIndex: 96, width: 460, maxWidth: "calc(100vw - 32px)", background: "var(--card)", border: "1px solid var(--line2)", borderRadius: 12, boxShadow: "var(--shadow)", padding: 24, display: "flex", flexDirection: "column", gap: 14, boxSizing: "border-box" }}>
+          <div ref={confirmRef} role="dialog" aria-modal="true" aria-label={v.cm.title} style={{ position: "fixed", top: "50%", left: "50%", transform: "translate(-50%,-50%)", zIndex: 96, width: 460, maxWidth: "calc(100vw - 32px)", background: "var(--card)", border: "1px solid var(--line2)", borderRadius: 12, boxShadow: "var(--shadow)", padding: 24, display: "flex", flexDirection: "column", gap: 14, boxSizing: "border-box" }}>
             <strong>{v.cm.title}</strong>{v.cm.lines.map((line) => <div key={line.role} style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", padding: "7px 0", borderTop: "1px solid var(--line)", fontSize: 12.5 }}><span style={line.chip}>{line.role}</span><span>{line.from}</span> → <b>{line.to}</b><span style={{ color: "var(--tx2)" }}>· {line.mode} · until {line.exp}</span></div>)}
             <span style={{ fontSize: 12.5, color: "var(--tx2)" }}>Applies from the next request. Requests in flight keep their model.</span><div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}><button onClick={v.cancelCf}>Cancel</button><button onClick={v.doCf}>Apply</button></div>
           </div>
@@ -524,9 +588,9 @@ function LiveCard({ c, narrow }) {
 }
 
 function SessionsTab({ v, ui, moreBusy }) {
+  const detailRef = useRef(null);
   if (!v.v.sess) return null;
   const t = v.tree, g = v.g, sm = v.sm;
-  const detailRef = useRef(null);
   return (
     <div>
       {v.v.partial && (
@@ -596,7 +660,7 @@ function DetailsDrawer({ data, onRoute, onClose }) {
       </section>
       <section><h3 className="r9-drawer-section-title">Facts</h3><dl className="r9-facts">{data.facts.map(([label, value]) => <React.Fragment key={label}><dt>{label}</dt><dd>{label === "Parent" && data.parentSession ? <button onClick={data.openParent} style={{ border: 0, background: "none", padding: 0, color: "var(--acc)", font: "12.5px var(--mono)", cursor: "pointer" }}>{value}</button> : factValue(label, value)}</dd></React.Fragment>)}</dl></section>
       <section><h3 className="r9-drawer-section-title">Totals</h3><div className="r9-details-kpis">{data.stats.map(([label, value, sub]) => <div key={label}><div className="r9-caps">{label}</div><strong style={{ color: label === "Value" ? "var(--violet)" : "var(--tx)" }}>{value === "Not recorded" ? <span className="r9-nodata" title={`${label} is not available in the session data.`} aria-label={`${label} is not recorded`}><span className="material-symbols-outlined" style={{ fontSize: 14 }}>info</span>Not recorded</span> : value}</strong>{sub && <small>{sub}</small>}</div>)}</div></section>
-      <section><h3 className="r9-drawer-section-title">Roles and models</h3>{data.roles.length ? data.roles.map((r) => <div className="r9-detail-role" key={`${r.role}-${r.model}`}><span style={r.chip}>{r.role}</span><span className="r9-detail-model" title={r.model}>{r.model}</span><span>{r.requests} · {r.tokens}</span><span className="r9-share-track"><i style={{ width: `${r.share}%`, background: r.color }} /></span><b style={{ color: "var(--violet)" }}>{r.value}</b></div>) : <span className="r9-nodata" title="No role totals are available."><span className="material-symbols-outlined" style={{ fontSize: 14 }}>info</span>Not recorded</span>}</section>
+      <section><h3 className="r9-drawer-section-title">Roles and models{data.roleSampled ? " · sampled" : ""}</h3>{data.roleSampled && <small style={{ display: "block", color: "var(--tx2)", marginBottom: 6 }}>From the latest 2,000 requests.</small>}{data.roles.length ? data.roles.map((r) => <div className="r9-detail-role" key={`${r.role}-${r.model}`}><span style={r.chip}>{r.role}</span><span className="r9-detail-model" title={r.model}>{r.model}</span><span>{r.requests} · {r.tokens}</span><span className="r9-share-track"><i style={{ width: `${r.share}%`, background: r.color }} /></span><b style={{ color: "var(--violet)" }}>{r.value}</b></div>) : <span className="r9-nodata" title="No role totals are available."><span className="material-symbols-outlined" style={{ fontSize: 14 }}>info</span>Not recorded</span>}</section>
       <section><h3 className="r9-drawer-section-title">Tools</h3>{data.tools.length ? data.tools.slice(0, 8).map((tool) => <div className="r9-tool-row" key={tool.name}><code>{tool.name}</code><span>{tool.calls}{tool.errors > 0 && <b title={`${tool.errors} tool errors`} style={{ color: "var(--red)", marginLeft: 8 }}>{tool.errors} ✕</b>}</span></div>) : <span className="r9-nodata" title="Tool calls are not included in this session response."><span className="material-symbols-outlined" style={{ fontSize: 14 }}>info</span>Not recorded</span>}</section>
     </div>
     <div style={{ position: "sticky", bottom: 0, minHeight: 56, display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 8, padding: "0 16px", borderTop: "1px solid var(--line)", background: "var(--card)" }}><button onClick={onRoute} style={{ height: 32, border: 0, borderRadius: 7, padding: "0 12px", background: "var(--acc)", color: "#fff", font: "inherit", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Change routing</button><button onClick={onClose} style={{ height: 32, border: "1px solid var(--line2)", borderRadius: 7, padding: "0 12px", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: 12, cursor: "pointer" }}>Close</button></div>
@@ -605,17 +669,17 @@ function DetailsDrawer({ data, onRoute, onClose }) {
 
 function Gantt({ v, ui }) {
   const g = v.g, sm = v.sm;
-  const rootRef = useRef(null), triggerRef = useRef(null);
+  const popoverRef = useRef(null), triggerRef = useRef(null);
   useEffect(() => {
     if (!g.pick) return;
     const close = () => { v.closePick(); triggerRef.current?.focus(); };
     const key = (e) => { if (e.key === "Escape") { e.preventDefault(); close(); } };
-    const down = (e) => { if (!rootRef.current?.contains(e.target)) close(); };
+    const down = (e) => { if (!popoverRef.current?.contains(e.target)) close(); };
     document.addEventListener("keydown", key); document.addEventListener("mousedown", down);
     return () => { document.removeEventListener("keydown", key); document.removeEventListener("mousedown", down); };
   }, [g.pick, v]);
   return (
-    <div ref={rootRef} style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: 12, boxShadow: "var(--shadow)", padding: 16 }}>
+    <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: 12, boxShadow: "var(--shadow)", padding: 16 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
         <span style={{ fontSize: 14, fontWeight: 700 }}>{sm.id}</span>
         <span style={{ fontSize: 12, color: "var(--tx2)" }}>{sm.client} · {sm.when}</span>
@@ -658,7 +722,7 @@ function Gantt({ v, ui }) {
           </div>
         )}
         {g.pick && (
-          <div role="dialog" aria-label={"Request " + g.pick.rid} style={{ position: "absolute", ...g.pick, zIndex: 31, width: 280, maxWidth: "calc(100% - 16px)", boxSizing: "border-box", background: "var(--card)", border: "1px solid var(--line2)", borderRadius: 10, boxShadow: "0 12px 32px rgba(40,20,10,.16)", padding: 12 }}>
+          <div ref={popoverRef} role="dialog" aria-label={"Request " + g.pick.rid} style={{ position: "absolute", ...g.pick, zIndex: 31, width: 280, maxWidth: "calc(100% - 16px)", boxSizing: "border-box", background: "var(--card)", border: "1px solid var(--line2)", borderRadius: 10, boxShadow: "0 12px 32px rgba(40,20,10,.16)", padding: 12 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <span style={{ fontSize: 12.5, fontWeight: 700 }}>{g.pick.model}</span>
               <span style={g.pick.stStyle}>{g.pick.status}</span>
