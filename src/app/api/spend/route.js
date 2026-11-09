@@ -47,7 +47,7 @@ function resolveRange(params, now, firstMs) {
 }
 
 function bump(map, k, init) { return map.get(k) || (map.set(k, init()), map.get(k)); }
-const acc = () => ({ v: 0, real: 0, list: 0, req: 0, tok: 0 });
+const acc = () => ({ v: 0, real: 0, realEst: 0, list: 0, req: 0, tok: 0 });
 
 export async function GET(request) {
   try {
@@ -99,7 +99,7 @@ export async function GET(request) {
       if (est) realEst += cost;
       const sk = SUB_OF[r.provider];
       const t = (r.promptTokens || 0) + (r.completionTokens || 0);
-      addModelEffortUsage(byModelEffort, { model: r.model, effort: meta.sentEffort, cost, real: rReal, tokens: t });
+      addModelEffortUsage(byModelEffort, { model: r.model, effort: meta.sentEffort, cost, real: rReal, realEst: est ? rReal : 0, tokens: t });
       b.list += cost; b.real += rReal;
       const keyName0 = keyNames.get(r.apiKey) || (r.apiKey ? "Unknown key" : "No key");
       (b.keys ||= new Map()).set(keyName0, (b.keys.get(keyName0) || 0) + cost);
@@ -111,7 +111,7 @@ export async function GET(request) {
       const client = meta.ua !== undefined ? clientOf(meta.ua) : null;
       const role = meta.ua !== undefined ? meta.combo || "main" : null;
       drilldown.add({ provider: r.provider, model: r.model, tokens: r.tokens, promptTokens: r.promptTokens, completionTokens: r.completionTokens, effort: meta.sentEffort, cost, real: rReal, realEst: est ? rReal : 0, client, role });
-      const add = (m, k) => { const o = bump(m, k, () => ({ ...acc(), clients: {}, keys: {}, mix: {}, n: 0, provider: r.provider })); o.v += cost; o.real += rReal; o.req++; o.tok += t; return o; };
+      const add = (m, k) => { const o = bump(m, k, () => ({ ...acc(), clients: {}, keys: {}, mix: {}, n: 0, provider: r.provider })); o.v += cost; o.real += rReal; if (est) o.realEst += rReal; o.req++; o.tok += t; return o; };
       const ko = add(byKey, keyName); if (client) ko.clients[client] = (ko.clients[client] || 0) + cost;
       const mo = add(byModel, r.model || "unknown"); mo.keys[keyName] = (mo.keys[keyName] || 0) + cost; if (client) mo.clients[client] = (mo.clients[client] || 0) + cost;
       add(byProv, r.provider || "unknown");
@@ -120,7 +120,7 @@ export async function GET(request) {
         const co = add(byClient, client); co.mix[r.model] = (co.mix[r.model] || 0) + cost; co.keys[keyName] = (co.keys[keyName] || 0) + cost;
         if (meta.session) {
           const s = bump(bySess, meta.session, () => ({ ...acc(), id: meta.session, client, role, key: keyName, start: ms, end: ms, models: new Map(), times: [] }));
-          s.v += cost; s.real += rReal; s.req++; s.tok += t; s.start = Math.min(s.start, ms); s.end = Math.max(s.end, ms);
+          s.v += cost; s.real += rReal; if (est) s.realEst += rReal; s.req++; s.tok += t; s.start = Math.min(s.start, ms); s.end = Math.max(s.end, ms);
           if (s.times.length < 400) s.times.push(ms);
           const sm = bump(s.models, r.model, () => ({ provider: r.provider, req: 0, v: 0, real: 0 })); sm.req++; sm.v += cost; sm.real += rReal;
         }
@@ -128,7 +128,7 @@ export async function GET(request) {
       top.push({ ms, model: r.model, provider: r.provider, key: keyName, combo: meta.combo || "", client, sess: meta.session || null, tok: t, v: cost, real: rReal, est, logged: !!client });
     }
 
-    const pack = (m) => [...m.entries()].map(([k, o]) => ({ k, v: o.v, real: o.real, req: o.req, tok: o.tok, n: o.n, provider: o.provider,
+    const pack = (m) => [...m.entries()].map(([k, o]) => ({ k, v: o.v, real: o.real, realEst: o.realEst, req: o.req, tok: o.tok, n: o.n, provider: o.provider,
       clients: Object.entries(o.clients || {}).sort((a, b) => b[1] - a[1]).map((e) => e[0]),
       keys: Object.entries(o.keys || {}).sort((a, b) => b[1] - a[1]).map((e) => e[0]),
       mix: Object.entries(o.mix || {}).sort((a, b) => b[1] - a[1]) }));
@@ -137,7 +137,7 @@ export async function GET(request) {
     const sessions = [...bySess.values()].sort((a, b) => b.v - a.v);
     const sessOut = sessions.slice(0, 200).map((s) => ({
       id: s.id, client: s.client, role: s.role, key: s.key, start: s.start, end: s.end, startDay: fmtDay(s.start), startTime: hhmm(s.start), endTime: hhmm(s.end),
-      isToday: dayKey(s.start) === dayKey(now), v: s.v, real: s.real, req: s.req, tok: s.tok,
+      isToday: dayKey(s.start) === dayKey(now), v: s.v, real: s.real, realEst: s.realEst, req: s.req, tok: s.tok,
       ticks: s.times.slice(0, 40).map((x) => (s.end > s.start ? (x - s.start) / (s.end - s.start) : 0.5)),
       models: [...s.models.entries()].sort((a, b) => b[1].v - a[1].v).map(([m, o]) => ({ m, ...o })),
     }));
@@ -171,7 +171,8 @@ export async function GET(request) {
         role: pack(byCombo), client: pack(byClient), provider: pack(byProv),
       },
       roleCount, sessionCount: sessions.length, sessionValue: sessions.reduce((a, s) => a + s.v, 0),
-      sessionRest: sessions.slice(8).reduce((a, s) => ({ v: a.v + s.v, real: a.real + s.real, req: a.req + s.req, tok: a.tok + s.tok }), { v: 0, real: 0, req: 0, tok: 0 }),
+      sessionRest: sessions.slice(8).reduce((a, s) => ({ v: a.v + s.v, real: a.real + s.real, realEst: a.realEst + s.realEst, req: a.req + s.req, tok: a.tok + s.tok }), { v: 0, real: 0, realEst: 0, req: 0, tok: 0 }),
+      sessionRest10: sessions.slice(10).reduce((a, s) => ({ v: a.v + s.v, real: a.real + s.real, realEst: a.realEst + s.realEst, req: a.req + s.req, tok: a.tok + s.tok }), { v: 0, real: 0, realEst: 0, req: 0, tok: 0 }),
       sessions: sessOut, outliers: { value: byValue, real: byReal }, topBars,
     }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {

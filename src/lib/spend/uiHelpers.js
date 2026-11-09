@@ -61,7 +61,7 @@ export function mapQuotaRows(apiRows = []) {
     const known = r.windowMs != null && r.limitKnown !== false;
     const row = {
       id: `${r.provider}:${r.name}:${r.window}`, prov, win: windowLabel(r.window), pct: r.usedPct == null ? null : Number(r.usedPct),
-      reset: r.resetAt, known, proj: r.projectedPct == null ? null : Math.round(r.projectedPct), runOut: r.runsOutAt,
+      reset: r.resetAt, known, proj: r.projectedPct == null ? null : Number(r.projectedPct), runOut: r.runsOutAt,
       risk: r.limitKnown === false || r.usedPct == null ? "unknown" : r.risk || "unknown",
     };
     if (r.provider === "antigravity" && r.windowMs == null) {

@@ -36,6 +36,12 @@ describe("quota runway mapping", () => {
     expect(rows.map((r) => r.id)).toEqual(["h", "w", "ok2", "ok", "u", "e"]);
   });
 
+  it("keeps the exact projected percent so 100.4% is not rounded to safe", () => {
+    const [row] = mapQuotaRows([{ provider: "claude", name: "x", window: "weekly (7d)", usedPct: 90, windowMs: 6048e5, resetAt: NOW + 1e6, projectedPct: 100.4, runsOutAt: NOW + 5e5, risk: "high", limitKnown: true }]);
+    expect(row.proj).toBe(100.4);
+    expect(row.runOut).toBeLessThan(row.reset);
+  });
+
   it("maps error rows and keeps plain window names", () => {
     const rows = mapQuotaRows([{ provider: "codex", name: "c", error: "usage request timed out" }, { provider: "claude", name: "x", window: "weekly (7d)", usedPct: 50, windowMs: 6048e5, risk: "ok", limitKnown: true }]);
     expect(rows[0]).toMatchObject({ risk: "error", err: "OpenAI Codex: usage request timed out" });

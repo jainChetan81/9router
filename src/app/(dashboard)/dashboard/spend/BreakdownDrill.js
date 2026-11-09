@@ -11,7 +11,7 @@ const SPC = ["var(--tx)", "var(--blue)", "var(--amber)", "var(--green)"], SPN = 
 const SPK = ["input", "cacheRead", "cacheWrite", "output"];
 const OPS = [1, 0.72, 0.5, 0.34, 0.22, 0.14, 0.1];
 const PROV = { claude: "Claude Code", codex: "OpenAI Codex", antigravity: "Antigravity", "opencode-go": "OpenCode Go", muse: "Muse", openrouter: "OpenRouter", deepseek: "DeepSeek", "ollama-local": "Ollama", ollama: "Ollama", opencode: "OpenCode Free" };
-const DESC = { claude: "Subscription · Max", codex: "Subscription · Pro", antigravity: "Subscription · Pro", "opencode-go": "Subscription · Go", muse: "Subscription · Basic", openrouter: "Pay per token", deepseek: "Pay per token · prepaid", "ollama-local": "Local · free", ollama: "Local · free", opencode: "Free tier" };
+const DESC = { claude: "Subscription", codex: "Subscription", antigravity: "Subscription", "opencode-go": "Subscription", muse: "Subscription", openrouter: "Pay per token", deepseek: "Pay per token · prepaid", "ollama-local": "Local · free", ollama: "Local · free", opencode: "Free tier" };
 const GROUPS = [["key", "API key"], ["model", "Model"], ["modelEffort", "Model + effort"], ["role", "Combo/Role"], ["client", "Client"], ["session", "Session"], ["provider", "Provider"]];
 const GH = { key: "API key", model: "Model", modelEffort: "Model + effort", role: "Combo / role", client: "Client", session: "Session", provider: "Provider" };
 const MH = { value: "Share of value", real: "Share of real spend", req: "Share of requests", tok: "Share of tokens" };
@@ -64,7 +64,9 @@ export default function BreakdownDrill({ data, state, group, onGroup, onRetry, o
   if (data) {
     const G = data.groups;
     if (group === "provider") {
-      const tree = (G.providerTree || []).map((p) => node(p, PROV[p.k] || p.k, DESC[p.k] || "Provider", {
+      const feeKey = Object.fromEntries((data.subsMeta || []).map((m) => [m.provider, m.k]));
+      const fee = (k) => { const f = data.fees?.[feeKey[k]]; return f !== null && f !== undefined && f !== "" ? " · $" + (+f).toFixed(0) + "/mo" : ""; };
+      const tree = (G.providerTree || []).map((p) => node(p, PROV[p.k] || p.k, (DESC[p.k] || "Provider") + (feeKey[p.k] ? fee(p.k) : ""), {
         id: p.k, models: (p.models || []).map((m) => node(m, m.k, "", { efforts: (m.efforts || []).map((e) => node(e, e.k, "")) })),
       }));
       const den = sum(tree, mv);
@@ -95,10 +97,7 @@ export default function BreakdownDrill({ data, state, group, onGroup, onRetry, o
       else if (group === "client") items = (G.client || []).map((o) => node(o, o.k, (o.mix || []).slice(0, 3).map((e) => e[0]).join(", "), { mixArr: mixOf(o) }));
       else if (group === "session") {
         items = (data.sessions || []).slice(0, 10).map((x) => node(x, "s·" + x.id, x.client + " · " + x.role, { mono: true }));
-        if ((data.sessionCount || 0) > 10) {
-          const rest = (data.sessions || []).slice(10);
-          items.push(node({ v: sum(rest, (x) => x.v), real: sum(rest, (x) => x.real), req: sum(rest, (x) => x.req), tok: sum(rest, (x) => x.tok) }, fN(data.sessionCount - 10) + " other sessions", "Below top 10"));
-        }
+        if ((data.sessionCount || 0) > 10 && data.sessionRest10) items.push(node(data.sessionRest10, fN(data.sessionCount - 10) + " other sessions", "Below top 10"));
       }
       if (["role", "client", "session"].includes(group) && T.nrReq > 0)
         items.push({ name: "Not recorded", desc: "Before " + (data.loggedSinceLabel || "logging start") + " · logging start", r: T.nrReq, t: T.nrTok || 0, v: T.nrList || 0, re: null, es: 0, sp: null, muted: true });
