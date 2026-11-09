@@ -139,10 +139,15 @@ export function getModelLockKey(model) {
  * Reads flat field `modelLock_${model}` (or `modelLock___all` when model=null).
  */
 export function isModelLockActive(connection, model) {
+  if (!connection) return false;
   const key = getModelLockKey(model);
-  const expiry = connection[key] || connection[MODEL_LOCK_ALL];
-  if (!expiry) return false;
-  return new Date(expiry).getTime() > Date.now();
+  const now = Date.now();
+  const activeExpiries = [connection[key], connection[MODEL_LOCK_ALL]]
+    .filter(Boolean)
+    .map((expiry) => new Date(expiry).getTime())
+    .filter((expiry) => Number.isFinite(expiry) && expiry > now);
+  const latestActiveExpiry = Math.max(...activeExpiries);
+  return Number.isFinite(latestActiveExpiry) && latestActiveExpiry > now;
 }
 
 /**

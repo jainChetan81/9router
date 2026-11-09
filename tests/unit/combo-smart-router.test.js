@@ -230,7 +230,7 @@ describe("System One Smart Combo Router", () => {
       expect(calls[0]).toBe("cx/gpt-5-mini"); // Default first model
     });
 
-    it("falls back to the next candidate and clears sticky lock if the chosen model fails", async () => {
+    it("pins the fallback when the chosen model fails", async () => {
       const calls = [];
       const handleSingleModel = vi.fn(async (_body, model) => {
         calls.push(model);
@@ -258,8 +258,7 @@ describe("System One Smart Combo Router", () => {
 
       expect(res.ok).toBe(true);
       expect(calls).toEqual(["ds/deepseek-v4", "cx/gpt-5-mini"]);
-      // Because ds/deepseek-v4 failed, the sticky lock should have been cleared
-      expect(getStickyComboModel("dev-combo", "session-error-fallback", ["cx/gpt-5-mini", "ds/deepseek-v4"])).toBeNull();
+      expect(getStickyComboModel("dev-combo", "session-error-fallback", ["cx/gpt-5-mini", "ds/deepseek-v4"])).toBe("cx/gpt-5-mini");
     });
 
     it("re-evaluates on each turn when sessionSticky is explicitly false", async () => {
@@ -307,6 +306,23 @@ describe("System One Smart Combo Router", () => {
 
       expect(resolveSmartChoice).toHaveBeenCalledTimes(2);
       expect(calls[1]).toBe("cx/gpt-5-mini");
+      expect(getStickyComboModel("dev-combo", "session-nostick", ["cx/gpt-5-mini", "ds/deepseek-v4"])).toBeNull();
+    });
+
+    it("does not persist a smart per-turn selection", async () => {
+      await handleComboChat({
+        body: { messages: [{ role: "user", content: "One turn" }] },
+        models: ["cx/gpt-5-mini", "ds/deepseek-v4"],
+        handleSingleModel: async () => okResponse(),
+        log,
+        comboName: "dev-combo",
+        comboStrategy: "smart",
+        sessionId: "session-per-turn",
+        smartPolicy: "per-turn",
+        resolveSmartChoice: async () => ({ choice: "ds/deepseek-v4", confidence: 0.95 }),
+      });
+
+      expect(getStickyComboModel("dev-combo", "session-per-turn", ["cx/gpt-5-mini", "ds/deepseek-v4"])).toBeNull();
     });
 
     it("falls back to default order when decision confidence is below confidenceThreshold", async () => {

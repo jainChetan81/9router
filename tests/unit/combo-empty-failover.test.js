@@ -1,5 +1,7 @@
 // empty-content failover for combo streaming responses.
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { handleComboChat, resetComboRotation } from "../../open-sse/services/combo.js";
+import { getStickyComboModel } from "../../open-sse/services/systemoneRouter.js";
 import {
   deltaHasClientContent,
   inspectSSELine,
@@ -393,5 +395,150 @@ describe("combo fall-through per client format (real combo.js + streaming pipeli
       expect(tried).toEqual(["openai/m0"]);
       expect(out).toContain('"reason":"content_filter"');
     });
+  });
+});
+
+describe("sticky combo acceptance after empty failover", () => {
+  const models = ["openai/empty", "openai/good"];
+  const body = { messages: [{ role: "user", content: "hi" }] };
+  const log = { info() {}, warn() {} };
+
+  beforeEach(() => resetComboRotation());
+
+  it("pins the member whose SSE stream contains usable content", async () => {
+    const tried = [];
+    const result = await handleComboChat({
+      body,
+      models,
+      handleSingleModel: async (_body, model) => {
+        tried.push(model);
+        const frames = model === models[0]
+          ? [ROLE, EMPTY_STOP, DONE]
+          : [ROLE, CONTENT, DONE];
+        return new Response(sseStream(frames), {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+      },
+      log,
+      comboName: "sticky-sse-fallback",
+      comboStrategy: "round-robin",
+      sessionId: "sse-session",
+      autoSwitch: false,
+    });
+
+    expect(await result.text()).toContain('"content":"OK"');
+    expect(tried).toEqual(models);
+    expect(getStickyComboModel("sticky-sse-fallback", "sse-session", models)).toBe(models[1]);
+  });
+
+  it("pins the member whose JSON response contains usable content", async () => {
+    const tried = [];
+    const result = await handleComboChat({
+      body,
+      models,
+      handleSingleModel: async (_body, model) => {
+        tried.push(model);
+        const payload = model === models[0]
+          ? { choices: [{ message: { role: "assistant", content: "" }, finish_reason: null }] }
+          : { choices: [{ message: { role: "assistant", content: "usable" }, finish_reason: "stop" }] };
+        return new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+      log,
+      comboName: "sticky-json-fallback",
+      comboStrategy: "round-robin",
+      sessionId: "json-session",
+      autoSwitch: false,
+    });
+
+    expect((await result.json()).choices[0].message.content).toBe("usable");
+    expect(tried).toEqual(models);
+    expect(getStickyComboModel("sticky-json-fallback", "json-session", models)).toBe(models[1]);
+  });
+
+  it("returns a known-empty final SSE response unchanged without pinning it", async () => {
+    const finalModels = ["openai/final-empty"];
+    const result = await handleComboChat({
+      body,
+      models: finalModels,
+      handleSingleModel: async () => new Response(sseStream([ROLE, EMPTY_STOP, DONE]), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+      log,
+      comboName: "sticky-final-empty",
+      comboStrategy: "round-robin",
+      sessionId: "final-session",
+      autoSwitch: false,
+    });
+
+    expect(result.status).toBe(200);
+    expect(await result.text()).toContain('"finish_reason":"stop"');
+    expect(getStickyComboModel("sticky-final-empty", "final-session", finalModels)).toBeNull();
+  });
+
+  it("pins a legitimate no-retry content-filter finish", async () => {
+    const filterModels = ["openai/filtered"];
+    const result = await handleComboChat({
+      body,
+      models: filterModels,
+      handleSingleModel: async () => new Response(sseStream([ROLE, FILTER_STOP, DONE]), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+      log,
+      comboName: "sticky-content-filter",
+      comboStrategy: "round-robin",
+      sessionId: "filter-session",
+      autoSwitch: false,
+    });
+
+    expect(await result.text()).toContain('"finish_reason":"content_filter"');
+    expect(getStickyComboModel("sticky-content-filter", "filter-session", filterModels)).toBe(filterModels[0]);
+  });
+
+  it("returns the final empty JSON response as-is when every member is empty", async () => {
+    const result = await handleComboChat({
+      body,
+      models,
+      handleSingleModel: async () => new Response(JSON.stringify({ choices: [{ message: { content: "" }, finish_reason: "in_progress" }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+      log,
+      comboName: "all-empty",
+      comboStrategy: "fallback",
+      autoSwitch: false,
+    });
+    expect(result.status).toBe(200);
+  });
+
+  it("keeps the real upstream status when empty output is followed by errors", async () => {
+    const result = await handleComboChat({
+      body,
+      models,
+      handleSingleModel: async (_body, model) => {
+        if (model === models[0]) {
+          return new Response(sseStream([ROLE, EMPTY_STOP, DONE]), {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+          });
+        }
+        return new Response(JSON.stringify({ error: { message: "member unavailable" } }), {
+          status: 500,
+          headers: { "content-type": "application/json" },
+        });
+      },
+      log,
+      comboName: "empty-then-error",
+      comboStrategy: "fallback",
+      autoSwitch: false,
+    });
+
+    expect(result.status).toBe(500);
+    expect((await result.json()).error.message).toContain("member unavailable");
   });
 });

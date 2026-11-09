@@ -211,6 +211,28 @@ function normalizeStickyLimit(stickyLimit) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
 }
 
+function parseRetryAfterValue(value, now = Date.now()) {
+  if (value === null || value === undefined || value === "") return null;
+
+  const text = String(value).trim();
+  if (!text) return null;
+
+  let retryAtMs;
+  if (/^\d+(?:\.\d+)?$/.test(text)) {
+    const seconds = Number(text);
+    if (!Number.isFinite(seconds) || seconds <= 0) return null;
+    retryAtMs = now + seconds * 1000;
+  } else {
+    retryAtMs = Date.parse(text);
+  }
+
+  if (!Number.isFinite(retryAtMs) || retryAtMs <= now) return null;
+  const retryAt = new Date(retryAtMs);
+  // Out-of-range values (e.g. "Retry-After: 99999999999999") make an Invalid Date.
+  if (Number.isNaN(retryAt.getTime())) return null;
+  return retryAt.toISOString();
+}
+
 function rotateModelsFromIndex(models, currentIndex) {
   const rotatedModels = [...models];
   for (let i = 0; i < currentIndex; i++) {
@@ -298,6 +320,15 @@ export function getComboModelsFromData(modelStr, combosData) {
  * (e.g. empty assistant message with in_progress/incomplete)
  * so combo fallback can continue to the next model.
  */
+// Finish reason of a non-streaming JSON response, in the OpenAI vocabulary used by isNoRetryFinish.
+function getJsonFinishReason(data) {
+  if (!data || typeof data !== "object") return null;
+  const choiceFinish = Array.isArray(data.choices) ? data.choices[0]?.finish_reason : null;
+  if (choiceFinish) return choiceFinish;
+  if (data.stop_reason === "refusal") return "content_filter";
+  return null;
+}
+
 export function isZeroContentResponse(data) {
   if (!data || typeof data !== "object") return false;
 
@@ -368,9 +399,20 @@ export async function handleComboChat({
 }) {
   let rotatedModels = models;
   let activeStickyModel = null;
+  const normalizedSmartPolicy = (typeof smartPolicy === "string" ? smartPolicy : "smart").toLowerCase();
+  const canPinAcceptedResponse = Boolean(
+    sessionSticky && sessionId && (
+      comboStrategy === "round-robin" ||
+      (comboStrategy === "smart" && normalizedSmartPolicy !== "per-turn")
+    )
+  );
+  const acceptResponse = (response, modelStr) => {
+    if (canPinAcceptedResponse) setStickyComboModel(comboName, sessionId, modelStr);
+    return response;
+  };
 
   if (comboStrategy === "smart") {
-    const policy = (typeof smartPolicy === "string" ? smartPolicy : "smart").toLowerCase();
+    const policy = normalizedSmartPolicy;
     const isPerTurn = policy === "per-turn" || sessionSticky === false;
     const isStrict = policy === "strict";
 
@@ -402,13 +444,10 @@ export async function handleComboChat({
           const conf = typeof smartResult?.confidence === "number" ? smartResult.confidence : null;
 
           if (newChoice && newChoice !== activeStickyModel && models.includes(newChoice) && conf !== null && conf >= switchThreshold) {
-            // Task changed with high confidence: switch model and update session
+            // Task changed with high confidence: order the new candidate first.
+            // Persist it only after that member returns an accepted response.
             rotatedModels = orderModelsByChoice(models, smartResult);
             log.info("COMBO", `smart-router [smart-switch] task changed → switched from ${activeStickyModel} to ${newChoice} (confidence: ${conf} >= ${switchThreshold})`);
-            if (sessionId) {
-              setStickyComboModel(comboName, sessionId, newChoice);
-              activeStickyModel = newChoice;
-            }
           } else {
             // Stay on current model to preserve warm prompt cache
             rotatedModels = [activeStickyModel, ...models.filter((m) => m !== activeStickyModel)];
@@ -434,10 +473,6 @@ export async function handleComboChat({
           } else {
             rotatedModels = orderModelsByChoice(models, smartResult);
             log.info("COMBO", `smart-router selected ${smartResult.choice} (confidence: ${conf ?? "N/A"})`);
-            if (!isPerTurn && sessionId) {
-              setStickyComboModel(comboName, sessionId, smartResult.choice);
-              activeStickyModel = smartResult.choice;
-            }
           }
         } else {
           log.info("COMBO", `smart-router no decision, fallback to order: [${models.join(", ")}]`);
@@ -454,9 +489,7 @@ export async function handleComboChat({
       rotatedModels = [activeStickyModel, ...models.filter((m) => m !== activeStickyModel)];
     } else {
       rotatedModels = getRotatedModels(models, comboName, comboStrategy, comboStickyLimit);
-      activeStickyModel = rotatedModels[0];
-      setStickyComboModel(comboName, sessionId, activeStickyModel);
-      log.info("COMBO", `round-robin pinned session "${sessionId}" → ${activeStickyModel}`);
+      log.info("COMBO", `round-robin selected initial candidate for session "${sessionId}" → ${rotatedModels[0]}`);
     }
   } else {
     // Apply rotation strategy if enabled
@@ -478,6 +511,8 @@ export async function handleComboChat({
   let lastError = null;
   let earliestRetryAfter = null;
   let lastStatus = null;
+  // Empty output is tracked apart from real upstream statuses, so a later 429/5xx keeps its status.
+  let sawEmptyOutput = false;
   let requestScopedResult = null;
 
   for (let i = 0; i < rotatedModels.length; i++) {
@@ -509,35 +544,43 @@ export async function handleComboChat({
 
         if (!peeked) {
           // Non-streaming (or non-SSE) response — not this peek's job. The zero-content
-          // JSON check still applies on a non-final seat.
+          // JSON check determines whether to fall through or preserve a final empty response.
           const isLastModel = i === rotatedModels.length - 1;
-          if (!isLastModel) {
-            const contentType = result.headers?.get?.("content-type") || "";
-            if (contentType.includes("application/json")) {
-              try {
-                const peekBody = await result.clone().json();
-                if (isZeroContentResponse(peekBody)) {
-                  log.warn("COMBO", `Model ${modelStr} returned HTTP 200 with zero usable content, falling back to next model`);
-                  if (sessionId && modelStr === activeStickyModel) {
-                    clearStickyComboSession(comboName, sessionId);
-                  }
-                  lastError = "Zero usable content";
-                  lastStatus = 200;
-                  continue;
-                }
-              } catch {
-                // Ignore JSON parse errors
+          const contentType = result.headers?.get?.("content-type") || "";
+          if (contentType.includes("application/json")) {
+            try {
+              const peekBody = await result.clone().json();
+              // A safety/refusal finish is a legitimate answer: never retry it on another member.
+              if (isNoRetryFinish(getJsonFinishReason(peekBody))) {
+                log.warn("COMBO", `Model ${modelStr} returned a no-retry finish, returning as-is`);
+                return acceptResponse(result, modelStr);
               }
+              if (isZeroContentResponse(peekBody)) {
+                if (isLastModel) {
+                  log.warn("COMBO", `Model ${modelStr} returned HTTP 200 with zero usable content as the final candidate, returning as-is`);
+                  if (sessionId) clearStickyComboSession(comboName, sessionId, modelStr);
+                  return result;
+                }
+                log.warn("COMBO", `Model ${modelStr} returned HTTP 200 with zero usable content, falling back to next model`);
+                if (sessionId && modelStr === activeStickyModel) {
+                  clearStickyComboSession(comboName, sessionId, modelStr);
+                }
+                lastError = "Zero usable content";
+                sawEmptyOutput = true;
+                continue;
+              }
+            } catch {
+              // Ignore JSON parse errors
             }
           }
 
           log.info("COMBO", `Model ${modelStr} succeeded`);
-          return result;
+          return acceptResponse(result, modelStr);
         }
 
         if (peeked.outcome === "content") {
           log.info("COMBO", `Model ${modelStr} succeeded${peeked.timedOut ? " (peek deadline; committed)" : ""}`);
-          return peeked.response;
+          return acceptResponse(peeked.response, modelStr);
         }
 
         // Empty generation. Fall through to the next candidate unless this is a legitimately
@@ -547,38 +590,47 @@ export async function handleComboChat({
         const isLast = i === rotatedModels.length - 1;
         if (isNoRetryFinish(peeked.finishReason) || isLast) {
           log.warn("COMBO", `Model ${modelStr} returned empty (${reasonLabel}) — ${isNoRetryFinish(peeked.finishReason) ? "no-retry class" : "last candidate"}, returning as-is`);
+          if (isNoRetryFinish(peeked.finishReason)) return acceptResponse(peeked.response, modelStr);
+          // A known-empty final answer must not keep (or leave) this member pinned.
+          if (sessionId) clearStickyComboSession(comboName, sessionId, modelStr);
           return peeked.response;
         }
 
         log.warn("COMBO", `Model ${modelStr} returned empty (${reasonLabel}) — falling through to next candidate`);
         if (sessionId && modelStr === activeStickyModel) {
-          clearStickyComboSession(comboName, sessionId);
+          clearStickyComboSession(comboName, sessionId, modelStr);
         }
         // Drain/close the discarded stream in the background so its usage logging still runs.
         peeked.response.body?.cancel?.().catch(() => {});
         lastError = `empty generation (${reasonLabel})`;
-        if (!lastStatus) lastStatus = 502;
+        sawEmptyOutput = true;
         continue;
       }
 
       // If the model that failed was the session-sticky model, clear it so next turns re-evaluate
       if (sessionId && modelStr === activeStickyModel) {
-        clearStickyComboSession(comboName, sessionId);
+        clearStickyComboSession(comboName, sessionId, modelStr);
       }
 
       // Extract error info from response
       let errorText = result.statusText || "";
-      let retryAfter = null;
+      let errorBody = null;
       try {
-        const errorBody = await result.clone().json();
+        errorBody = await result.clone().json();
         errorText = errorBody?.error?.message || errorBody?.error || errorBody?.message || errorText;
-        retryAfter = errorBody?.retryAfter || null;
       } catch {
         // Ignore JSON parse errors
       }
 
-      // Track earliest retryAfter across all combo models
-      if (retryAfter && (!earliestRetryAfter || new Date(retryAfter) < new Date(earliestRetryAfter))) {
+      // Keep the earliest future retry time from either the response header or the
+      // legacy JSON field. Retry-After may contain delta-seconds or an HTTP-date.
+      const retryAfterValues = [
+        result.headers?.get?.("retry-after"),
+        errorBody?.retryAfter,
+      ].map((value) => parseRetryAfterValue(value)).filter(Boolean);
+      const retryAfter = retryAfterValues.sort((a, b) => Date.parse(a) - Date.parse(b))[0] || null;
+
+      if (retryAfter && (!earliestRetryAfter || Date.parse(retryAfter) < Date.parse(earliestRetryAfter))) {
         earliestRetryAfter = retryAfter;
       }
 
@@ -627,7 +679,7 @@ export async function handleComboChat({
     } catch (error) {
       // Catch unexpected exceptions to ensure fallback continues
       if (sessionId && modelStr === activeStickyModel) {
-        clearStickyComboSession(comboName, sessionId);
+        clearStickyComboSession(comboName, sessionId, modelStr);
       }
       lastError = error.message || String(error);
       if (!lastStatus) lastStatus = 500;
@@ -650,7 +702,7 @@ export async function handleComboChat({
   // the request itself is invalid, but here the providers are simply unavailable
   // or have no active credentials. 503 is more accurate and retryable by clients.
   const allDisabled = lastError && lastError.toLowerCase().includes("no credentials");
-  const status = allDisabled ? 503 : (lastStatus || 503);
+  const status = allDisabled ? 503 : (lastStatus || (sawEmptyOutput ? 502 : 503));
   const msg = lastError || "All combo models unavailable";
 
   if (earliestRetryAfter) {
