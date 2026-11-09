@@ -3,3 +3,7 @@
 [data-r9] a{color:var(--acc);text-decoration:none}
 [data-r9] a:hover{text-decoration:underline}
 [data-r9] .r9-hacc:hover{color:var(--acc)!important}
+@keyframes r9pulse{0%,100%{opacity:1}50%{opacity:.3}}
+[data-r9] .r9-segment::-webkit-scrollbar{height:4px}
+[data-r9] .r9-segment::-webkit-scrollbar-thumb{background:var(--line2);border-radius:4px}
+@media(max-width:600px){[data-r9] .spend-wide-only{display:none!important}}

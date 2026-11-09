@@ -3,6 +3,9 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import RangeBar from "./RangeBar";
+import QuotaRunway from "./QuotaRunway";
+import BreakdownDrill from "./BreakdownDrill";
+import RoutingMap from "./RoutingMap";
 import { buildView } from "./view";
 import "./spend.css";
 
@@ -173,6 +176,7 @@ export default function SpendClient() {
             </div>
           </>)}
 
+          <QuotaRunway />
           {(s.real) && (<>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(300px,1fr))", gap: "16px" }}>
               <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: "12px", boxShadow: "var(--shadow)", padding: "16px 18px", display: "flex", flexDirection: "column", gap: "14px" }}>
@@ -278,24 +282,9 @@ export default function SpendClient() {
             </>)}
           </div>
 
-          {(s.breakdown) && (<>
-            <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: "12px", boxShadow: "var(--shadow)", padding: "16px 18px", display: "flex", flexDirection: "column", gap: "4px", overflowX: "auto" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "12px", paddingBottom: "8px", flexWrap: "wrap" }}><span style={{ fontSize: "11.5px", fontWeight: "600", letterSpacing: ".05em", color: "var(--tx2)" }}>BREAKDOWN</span>
-                <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}><span style={{ fontSize: "12px", color: "var(--tx3)" }}>Group by</span><div style={{ display: "flex", flexWrap: "wrap", gap: "2px", padding: "3px", borderRadius: "9px", background: "var(--seg)" }}>{(groups).map((g, _i) => (<Fragment key={_i}><button onClick={g.on} style={g.style}>{g.label}</button></Fragment>))}</div></div>
-              </div>
-              <div style={{ display: "grid", gridTemplateColumns: "minmax(180px,2fr) 1fr 1fr 1fr 1.1fr minmax(140px,1.6fr)", gap: "12px", fontSize: "11px", fontWeight: "600", color: "var(--tx3)", letterSpacing: ".04em", padding: "6px 0", minWidth: "760px" }}><span>{groupHead}</span><span style={{ textAlign: "right" }}>REQUESTS</span><span style={{ textAlign: "right" }}>TOKENS</span><span style={{ textAlign: "right" }}>REAL SPEND</span><span style={{ textAlign: "right" }}>LIST-PRICE VALUE</span><span>SHARE OF VALUE</span></div>
-              {(rows).map((r, _i) => (<Fragment key={_i}>
-                <div style={{ display: "grid", gridTemplateColumns: "minmax(180px,2fr) 1fr 1fr 1fr 1.1fr minmax(140px,1.6fr)", gap: "12px", alignItems: "center", padding: "9px 0", borderTop: "1px solid var(--line)", fontVariantNumeric: "tabular-nums", minWidth: "760px" }}>
-                  <div style={{ display: "flex", flexDirection: "column", gap: "2px", minWidth: "0" }}><span style={{ fontFamily: "var(--mono)", fontSize: "12.5px" }}>{r.name}</span><span style={{ fontSize: "11.5px", color: "var(--tx3)" }}>{r.desc}</span>{(r.hasMix) && (<><div style={{ display: "flex", width: "170px", maxWidth: "100%", height: "6px", borderRadius: "3px", overflow: "hidden", gap: "1px", marginTop: "2px" }}>{(r.mix).map((m, _i) => (<Fragment key={_i}><span title={m.t} style={{ width: m.w, background: m.c }}></span></Fragment>))}</div></>)}</div>
-                  <span style={{ textAlign: "right" }}>{r.req}</span>
-                  <span style={{ textAlign: "right", color: "var(--tx2)" }}>{r.tok}</span>
-                  <span style={{ textAlign: "right", fontWeight: "600", color: r.realC }}>{r.real}</span>
-                  <span style={{ textAlign: "right", color: "var(--violet)" }}>{r.value}</span>
-                  <div style={{ display: "flex", alignItems: "center", gap: "8px" }}><div style={{ flex: "1", height: "6px", borderRadius: "3px", background: "var(--seg)", overflow: "hidden" }}><div style={{ width: r.share, height: "100%", background: "var(--violet)", borderRadius: "3px" }}></div></div><span style={{ width: "40px", textAlign: "right", fontSize: "11.5px", color: "var(--tx2)" }}>{r.shareL}</span></div>
-                </div>
-              </Fragment>))}
-              <div style={{ fontSize: "11px", color: "var(--tx3)", paddingTop: "8px" }}>{bdNote}</div>
-            </div>
+          {(s.breakdown || isEmpty || isError || isLoading) && (<>
+            <BreakdownDrill data={data} state={mode === "ready" && v ? "ready" : mode === "ready" ? "loading" : mode} group={ui.group} onGroup={(group) => set({ group })} onRetry={retry} onShow30={showLast30} rangeTitle={rangeTitle} />
+            <RoutingMap data={data} state={mode === "ready" && v ? "ready" : mode === "ready" ? "loading" : mode} onRetry={retry} onShow30={showLast30} rangeTitle={rangeTitle} />
           </>)}
 
           {(s.agents) && (<>
