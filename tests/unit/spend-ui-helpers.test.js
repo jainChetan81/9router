@@ -92,3 +92,12 @@ describe("routing map", () => {
     expect(topPaidRoute([])).toBeNull();
   });
 });
+
+describe("fee display", () => {
+  it("shows the fee exactly as entered", async () => {
+    const { fmtFee } = await import("../../src/app/(dashboard)/dashboard/spend/view.js");
+    expect(fmtFee(200)).toBe("$200");
+    expect(fmtFee("19.99")).toBe("$19.99");
+    expect(fmtFee(0.49)).toBe("$0.49");
+  });
+});

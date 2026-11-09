@@ -22,12 +22,13 @@ const SUBN = {
   claude: "Claude sub", codex: "ChatGPT Pro sub", antigravity: "Antigravity sub", muse: "Muse sub", "opencode-go": "OpenCode Go sub",
   openrouter: "OpenRouter · pay per token", deepseek: "DeepSeek · prepaid", "ollama-local": "local",
 };
-const PLAN = { claude: "Max", codex: "Pro", antigravity: "Pro", ocgo: "Go", muse: "Basic" };
 const CLIENT_DESC = { "Claude Code": "Claude Code CLI", Codex: "Codex CLI", OpenCode: "OpenCode", "OpenCode Review": "open-code-review", "T3 Code": "T3 Code", Other: "other user-agents", Unknown: "no user-agent" };
 const ROLE_ORDER = ["main", "implementer", "reviewer", "thinker", "scout"];
 export const RC = { main: ["var(--seg)", "var(--tx2)"], scout: ["var(--bluebg)", "var(--chipscout)"], implementer: ["var(--violetbg)", "var(--chipimpl)"], reviewer: ["var(--greenbg)", "var(--chiprev)"], thinker: ["var(--amberbg)", "var(--chipthink)"], background: ["transparent", "var(--tx2)"] };
 const ROLEDESC = { main: "single model, direct", scout: "combo", implementer: "combo", reviewer: "combo", thinker: "combo · fusion" };
 
+// Owner-entered fee exactly as entered: $200, $19.99.
+export const fmtFee = (f) => { const n = +f; return "$" + (Number.isInteger(n) ? String(n) : n.toFixed(2)); };
 export const usd = (n, force2) => {
   if (!n) return "$0.00";
   if (n < 0.01) return "<$0.01";
@@ -136,7 +137,7 @@ export function buildView({ data, quota, ui, set, fit, range, feeRefs, saveFees 
     return {
       inputReady: !!ui.editing, ref, showFee: !ui.editing && fs, showSet: !ui.editing && !fs,
       setFee: () => { set({ editing: true, draft: { ...fees } }); setTimeout(() => feeRefs[s.k]?.focus(), 0); },
-      name: s.name, plan: PLAN[s.k], fee: fs ? "$" + (+fees[s.k]).toFixed(0) : "Not set", draft: draft[s.k] ?? "", value: usd(totals.subs[s.k]),
+      name: s.name, plan: "Subscription", fee: fs ? fmtFee(fees[s.k]) : "Not set", draft: draft[s.k] ?? "", value: usd(totals.subs[s.k]),
       ratio: rt ? (rt >= 10 ? rt.toFixed(0) : rt.toFixed(1)) + "×" : "", c: rt < 1 ? "var(--red)" : "var(--green)",
       onFee: (e) => { const val = e.target.value; set((u) => ({ draft: { ...(u.draft || fees), [s.k]: val } })); },
     };
