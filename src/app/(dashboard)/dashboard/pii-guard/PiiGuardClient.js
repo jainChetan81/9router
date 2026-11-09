@@ -1,9 +1,10 @@
 "use client";
 
 import { Fragment, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
+import { occurrences, parseUrlState, serialiseUrlState, buildRangeKey, buildEventsFilterKey, buildEventsRequestKey, nextHitLookupCursor, clearPromptLandingOnNavigation, shouldSyncSearchInput, shouldDropMissingDetail } from "./urlState";
 import RangeBar from "../spend/RangeBar";
-import { buildView, place, PAGE } from "./view";
+import { buildView, place, PAGE, buildPromptFilterKey, buildPromptRequestKey, canLandOnPrompt } from "./view";
 import "../spend/spend.css";
 
 const DAY = 864e5, IST = 5.5 * 3600e3;
@@ -25,24 +26,114 @@ async function call(url, body, signal) {
 }
 const hhmmss = (ts) => new Date(Date.parse(ts) + IST).toISOString().slice(11, 19);
 const toB64 = (file) => new Promise((ok, bad) => { const r = new FileReader(); r.onload = () => ok(String(r.result).split(",")[1] || ""); r.onerror = bad; r.readAsDataURL(file); });
+function eventRows(events) {
+  const rows = [];
+  for (const e of events) (e.hits || []).forEach((h, i) => rows.push({ id: `${e.ts}:${e.requestId || ""}:${h.hash}:${h.rule}:${i}`, ts: e.ts, t: hhmmss(e.ts), rule: h.rule, name: h.name, hash: String(h.hash).slice(0, 6), fullHash: h.hash, preview: h.preview || "", context: h.context || "",
+    loc: e.type === "ocr" ? `${place(String(h.source || "").replace(/\/ocr$/, ""))} · image #${(e.imageIndex ?? 0) + 1}` : place(h.source), a: h.action === "ignored" ? "allowed" : h.action || "observe", model: e.model || "—", client: e.client || "—",
+    test: e.type === "test" || e.test === true, requestId: e.requestId || "", sessionId: e.sessionId || "", image: e.type === "ocr" ? e.sha256Prefix || null : null, imageIndex: e.imageIndex, req: e.requestId ? `${e.requestId.slice(0, 6)}…${e.requestId.slice(-2)}` : "—" }));
+  return rows;
+}
 
 export default function PiiGuardClient() {
   const router = useRouter();
-  const [range, setRange] = useState({ preset: "24h" });
-  const [data, setData] = useState(null);
+  const searchParams = useSearchParams();
+  const search = searchParams.toString();
+  const urlState = useMemo(() => parseUrlState(new URLSearchParams(search)), [search]);
+  // Keyed by its values, so a change to another param keeps the same range object and event pagination.
+  const rangeKey = buildRangeKey(urlState.range);
+  const range = useMemo(() => urlState.range, [rangeKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  const [loadedSummary, setLoadedSummary] = useState({ key: null, data: null });
+  const data = loadedSummary.data;
   const [mode, setMode] = useState("loading");
   const [errorText, setErrorText] = useState("");
-  const [rawEvents, setRawEvents] = useState([]);
+  const [eventData, setEventData] = useState({ key: null, status: "idle", rows: [], next: null });
+  const [hitLookup, setHitLookup] = useState({ key: null, status: "idle", hit: null });
   // Event log shows one fixed page. `evPage`: cursors of the pages above the current one (empty = newest page).
-  const [evPage, setEvPage] = useState([]);
-  const [evNext, setEvNext] = useState(null);
-  const [evBusy, setEvBusy] = useState(false);
+  const [evPageState, setEvPageState] = useState({ key: null, list: [] });
   const [samples, setSamples] = useState([]);
   const [toastState, setToast] = useState(null);
   const [test, setTest] = useState({ result: null, image: null, error: "", busy: false });
-  const [ui, setUi] = useState({ tab: "overview", view: "value", openGroup: null, allLoc: false, q: "", fGroup: "", fAction: "", fClient: "", fModel: "", fSource: "", tests: false, sel: {}, page: 0, leakPage: 0, detail: null, pending: null, menu: null, showAllowed: false, session: "",
+  const [local, setLocal] = useState({ openGroup: null, allLoc: false, sel: {}, page: 0, leakPage: 0, pending: null, menu: null, showAllowed: false,
     testKind: "text", testText: "My mobile number is 9876543210 and PAN is ABCPE1234F.", testMode: "current", testWhere: "user", imgSel: 0, upload: null });
-  const set = useCallback((p) => setUi((u) => ({ ...u, ...(typeof p === "function" ? p(u) : p) })), []);
+  const [searchInput, setSearchInput] = useState(urlState.q);
+  const pendingUrl = useRef(urlState), searchTimer = useRef(null);
+  const ownSearchWrites = useRef(new Map()), externalUrlChange = useRef(false), hitCache = useRef(new Map());
+  useEffect(() => {
+    const onPopState = () => { externalUrlChange.current = true; };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+  useEffect(() => {
+    const external = externalUrlChange.current;
+    externalUrlChange.current = false;
+    const writes = ownSearchWrites.current;
+    const ownEcho = writes.has(search);
+    const sync = shouldSyncSearchInput(search, writes, external);
+    if (ownEcho) {
+      const count = writes.get(search);
+      if (count > 1) writes.set(search, count - 1); else writes.delete(search);
+    }
+    if (!sync) return;
+    pendingUrl.current = urlState;
+    setSearchInput(urlState.q);
+    clearTimeout(searchTimer.current);
+  }, [search, urlState]);
+  useEffect(() => () => clearTimeout(searchTimer.current), []);
+  const dq0 = useDeferredValue(searchInput);
+  const eventsFilterKey = buildEventsFilterKey(range, { client: urlState.fClient, model: urlState.fModel, source: urlState.fSource,
+    action: urlState.fAction, group: urlState.fGroup, q: dq0, tests: urlState.tests });
+  const evPage = evPageState.key === eventsFilterKey ? evPageState.list : [];
+  const evCursor = evPage.at(-1)?.cursor || null, evNewest = evPage.length === 0;
+  const evRequestKey = buildEventsRequestKey(eventsFilterKey, evCursor);
+  const eventRequestCurrent = eventData.key === evRequestKey;
+  const eventsReady = eventRequestCurrent && eventData.status === "success";
+  const evBusy = !eventRequestCurrent || eventData.status === "loading";
+  const rawEvents = useMemo(() => eventsReady ? eventData.rows : [], [eventsReady, eventData.rows]);
+  const evNext = eventsReady ? eventData.next : null;
+  const hitCacheKey = urlState.detailHit ? `${rangeKey}:${urlState.detailHit}` : null;
+  const pageHit = rawEvents.find((e) => `${e.requestId}:${e.fullHash}` === urlState.detailHit) || (hitCacheKey && hitCache.current.get(hitCacheKey));
+  const currentHitLookup = hitCacheKey && hitLookup.key === hitCacheKey ? hitLookup : null;
+  const hit = pageHit || currentHitLookup?.hit;
+  const hitStatus = hit ? "success" : currentHitLookup?.status || "loading";
+  const ui = useMemo(() => ({ ...local, ...urlState, q: searchInput, detail: urlState.at && urlState.view === "prompt" ? null : urlState.detailKey ? { kind: "value", key: urlState.detailKey } : urlState.detailHit ? hit ? { kind: "hit", hit } : { kind: "missing-hit", status: hitStatus } : null }), [local, urlState, searchInput, hit, hitStatus]);
+  const currentUi = useRef(ui); currentUi.current = ui;
+  const set = useCallback((update) => {
+    const p = typeof update === "function" ? update(currentUi.current) : update;
+    const keys = ["tab", "view", "q", "fGroup", "fAction", "fClient", "fModel", "fSource", "tests", "session", "at", "range", "detailKey", "detailHit"];
+    const next = { ...pendingUrl.current }, rest = {};
+    let changed = false, navigation = false;
+    for (const [key, value] of Object.entries(p)) {
+      if (key === "detail") {
+        if (value?.kind === "hit") {
+          const hitKey = `${value.hit.requestId}:${value.hit.fullHash}`;
+          hitCache.current.set(`${rangeKey}:${hitKey}`, value.hit);
+          if (hitCache.current.size > 200) hitCache.current.delete(hitCache.current.keys().next().value);
+        }
+        next.detailKey = value?.kind === "value" ? value.key : null;
+        next.detailHit = value?.kind === "hit" ? `${value.hit.requestId}:${value.hit.fullHash}` : null;
+        changed = true; navigation = true;
+      } else if (keys.includes(key)) {
+        next[key] = value; changed = true;
+        if (["tab", "view", "session", "at", "range"].includes(key)) navigation = true;
+      } else rest[key] = value;
+    }
+    Object.assign(next, clearPromptLandingOnNavigation(pendingUrl.current, next));
+    if (Object.keys(rest).length) setLocal((u) => ({ ...u, ...rest }));
+    if (!changed) return;
+    if ("q" in p) setSearchInput(p.q);
+    pendingUrl.current = next;
+    const go = () => {
+      const params = serialiseUrlState(pendingUrl.current, new URLSearchParams(window.location.search));
+      const query = params.toString();
+      const current = new URLSearchParams(window.location.search).toString();
+      if (query === current) return;
+      const writes = ownSearchWrites.current;
+      writes.set(query, (writes.get(query) || 0) + 1);
+      router[navigation ? "push" : "replace"](`${window.location.pathname}${query ? `?${query}` : ""}`, { scroll: false });
+    };
+    clearTimeout(searchTimer.current);
+    if ("q" in p && !navigation) searchTimer.current = setTimeout(go, 300); else go();
+  }, [router, rangeKey]);
   const [theme, setTheme] = useState("light");
   useEffect(() => {
     const el = document.documentElement, sync = () => setTheme(el.classList.contains("dark") ? "dark" : "light");
@@ -60,12 +151,12 @@ export default function PiiGuardClient() {
     const { from, to } = bounds(range);
     try {
       const d = await call(`/api/pii-guard?from=${Math.round(from)}&to=${Math.round(to)}`, null, ctl.signal);
-      setData(d); setMode("ready");
+      setLoadedSummary({ key: rangeKey, data: d }); setMode("ready");
     } catch (e) {
       if (ctl.signal.aborted) return;
       setErrorText(e.message || "Request failed"); setMode("error");
     }
-  }, [range]);
+  }, [range, rangeKey]);
   // Poll every 30 s while the tab is visible. The next poll starts after the last one ends; a hidden tab
   // stops polling and reloads when it is shown again.
   useEffect(() => {
@@ -79,33 +170,75 @@ export default function PiiGuardClient() {
 
   // Event log: 50 events per page, newest first, flattened to one row per hit. The server applies the
   // client, model, source and action filters. The 30 s refresh reloads only the newest page.
-  const dq0 = useDeferredValue(ui.q);
   const evFilter = `&client=${encodeURIComponent(ui.fClient)}&model=${encodeURIComponent(ui.fModel)}&source=${ui.fSource}&action=${ui.fAction}&group=${encodeURIComponent(ui.fGroup)}&q=${encodeURIComponent(dq0)}${ui.tests ? "&tests=1" : ""}`;
   const fetchEvents = useCallback(async (cursor, signal) => {
     const { from, to } = bounds(range);
     const cur = cursor ? `&before=${cursor.before}&skip=${cursor.skip}` : "";
     const { events = [], next = null } = await call(`/api/pii-guard?events=1&limit=50&from=${Math.round(from)}&to=${Math.round(to)}${cur}${evFilter}`, null, signal);
-    const rows = [];
-    for (const e of events) (e.hits || []).forEach((h, i) => rows.push({ id: `${e.ts}:${e.requestId || ""}:${h.hash}:${h.rule}:${i}`, ts: e.ts, t: hhmmss(e.ts), rule: h.rule, name: h.name, hash: String(h.hash).slice(0, 6), fullHash: h.hash, preview: h.preview || "", context: h.context || "",
-      loc: e.type === "ocr" ? `${place(String(h.source || "").replace(/\/ocr$/, ""))} · image #${(e.imageIndex ?? 0) + 1}` : place(h.source), a: h.action === "ignored" ? "allowed" : h.action || "observe", model: e.model || "—", client: e.client || "—",
-      test: e.type === "test" || e.test === true, requestId: e.requestId || "", sessionId: e.sessionId || "", image: e.type === "ocr" ? e.sha256Prefix || null : null, imageIndex: e.imageIndex, req: e.requestId ? `${e.requestId.slice(0, 6)}…${e.requestId.slice(-2)}` : "—" }));
-    return { rows, next };
+    return { rows: eventRows(events), next };
   }, [range, evFilter]);
-  // Range or filter change: back to the newest page.
-  useEffect(() => { setEvPage([]); }, [range, evFilter]);
-  const evCursor = evPage.at(-1)?.cursor || null, evNewest = evPage.length === 0;
   // The newest page follows `data` (the poll); older pages load once.
   const evTick = evNewest ? data : null;
   useEffect(() => {
-    if (ui.tab !== "findings" || ui.view !== "hit") return;
+    if ((ui.tab !== "findings" || ui.view !== "hit") && !urlState.detailHit) return;
     const ctl = new AbortController();
-    setEvBusy(true);
-    fetchEvents(evCursor, ctl.signal).then(({ rows, next }) => { setRawEvents(rows); setEvNext(next); setEvBusy(false); }).catch(() => { if (!ctl.signal.aborted) setEvBusy(false); });
-    return () => { ctl.abort(); setEvBusy(false); };
-  }, [ui.tab, ui.view, evTick, evCursor, fetchEvents]);
+    const key = evRequestKey;
+    setEventData({ key, status: "loading", rows: [], next: null });
+    fetchEvents(evCursor, ctl.signal).then(({ rows, next }) => setEventData({ key, status: "success", rows, next }))
+      .catch(() => { if (!ctl.signal.aborted) setEventData({ key, status: "error", rows: [], next: null }); });
+    return () => ctl.abort();
+  }, [ui.tab, ui.view, urlState.detailHit, evTick, evCursor, fetchEvents, evRequestKey]);
+  useEffect(() => {
+    if (!urlState.detailHit || !hitCacheKey) return;
+    const cached = hitCache.current.get(hitCacheKey);
+    if (cached) {
+      setHitLookup({ key: hitCacheKey, status: "success", hit: cached });
+      return;
+    }
+    const ctl = new AbortController();
+    setHitLookup({ key: hitCacheKey, status: "loading", hit: null });
+    const { from, to } = bounds(range);
+    const [requestId, fullHash] = urlState.detailHit.split(":");
+    const lookup = async () => {
+      let cursor = null, pageCount = 0;
+      try {
+        while (!ctl.signal.aborted) {
+          const cur = cursor ? `&before=${cursor.before}&skip=${cursor.skip}` : "";
+          const { events = [], next = null } = await call(`/api/pii-guard?events=1&limit=200&tests=1&q=${encodeURIComponent(fullHash)}&from=${Math.round(from)}&to=${Math.round(to)}${cur}`, null, ctl.signal);
+          pageCount++;
+          const found = eventRows(events).find((row) => row.requestId === requestId && row.fullHash === fullHash);
+          if (found) {
+            hitCache.current.set(hitCacheKey, found);
+            setHitLookup({ key: hitCacheKey, status: "success", hit: found });
+            return;
+          }
+          cursor = nextHitLookupCursor({ pageCount, next });
+          if (!cursor) break;
+        }
+        if (!ctl.signal.aborted) setHitLookup({ key: hitCacheKey, status: "missing", hit: null });
+      } catch {
+        if (!ctl.signal.aborted) setHitLookup({ key: hitCacheKey, status: "error", hit: null });
+      }
+    };
+    lookup();
+    return () => ctl.abort();
+  }, [urlState.detailHit, hitCacheKey, range, rangeKey]);
+  useEffect(() => {
+    if (!urlState.detailKey) return;
+    const found = (data?.summary?.groups || []).some((v) => `${v.hash}:${v.rule}` === urlState.detailKey);
+    const missingValue = shouldDropMissingDetail({ currentKey: rangeKey, loadedKey: loadedSummary.key, succeeded: mode === "ready", found });
+    if (!missingValue) return;
+    const next = { ...pendingUrl.current, detailKey: null };
+    pendingUrl.current = next;
+    const query = serialiseUrlState(next, new URLSearchParams(window.location.search)).toString();
+    const writes = ownSearchWrites.current;
+    writes.set(query, (writes.get(query) || 0) + 1);
+    router.replace(`${window.location.pathname}${query ? `?${query}` : ""}`, { scroll: false });
+  }, [data, loadedSummary.key, mode, rangeKey, urlState, router]);
+  const setEvPage = (update) => setEvPageState({ key: eventsFilterKey, list: update(evPage) });
   const loadOlder = evNext && !evBusy ? () => { setEvPage((p) => [...p, { cursor: evNext }]); set({ sel: {} }); } : null;
   const loadNewer = !evNewest && !evBusy ? () => { setEvPage((p) => p.slice(0, -1)); set({ sel: {} }); } : null;
-  const loadNewest = !evNewest && !evBusy ? () => { setEvPage([]); set({ sel: {} }); } : null;
+  const loadNewest = !evNewest && !evBusy ? () => { setEvPage(() => []); set({ sel: {} }); } : null;
 
   useEffect(() => { call("/api/pii-guard?samples=1").then((s) => setSamples(Array.isArray(s) ? s : [])).catch(() => {}); }, []);
 
@@ -158,7 +291,7 @@ export default function PiiGuardClient() {
 
   const isLoading = mode === "loading" || (!v && mode !== "error"), isError = mode === "error";
   const preset = range.preset, customLabel = range.label || "";
-  const onRange = (r) => { setRange(r); set({ sel: {}, detail: null, pending: null, page: 0, leakPage: 0 }); };
+  const onRange = (r) => set({ range: r, sel: {}, detail: null, pending: null, page: 0, leakPage: 0 });
   const todayKey = new Date(Date.now() + IST).toISOString().slice(0, 10);
   const retry = () => { setMode("loading"); load(); };
   const openConsole = () => router.push("/dashboard/console-log");
@@ -194,6 +327,7 @@ export default function PiiGuardClient() {
     redactRules, globalBtns = [], piiEx, ocrRows = [], groups = [], viewBtns = [], isValues, isEvents, isPrompts, shownLabel, groupOpts = [], clientOpts = [], modelOpts = [], hasSel, selCount, allSel, toggleAll,
     bulkAllow, values = [], noValues, hits = [], noHits, allowedCount = 0, showAllowed, toggleAllowed, allowed = [], detail, prevValues, nextValues, prevLeaks, nextLeaks, leakPageLabel, samples: sampleBtns = [], kindBtns = [], isText, isImage, testSegs = [], imgSegs = [], testHits = [], noTestHits,
     noHitsText, testVerdict = empty, testOut, thumbs = [], hasUpload, hasSample, imgBg, imgName, sampleName, sampleBg, problems = [], metrics = [], ocrStats = [], healthNote, ocrNote, imgGroups = [], health = empty } = v || {};
+  const drawerDetail = detail || (urlState.detailHit && !(urlState.at && urlState.view === "prompt") ? { missingHit: true, hitStatus: hit ? "loading" : hitStatus, close: () => set({ detail: null }) } : null);
   // A filter change clears the selection, so bulk actions never hit hidden rows.
   const filt = (k) => (e) => set({ [k]: e.target.value, sel: {}, page: 0 });
   const q = ui.q, onQ = filt("q"), fGroup = ui.fGroup, onGroup = filt("fGroup"), fAction = ui.fAction, onAction = filt("fAction");
@@ -466,7 +600,7 @@ export default function PiiGuardClient() {
               {(loadOlder) && (<button onClick={loadOlder} style={moreBtn}>Older 50</button>)}
             </div>
           </>)}
-          {(isPrompts) && <Prompts q={dq0} session={ui.session} range={range} tick={data} clearSession={() => set({ session: "" })} setSession={(id) => set({ session: id, q: "" })} />}</div>
+          {(isPrompts) && <Prompts q={dq0} session={ui.session} at={ui.at} mark={(data?.summary?.groups || []).find((v) => `${v.hash}:${v.rule}` === ui.detailKey)?.preview || ""} range={range} tick={data} clearSession={() => set({ session: "", at: "", detail: null })} setSession={(id) => set({ session: id, at: "", q: "" })} />}</div>
         </div>
       </>)}
 
@@ -546,7 +680,7 @@ export default function PiiGuardClient() {
     </div>
   </main>
   </div>
-      {(detail) && <Drawer d={detail} />}
+      {(drawerDetail) && <Drawer d={drawerDetail} />}
     </div>
   );
 }
@@ -602,9 +736,11 @@ function Sec({ label, children }) {
 }
 // Marks the masked value inside its masked context.
 function highlight(text, mark) {
-  const at = mark ? text.indexOf(mark) : -1;
-  if (at < 0) return text;
-  return <>{text.slice(0, at)}<span style={{ background: "var(--bluebg)", color: "var(--blue)", borderRadius: "4px", padding: "0 4px" }}>{mark}</span>{text.slice(at + mark.length)}</>;
+  const positions = occurrences(text, mark);
+  if (!positions.length) return text;
+  let end = 0;
+  const parts = positions.map((at) => { const before = text.slice(end, at); end = at + mark.length; return <Fragment key={at}>{before}<mark data-match style={{ background: "var(--bluebg)", color: "var(--blue)", borderRadius: "4px", padding: "0 4px" }}>{mark}</mark></Fragment>; });
+  return <>{parts}{text.slice(end)}</>;
 }
 
 // Snippet marks from SQLite (\u0001…\u0002) become <mark>; text renders as React text, never HTML.
@@ -620,6 +756,12 @@ const promptWhen = (ts) => new Date(ts + IST).toISOString().slice(5, 16).replace
 // Full masked message, loaded on demand; long text scrolls in a fixed box.
 function PromptText({ id, mark }) {
   const [m, setM] = useState(null);
+  const [match, setMatch] = useState(0);
+  const box = useRef(null);
+  useEffect(() => {
+    const el = box.current, target = el?.querySelectorAll("[data-match]")[match];
+    if (el && target) el.scrollTop += target.getBoundingClientRect().top - el.getBoundingClientRect().top - el.clientHeight / 2 + target.clientHeight / 2;
+  }, [m, match, mark]);
   useEffect(() => {
     const ctl = new AbortController();
     call(`/api/pii-guard/prompts?id=${id}`, null, ctl.signal).then(setM).catch((e) => { if (!ctl.signal.aborted) setM({ error: e.message }); });
@@ -627,10 +769,11 @@ function PromptText({ id, mark }) {
   }, [id]);
   if (!m) return <span style={{ fontSize: "12px", color: "var(--tx3)" }}>Loading…</span>;
   if (m.error) return <span style={{ fontSize: "12px", color: "var(--tx3)" }}>{m.error}</span>;
-  return <><pre style={{ margin: "0", maxHeight: "360px", overflow: "auto", whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontFamily: "var(--mono)", fontSize: "12px", padding: "8px 12px", borderRadius: "8px", border: "1px solid var(--line2)", background: "var(--card)" }}>{mark ? highlight(m.text, mark) : m.text}</pre>
+  const count = occurrences(m.text || "", mark).length;
+  return <>{count > 1 && <div style={{ display: "flex", gap: "8px", alignItems: "center", fontSize: "11px" }}><span>{match + 1} of {count}</span><button style={btn} onClick={() => setMatch((match + count - 1) % count)}>Previous</button><button style={btn} onClick={() => setMatch((match + 1) % count)}>Next</button></div>}<pre ref={box} style={{ margin: "0", maxHeight: "360px", overflow: "auto", whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontFamily: "var(--mono)", fontSize: "12px", padding: "8px 12px", borderRadius: "8px", border: "1px solid var(--line2)", background: "var(--card)" }}>{mark ? highlight(m.text, mark) : m.text}</pre>
     {m.cut ? <span style={{ fontSize: "11px", color: "var(--tx3)" }}>Cut at the size limit (1 MB, tool output 128 KB).</span> : null}</>;
 }
-function PromptPeek({ query, mark }) {
+function PromptPeek({ query, mark, openSession }) {
   const [res, setRes] = useState(null);
   useEffect(() => {
     const ctl = new AbortController();
@@ -639,44 +782,63 @@ function PromptPeek({ query, mark }) {
   }, [query]);
   if (!res) return <span style={{ fontSize: "12px", color: "var(--tx3)" }}>Loading…</span>;
   if (!res.rows?.length) return <span style={{ fontSize: "12px", color: "var(--tx3)" }}>No stored prompt. Prompts are kept 14 days, starting Nov 7, 2026.</span>;
-  return <>{res.rows.map((r) => <Fragment key={r.id}><span style={{ fontSize: "11px", color: "var(--tx3)" }}>{r.role}{KIND[r.kind] ? ` · ${KIND[r.kind]}` : ""} · {promptWhen(r.ts)}</span><PromptText id={r.id} mark={mark} /></Fragment>)}
+  return <>{res.rows.map((r) => <Fragment key={r.id}><span style={{ fontSize: "11px", color: "var(--tx3)" }}>{r.role}{KIND[r.kind] ? ` · ${KIND[r.kind]}` : ""} · {promptWhen(r.ts)}</span><PromptText id={r.id} mark={mark} />{openSession && r.sessionId && <button onClick={() => openSession(r.id, r.sessionId)} style={{ ...btn, alignSelf: "flex-start" }}>Show whole conversation</button>}</Fragment>)}
     <span style={{ fontSize: "11px", color: "var(--tx3)" }}>Detected values are masked. Text the rules miss, like names, is stored as is.</span></>;
 }
 // Prompts view: server search, 300 ms after typing stops; a newer search cancels the older one.
-function Prompts({ q, session, range, tick, clearSession, setSession }) {
-  const [state, setState] = useState({ rows: [], next: null, busy: true, error: "" });
-  const [open, setOpen] = useState(null);
+function Prompts({ q, session, at, mark, range, tick, clearSession, setSession }) {
+  const [state, setState] = useState({ key: null, rows: [], next: null, busy: true, error: "" });
+  const [openState, setOpenState] = useState({ fkey: null, id: null });
   // Page cursors belong to one filter; a new filter starts on the newest page.
-  const fkey = `${q}\0${session}\0${JSON.stringify(range)}`;
-  const [pageState, setPageState] = useState({ fkey, list: [] });
-  const pages = pageState.fkey === fkey ? pageState.list : [];
+  const fkey = buildPromptFilterKey(q, session, range);
+  const [pageState, setPageState] = useState({ fkey: null, list: [] });
+  const pages = useMemo(() => pageState.fkey === fkey ? pageState.list : [], [pageState, fkey]);
   const setPages = (f) => setPageState({ fkey, list: f(pages) });
   const cursor = pages.at(-1) ?? null, pollTick = cursor ? null : tick;
+  const requestKey = buildPromptRequestKey(fkey, cursor);
+  const currentState = useMemo(() => state.key === requestKey ? state : { key: requestKey, rows: [], next: null, busy: true, error: "" }, [state, requestKey]);
+  const open = openState.fkey === fkey ? openState.id : null;
+  const setOpen = (id) => setOpenState({ fkey, id });
   useEffect(() => {
     const ctl = new AbortController();
     const t = setTimeout(() => {
       const { from, to } = bounds(range);
-      setState((x) => ({ ...x, busy: true }));
+      setState((old) => old.key === requestKey ? { ...old, busy: true, error: "" } : old);
       call(`/api/pii-guard/prompts?q=${encodeURIComponent(q)}&sessionId=${encodeURIComponent(session)}&from=${Math.round(from)}&to=${Math.round(to)}${cursor ? `&before=${cursor}` : ""}`, null, ctl.signal)
-        .then((r) => setState({ rows: r.rows || [], next: r.next, busy: false, error: r.unavailable ? "Prompt store unavailable on this server." : "" }))
-        .catch((e) => { if (!ctl.signal.aborted) setState({ rows: [], next: null, busy: false, error: e.message }); });
+        .then((r) => { if (!ctl.signal.aborted) setState({ key: requestKey, rows: r.rows || [], next: r.next, busy: false, error: r.unavailable ? "Prompt store unavailable on this server." : "" }); })
+        .catch((e) => { if (!ctl.signal.aborted) setState({ key: requestKey, rows: [], next: null, busy: false, error: e.message }); });
     }, 300);
     return () => { clearTimeout(t); ctl.abort(); };
-  }, [q, session, range, cursor, pollTick]);
+  }, [q, session, range, cursor, pollTick, requestKey]);
+  const target = useRef(null), jumped = useRef("");
+  useEffect(() => { jumped.current = ""; }, [at, fkey]);
+  useEffect(() => {
+    if (!at || !canLandOnPrompt(requestKey, state.key, currentState.busy) || jumped.current === at) return;
+    const timer = setTimeout(() => {
+      if (currentState.rows.some((r) => String(r.id) === at)) {
+        jumped.current = at; setOpenState({ fkey, id: currentState.rows.find((r) => String(r.id) === at).id });
+      } else if (currentState.next && pages.length < 9) {
+        setState((s) => s.key === requestKey ? { ...s, busy: true } : s);
+        setPageState({ fkey, list: [...pages, currentState.next] });
+      }
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [at, currentState, state.key, requestKey, pages, fkey]);
+  useEffect(() => { if (at && String(open) === at) target.current?.scrollIntoView({ block: "center" }); }, [at, open]);
   return <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
     {session && <div style={{ display: "flex", gap: "8px", alignItems: "center", fontSize: "12px", color: "var(--tx2)", padding: "4px 0" }}>Conversation <span style={{ fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: "0" }}>{session}</span><button onClick={clearSession} style={btn}>Show all</button></div>}
-    {state.error && <div style={{ padding: "16px 0", color: "var(--tx3)", textAlign: "center" }}>{state.error}</div>}
-    {state.rows.map((r) => <div key={r.id} style={{ borderTop: "1px solid var(--line)", padding: "8px 0", display: "flex", flexDirection: "column", gap: "4px" }}>
+    {currentState.error && <div style={{ padding: "16px 0", color: "var(--tx3)", textAlign: "center" }}>{currentState.error}</div>}
+    {currentState.rows.map((r) => <div key={r.id} ref={String(r.id) === at ? target : null} style={{ borderTop: "1px solid var(--line)", padding: "8px 0", display: "flex", flexDirection: "column", gap: "4px" }}>
       <button onClick={() => setOpen(open === r.id ? null : r.id)} aria-expanded={open === r.id} style={{ border: "0", background: "transparent", padding: "0", font: "inherit", color: "var(--tx)", textAlign: "left", cursor: "pointer", display: "flex", flexDirection: "column", gap: "2px" }}>
         <span style={{ fontSize: "11px", color: "var(--tx3)" }}>{promptWhen(r.ts)} · {r.role}{KIND[r.kind] ? ` · ${KIND[r.kind]}` : ""} · {r.client || "—"} · <span style={{ fontFamily: "var(--mono)" }}>{r.model || "—"}</span>{r.hashes ? " · has findings" : ""}</span>
-        <span style={{ fontFamily: "var(--mono)", fontSize: "12px", whiteSpace: "pre-wrap", overflowWrap: "anywhere", maxHeight: "3.6em", overflow: "hidden" }}>{marked(r.snip)}</span>
+        {open !== r.id && <span style={{ fontFamily: "var(--mono)", fontSize: "12px", whiteSpace: "pre-wrap", overflowWrap: "anywhere", maxHeight: "3.6em", overflow: "hidden" }}>{marked(r.snip)}</span>}
       </button>
-      {open === r.id && <><PromptText id={r.id} /><span style={{ display: "flex", gap: "8px", flexWrap: "wrap", fontSize: "11px", color: "var(--tx3)" }}>Request <span style={{ fontFamily: "var(--mono)" }}>{r.requestId}</span>{r.sessionId && !session && <button onClick={() => setSession(r.sessionId)} style={btn}>Show whole conversation</button>}</span></>}
+      {open === r.id && <><PromptText id={r.id} mark={String(r.id) === at ? mark : ""} /><span style={{ display: "flex", gap: "8px", flexWrap: "wrap", fontSize: "11px", color: "var(--tx3)" }}>Request <span style={{ fontFamily: "var(--mono)" }}>{r.requestId}</span>{r.sessionId && !session && <button onClick={() => setSession(r.sessionId)} style={btn}>Show whole conversation</button>}</span></>}
     </div>)}
-    {!state.busy && !state.error && !state.rows.length && <div style={{ padding: "32px 0", textAlign: "center", color: "var(--tx3)" }}>{q ? "No stored prompt has these words." : "No prompts stored in this range yet."}</div>}
+    {!currentState.busy && !currentState.error && !currentState.rows.length && <div style={{ padding: "32px 0", textAlign: "center", color: "var(--tx3)" }}>{q ? "No stored prompt has these words." : "No prompts stored in this range yet."}</div>}
     <div style={{ display: "flex", gap: "8px", justifyContent: "center" }}>
       {pages.length > 0 && <button onClick={() => setPages((p) => p.slice(0, -1))} style={btn}>Newer 50</button>}
-      {state.next && <button onClick={() => setPages((p) => [...p, state.next])} style={btn}>Older 50</button>}
+      {currentState.next && <button onClick={() => setPages((p) => [...p, currentState.next])} style={btn}>Older 50</button>}
     </div>
     <span style={{ fontSize: "11px", color: "var(--tx3)", paddingTop: "4px" }}>Searches whole words and word starts. Detected values are masked; text the rules miss, like names, is stored as is.</span>
   </div>;
@@ -692,6 +854,13 @@ function Drawer({ d }) {
     return () => document.removeEventListener("keydown", key);
   }, [d]);
   const row = (label, value, mono) => value ? <div style={{ display: "flex", flexDirection: "column", gap: "2px" }}><span style={{ fontSize: "11px", color: "var(--tx3)" }}>{label}</span><span style={{ fontSize: "12.5px", fontFamily: mono ? "var(--mono)" : "inherit", overflowWrap: "anywhere" }}>{value}</span></div> : null;
+  if (d.missingHit) return <>
+    <div onClick={d.close} style={{ position: "fixed", inset: "0", background: "rgba(0,0,0,.25)", zIndex: 80 }} />
+    <aside role="dialog" aria-modal="true" aria-label="Hit details" style={{ position: "fixed", top: "0", right: "0", bottom: "0", width: "min(420px,100vw)", zIndex: 81, background: "var(--card)", borderLeft: "1px solid var(--line2)", boxShadow: "-12px 0 32px rgba(0,0,0,.12)", display: "flex", flexDirection: "column" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "16px", borderBottom: "1px solid var(--line)" }}><strong>Hit details</strong><button onClick={d.close} aria-label="Close" style={{ ...btn, padding: "0", width: "28px", fontFamily: "'Material Symbols Outlined'", fontSize: "18px" }}>close</button></div>
+      <div style={{ padding: "20px 16px", color: "var(--tx2)", fontSize: "13px" }}>{d.hitStatus === "missing" ? "This hit was not found in the selected range." : d.hitStatus === "error" ? "Could not look up this hit." : "Loading hit details…"}</div>
+    </aside>
+  </>;
   return (
     <>
       <div onClick={d.close} style={{ position: "fixed", inset: "0", background: "rgba(0,0,0,.25)", zIndex: 80 }} />
@@ -711,7 +880,7 @@ function Drawer({ d }) {
               : <a href={d.image} target="_blank" rel="noreferrer">
                 {/* eslint-disable-next-line @next/next/no-img-element -- auth-checked API image */}
                 <img src={d.image} alt={d.imageLabel} onError={() => setBrokenSrc(d.image)} style={{ width: "100%", maxHeight: "320px", objectFit: "contain", borderRadius: "6px", background: "var(--seg)" }} /></a>}</Sec>)}
-          <Sec label="Prompt"><PromptPeek query={d.promptQuery} mark={d.preview} />{d.openSession && <button onClick={d.openSession} style={{ ...btn, alignSelf: "flex-start" }}>Show whole conversation</button>}</Sec>
+          <Sec label="Prompt"><PromptPeek query={d.promptQuery} mark={d.preview} openSession={d.openSession} /></Sec>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" }}>
             {row("Client", d.client)}{row("Model", d.model, true)}{row("Requests", d.reqs)}{row("First seen", d.first)}{row("Last seen", d.last)}{row("Hash", `#${d.hash}`, true)}{row("Request", d.request, true)}{row("Session", d.session, true)}
           </div>

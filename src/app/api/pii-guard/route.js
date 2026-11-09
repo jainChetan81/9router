@@ -4,7 +4,7 @@ import { open, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { getSettings, updateSettings } from "@/lib/localDb";
 import { ready, rules, groups, testText, testImage, eventsFile, health } from "@/lib/piiGuard/observe.js";
-import { summarize } from "@/lib/piiGuard/summary.js";
+import { summarize, routingByRequest } from "@/lib/piiGuard/summary.js";
 
 export const dynamic = "force-dynamic";
 const MODES = ["off", "observe", "redact", "block"];
@@ -87,7 +87,7 @@ async function readEvents(fromMs, visit) {
       for (const e of parseLines(buf.subarray(0, cut))) cache.events.push(e); // no spread: a big append would overflow the call stack
       cache.end += cut;
     }
-    const oldest = () => Date.parse(cache.events[0]?.ts);
+    const oldest = () => Date.parse(cache.events.find(e => e.kind !== "routing")?.ts);
     let back = CHUNK;
     while (cache.start > 0 && cache.end - cache.start < CAP && !(oldest() < fromMs)) {
       const from = Math.max(0, cache.start - back);
@@ -99,11 +99,16 @@ async function readEvents(fromMs, visit) {
       back = CHUNK;
     }
     const truncated = cache.start > 0 && !(oldest() <= fromMs);
+    // Routing may arrive after the requested range. Merge before filters and pagination.
+    const routing = routingByRequest(cache.events);
     const out = [];
     for (let i = cache.events.length - 1; i >= 0; i--) {
-      const ts = Date.parse(cache.events[i].ts);
+      const raw = cache.events[i];
+      if (raw.kind === "routing") continue;
+      const ts = Date.parse(raw.ts);
       if (ts < fromMs) break;
-      if (visit) { if (visit(cache.events[i], ts) === false) break; } else out.push(cache.events[i]);
+      const event = { ...raw, ...routing.get(raw.requestId) };
+      if (visit) { if (visit(event, ts) === false) break; } else out.push(event);
     }
     // Appends grow the cache past CAP over a long uptime; rebuild it on the next call.
     if (cache.end - cache.start > CAP * 1.5) cache = null;
@@ -166,17 +171,18 @@ export async function GET(request) {
     if (vr === "bad") return NextResponse.json({ error: "Invalid range" }, { status: 400 });
     const range = vr || { from: Date.now() - DAY, to: Date.now() };
     // Filters, same meaning in both Findings views. action "allowed" means the hash is on the allow (ignore) list now.
-    const f = Object.fromEntries(["model", "client", "source", "action", "group", "q"].map((k) => [k, (url.searchParams.get(k) || "").slice(0, 200)]));
+    const f = Object.fromEntries(["model", "client", "source", "action", "group", "provider", "combo", "q"].map((k) => [k, (url.searchParams.get(k) || "").slice(0, 200)]));
     const tests = url.searchParams.get("tests") === "1";
     const q = f.q.toLowerCase();
     const allowed = new Set(f.action === "allowed" || q ? ((await getSettings()).piiGuard?.ignore || []) : []);
     const ruleList = f.group || q ? rules() : [];
     const groupOf = Object.fromEntries(ruleList.map((r) => [r.id, r.group]));
     const labelOf = Object.fromEntries(ruleList.map((r) => [r.id, r.label || r.id]));
-    const keep = (e) => (tests || !(e.type === "test" || e.test === true)) && (!f.model || e.model === f.model) && (!f.client || clientOf(e.ua || "") === f.client);
+    const keep = (e) => (tests || !(e.type === "test" || e.test === true)) && (!f.model || e.model === f.model) && (!f.client || clientOf(e.ua || "") === f.client)
+      && (!f.provider || e.provider === f.provider) && (!f.combo || e.combo === f.combo);
     // Allowed = allowed now, or allowed when it was logged; the row badge uses the logged action.
     const actionOk = (h) => f.action === "allowed" ? h.action === "ignored" || allowed.has(h.hash) : (h.action || "observe") === f.action;
-    const text = (e, h) => [h.rule, h.name, labelOf[h.rule], h.hash, h.preview, h.source, e.model, clientOf(e.ua || "")].join(" ").toLowerCase();
+    const text = (e, h) => [h.rule, h.name, labelOf[h.rule], h.hash, h.preview, h.source, e.model, e.provider, e.combo, clientOf(e.ua || "")].join(" ").toLowerCase();
     const hitOk = (e, h) => (!f.action || actionOk(h)) && (!f.source || (f.source === "ocr") === String(h.source || "").endsWith("/ocr"))
       && (!f.group || groupOf[h.rule] === f.group) && (!q || text(e, h).includes(q));
     const filtered = f.action || f.source || f.group || q;

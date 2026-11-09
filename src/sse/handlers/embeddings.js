@@ -77,8 +77,9 @@ export async function handleEmbeddings(request) {
     return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing required field: input");
   }
 
+  let guard;
   if (process.env.PII_GUARD_MODULE) {
-    const guard = await observeRequest(body, { endpoint: url.pathname, userAgent: request.headers.get("user-agent"), model: body?.model }, settings.piiGuard);
+    guard = await observeRequest(body, { endpoint: url.pathname, userAgent: request.headers.get("user-agent"), model: body?.model }, settings.piiGuard);
     if (guard?.blocked) return errorResponse(HTTP_STATUS.BAD_REQUEST, blockMessage(guard.blocked, false));
     modelStr = body.model; // redaction may have rewritten it
   }
@@ -111,6 +112,7 @@ export async function handleEmbeddings(request) {
 
     // All accounts unavailable
     if (!credentials || credentials.allRateLimited) {
+      if (excludeConnectionIds.size === 0) await guard?.recordRouting?.({ provider, resolvedModel: `${provider}/${model}`, account: null });
       if (credentials?.allRateLimited) {
         const errorMsg = lastError || credentials.lastError || "Unavailable";
         const status = lastStatus || Number(credentials.lastErrorCode) || HTTP_STATUS.SERVICE_UNAVAILABLE;
@@ -145,6 +147,8 @@ export async function handleEmbeddings(request) {
         await clearAccountError(credentials.connectionId, credentials, model);
       }
     });
+
+    await guard?.recordRouting?.({ provider, resolvedModel: `${provider}/${model}`, account: credentials.connectionName });
 
     if (result.success) {
       const usage = exactEmbeddingUsage(result.usage);

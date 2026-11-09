@@ -72,6 +72,22 @@ function indexOf(data, nameOf, gLabelOf, gidOf) {
 }
 export const PAGE = 100, LEAK_PAGE = 20;
 
+export function buildPromptFilterKey(q, session, range) {
+  return JSON.stringify([q || "", session || "", range?.preset || "", range?.from || "", range?.to || ""]);
+}
+
+export function buildPromptRequestKey(filterKey, cursor) {
+  return JSON.stringify([filterKey, cursor ?? null]);
+}
+
+export function canLandOnPrompt(currentKey, loadedKey, busy) {
+  return currentKey === loadedKey && !busy;
+}
+
+export function sessionForOpenPrompt(promptId, promptSessionId, fallbackSessionId) {
+  return promptId ? promptSessionId || null : fallbackSessionId || null;
+}
+
 export function buildView({ data, ui, set, act, range, fit, test, events, samples }) {
   const { config = {}, health: h = {}, summary: sm = {} } = data;
   const tab = ui.tab;
@@ -264,7 +280,9 @@ export function buildView({ data, ui, set, act, range, fit, test, events, sample
   // Detail drawer. Text and image facts come from the event log; values never leave the server unmasked.
   const det = ui.detail;
   let detail = null;
-  if (det) {
+  if (det?.kind === "missing-hit") {
+    detail = { title: "Hit details", missingHit: true, hitStatus: det.status, close: () => set({ detail: null }) };
+  } else if (det) {
     const hit = det.kind === "hit" ? det.hit : null;
     const v = hit ? byKey.get(`${hit.fullHash}:${hit.rule}`) : byKey.get(det.key);
     const rule = hit?.rule || v?.rule, hash = hit?.fullHash || v?.hash;
@@ -279,7 +297,11 @@ export function buildView({ data, ui, set, act, range, fit, test, events, sample
       request: hit?.requestId || v?.requestId || "", session: hit?.sessionId || v?.sessionId || "", hash,
       // Prompt lookup: newest stored messages holding this value (each message is stored once per session).
       promptQuery: `hash=${hash}`,
-      openSession: (hit?.sessionId || v?.sessionId) ? () => set({ tab: "findings", view: "prompt", q: "", session: hit?.sessionId || v?.sessionId, detail: null }) : null,
+      openSession: (id, sessionId) => {
+        const targetSession = sessionForOpenPrompt(id, sessionId, hit?.sessionId || v?.sessionId);
+        if (!targetSession) return;
+        set({ tab: "findings", view: "prompt", q: "", session: targetSession, at: String(id || ""), detailKey: `${hash}:${rule}`, detailHit: null });
+      },
       first: v ? stamp(v.firstSeen) : "—", last: v ? stamp(v.lastSeen) : hit ? stamp(hit.ts) : "—", reqs: v ? fmt(v.turns) : "—",
       image: image ? `/api/pii-guard/image?id=${image}` : null, imageLabel: image ? `Image #${(hit?.imageIndex ?? v?.imageIndex ?? 0) + 1}` : "",
       ruleBtns: rule ? ruleBtns(rule, "detail") : [], pending: pending("detail"),

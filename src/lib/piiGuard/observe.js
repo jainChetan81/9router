@@ -6,7 +6,7 @@ import { dirname, isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { performance } from "node:perf_hooks";
 import { clientOf } from "../spendClient.js";
-import { capture as capturePrompts, collect as collectPrompts, stats as promptStats } from "./prompts.js";
+import { capture as capturePrompts, collect as collectPrompts, stats as promptStats, cleanId, updateRouting as updatePromptRouting } from "./prompts.js";
 
 const since = new Date().toISOString();
 let loading, library, detector, knownMtime, lastCheck = -Infinity, warnedAt = -Infinity;
@@ -180,6 +180,7 @@ function initCaptureStore() {
   return captureStore;
 }
 function getOcrWorker(config = {}) {
+  if (!detector || !library) return null;
   if (!ocrEffective(config)) return null;
   const quality = ocrMode(config);
   if (ocrWorker && ocrWorkerQuality !== quality) closeOcrWorker();
@@ -306,7 +307,7 @@ function replace(text, findings, action, redacted) {
   }
   return out + text.slice(at);
 }
-function handleOcrResult(result, requestId, imageIndex, meta, body, config, model, ua) {
+function handleOcrResult(result, requestId, imageIndex, meta, config, model, ua) {
   try {
     const act = actionFor(config);
     const ignore = new Set(Array.isArray(config?.ignore) ? config.ignore.filter(h => typeof h === "string" && /^[0-9a-f]{12}$/i.test(h)) : []);
@@ -350,8 +351,9 @@ function handleOcrResult(result, requestId, imageIndex, meta, body, config, mode
       mode: ocrMode(config),
       requestId,
       imageIndex,
+      ...validateRouting(meta, detector),
       endpoint: meta?.endpoint,
-      model: model || (body?.model ?? meta?.model),
+      model: model || meta?.model,
       ua,
       status: result?.status || "empty",
       reason: result?.reason,
@@ -370,6 +372,31 @@ function handleOcrResult(result, requestId, imageIndex, meta, body, config, mode
   } catch {
     failure("ocr");
   }
+}
+
+function validateRouting(routing, det) {
+  const out = {};
+  for (const field of ["provider", "combo", "account", "resolvedModel"]) {
+    const value = cleanId(routing?.[field], det);
+    if (value !== null) out[field] = value;
+  }
+  return out;
+}
+
+// Keep only identifiers and the request id alive after the scan, never prompt text.
+// `log: false` updates stored prompt rows only, so requests without findings add no event lines.
+function routingRecorder(requestId, initial, det, { log = true } = {}) {
+  let writes = Promise.resolve();
+  return async (routing) => {
+    const fields = validateRouting({ ...initial, ...routing }, det);
+    writes = writes.then(async () => {
+      try {
+        if (log) await append({ ts: new Date().toISOString(), kind: "routing", requestId, ...fields });
+        updatePromptRouting(requestId, fields, det);
+      } catch { failure("write"); }
+    });
+    await writes;
+  };
 }
 
 export async function observeRequest(body, meta = {}, config = {}) {
@@ -402,7 +429,7 @@ export async function observeRequest(body, meta = {}, config = {}) {
       try {
         const enqueued = worker.enqueue(image, (result) => {
           try {
-            handleOcrResult(result, requestId, idx, meta, body, config, model, ua);
+            handleOcrResult(result, requestId, idx, meta, config, model, ua);
           } catch {
             failure("ocr");
           }
@@ -415,7 +442,7 @@ export async function observeRequest(body, meta = {}, config = {}) {
             cache: "none",
             ocrMs: 0,
             queueMs: 0,
-          }, requestId, idx, meta, body, config, model, ua);
+          }, requestId, idx, meta, config, model, ua);
         }
       } catch {
         failure("ocr");
@@ -433,7 +460,8 @@ export async function observeRequest(body, meta = {}, config = {}) {
     for (const f of findings) if (f.readonly) { const at = thinkingBlock(body, f); if (at) { delete f.readonly; drop.set(f, at); } }
     // meta.model is a pre-scan copy; log the body value, which redaction may have rewritten, and drop it if it held a finding.
     model = findings.some(f => /^\.?model$/.test(f.path)) ? "[redacted]" : body?.model ?? meta.model;
-    capturePrompts({ nodes: promptNodes, bodyFindings: findings.map(f => ({ path: f.path, start: f.start, end: f.end, hash: f.hash, rule: f.rule, kind: f.kind })), requestId, sessionId: sessionKey, model, client: clientOf(ua0) }, library, detector);
+    const routing = validateRouting(meta, detector);
+    const promptCount = capturePrompts({ nodes: promptNodes, bodyFindings: findings.map(f => ({ path: f.path, start: f.start, end: f.end, hash: f.hash, rule: f.rule, kind: f.kind })), requestId, sessionId: sessionKey, model, ...routing, client: clientOf(ua0) }, library, detector);
     for (const f of findings) foundActions.set(f, decide(f));
     const strip = new Map();
     for (const [f, at] of drop) if (foundActions.get(f) === "redact") { strip.set(`${at.i}:${at.j}`, at); redacted[label(f)] = (redacted[label(f)] || 0) + 1; }
@@ -444,7 +472,10 @@ export async function observeRequest(body, meta = {}, config = {}) {
     const scanMs = performance.now() - start;
     requests++; totalRequests++; if (samples.length === 10_000) samples.shift(); samples.push(scanMs); if (healthSamples.length === 10_000) healthSamples.shift(); healthSamples.push(scanMs); maxScanMs = Math.max(maxScanMs, scanMs); healthMaxScanMs = Math.max(healthMaxScanMs, scanMs);
     for (const k of Object.keys(unscanned)) unscanned[k] += result.unscanned[k] || 0;
-    if (!findings.some(f => foundActions.get(f) !== "off")) return;
+    if (!findings.some(f => foundActions.get(f) !== "off")) {
+      if (!promptCount) return;
+      return { recordRouting: routingRecorder(requestId, routing, detector, { log: false }) };
+    }
     const counts = Object.create(null), fresh = [], hitRows = new Map(), newHashes = [];
     for (const f of findings) {
       const action = foundActions.get(f);
@@ -460,9 +491,11 @@ export async function observeRequest(body, meta = {}, config = {}) {
     }
     const blocked = [...preliminaryBlocked], hits = [...hitRows.values()].sort((a, b) => RANK[a.action] - RANK[b.action]).slice(0, 200);
     withFindings++; totalWithFindings++;
-    const event = { ts: new Date().toISOString(), requestId, ...(sessionKey && { sessionId: sessionKey }), endpoint: meta.endpoint, model: model, ua, chars: result.chars, images: result.images, imageBytes: result.imageBytes, unscanned: result.unscanned, scanMs, counts, new: fresh, hits, ...(hitRows.size > hits.length && { hitsDropped: hitRows.size - hits.length }), ...(blocked.length && { blocked }), ...(Object.keys(redacted).length && { redacted }), ...(Object.keys(leaked).length && { leaked }), ignored: findings.filter(f => foundActions.get(f) === "ignored").length };
+    const event = { ts: new Date().toISOString(), requestId, ...routing, ...(sessionKey && { sessionId: sessionKey }), endpoint: meta.endpoint, model: model, ua, chars: result.chars, images: result.images, imageBytes: result.imageBytes, unscanned: result.unscanned, scanMs, counts, new: fresh, hits, ...(hitRows.size > hits.length && { hitsDropped: hitRows.size - hits.length }), ...(blocked.length && { blocked }), ...(Object.keys(redacted).length && { redacted }), ...(Object.keys(leaked).length && { leaked }), ignored: findings.filter(f => foundActions.get(f) === "ignored").length };
     markSeen(newHashes);
-    void append(event).catch(() => failure("write"));
+    let stored = false;
+    try { await append(event); stored = true; } catch { failure("write"); }
+    const recordRouting = stored ? routingRecorder(requestId, routing, detector) : async () => {};
     const summary = Object.entries(counts).map(([k, n]) => `${k}=${n}`).join(", ");
     const line = `[pii-guard] ${model || "-"} ${meta.endpoint || "-"}: ${summary}`;
     if (blocked.length) console.error(`${line} BLOCKED: ${blocked.join(", ")}`);
@@ -470,7 +503,8 @@ export async function observeRequest(body, meta = {}, config = {}) {
     else if (Object.keys(redacted).length) console.warn(`${line} redacted: ${Object.entries(redacted).map(([k, n]) => `${k}=${n}`).join(", ")}`);
     else if (fresh.length) console.warn(`${line} (new: ${[...new Set(fresh.map(label))].join(", ")})`);
     else console.info(line);
-    if (blocked.length) return { blocked, ...(stuck && { stuck }) };
+    if (blocked.length) return { blocked, ...(stuck && { stuck }), recordRouting };
+    return { recordRouting };
   } catch { failure(stage); }
 }
 // The library masks previews; recheck shape here so a raw value can never reach the log from an old library build.
