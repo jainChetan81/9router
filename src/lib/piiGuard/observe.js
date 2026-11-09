@@ -384,13 +384,14 @@ function validateRouting(routing, det) {
 }
 
 // Keep only identifiers and the request id alive after the scan, never prompt text.
-function routingRecorder(requestId, initial, det) {
+// `log: false` updates stored prompt rows only, so requests without findings add no event lines.
+function routingRecorder(requestId, initial, det, { log = true } = {}) {
   let writes = Promise.resolve();
   return async (routing) => {
     const fields = validateRouting({ ...initial, ...routing }, det);
     writes = writes.then(async () => {
       try {
-        await append({ ts: new Date().toISOString(), kind: "routing", requestId, ...fields });
+        if (log) await append({ ts: new Date().toISOString(), kind: "routing", requestId, ...fields });
         updatePromptRouting(requestId, fields, det);
       } catch { failure("write"); }
     });
@@ -473,8 +474,7 @@ export async function observeRequest(body, meta = {}, config = {}) {
     for (const k of Object.keys(unscanned)) unscanned[k] += result.unscanned[k] || 0;
     if (!findings.some(f => foundActions.get(f) !== "off")) {
       if (!promptCount) return;
-      await append({ ts: new Date().toISOString(), requestId, ...(sessionKey && { sessionId: sessionKey }), endpoint: meta.endpoint, model, ua, ...routing, hits: [] });
-      return { recordRouting: routingRecorder(requestId, routing, detector) };
+      return { recordRouting: routingRecorder(requestId, routing, detector, { log: false }) };
     }
     const counts = Object.create(null), fresh = [], hitRows = new Map(), newHashes = [];
     for (const f of findings) {

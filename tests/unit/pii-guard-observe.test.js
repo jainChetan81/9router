@@ -353,9 +353,11 @@ describe("PII guard routing records", () => {
     const P = await import("../../src/lib/piiGuard/prompts.js");
     try {
       const guard = await observeRequest(body("ordinary prompt words"), { ...meta, combo: "daily" });
-      const scan = JSON.parse((await readFile(events, "utf8")).trim());
-      await guard.recordRouting({ provider: "first", account: "acc-one", resolvedModel: "first/m" });
       P.flush();
+      const scan = { requestId: P.search({}).rows[0].requestId };
+      await guard.recordRouting({ provider: "first", account: "acc-one", resolvedModel: "first/m" });
+      // A request without findings writes no event lines, only prompt rows.
+      expect(await readFile(events, "utf8").catch(() => "")).toBe("");
       expect(P.search({ requestId: scan.requestId }).rows[0]).toMatchObject({ provider: "first", combo: "daily", account: "acc-one" });
       await guard.recordRouting({ provider: "second", account: "acc-two", resolvedModel: "second/m" });
       expect(P.search({ requestId: scan.requestId }).rows[0]).toMatchObject({ provider: "second", combo: "daily", account: "acc-two" });
@@ -368,10 +370,10 @@ describe("PII guard routing records", () => {
     try {
       const context = { ...meta, sessionId: "repeat-session" };
       await observeRequest(body("ordinary repeated prompt"), context);
-      const original = await readFile(events, "utf8");
+      const original = await readFile(events, "utf8").catch(() => "");
       const guard = await observeRequest(body("ordinary repeated prompt"), context);
       await guard?.recordRouting?.({ provider: "unused" });
-      expect(await readFile(events, "utf8")).toBe(original);
+      expect(await readFile(events, "utf8").catch(() => "")).toBe(original);
     } finally { P._reset(); }
   });
 });
