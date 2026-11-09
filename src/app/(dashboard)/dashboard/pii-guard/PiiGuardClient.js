@@ -2,7 +2,7 @@
 
 import { Fragment, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { occurrences, parseUrlState, serialiseUrlState, buildRangeKey, buildEventsFilterKey, buildEventsRequestKey, shouldSyncSearchInput, shouldDropMissingDetail } from "./urlState";
+import { occurrences, parseUrlState, serialiseUrlState, buildRangeKey, buildEventsFilterKey, buildEventsRequestKey, nextHitLookupCursor, clearPromptLandingOnNavigation, shouldSyncSearchInput, shouldDropMissingDetail } from "./urlState";
 import RangeBar from "../spend/RangeBar";
 import { buildView, place, PAGE, buildPromptFilterKey, buildPromptRequestKey, canLandOnPrompt } from "./view";
 import "../spend/spend.css";
@@ -26,6 +26,13 @@ async function call(url, body, signal) {
 }
 const hhmmss = (ts) => new Date(Date.parse(ts) + IST).toISOString().slice(11, 19);
 const toB64 = (file) => new Promise((ok, bad) => { const r = new FileReader(); r.onload = () => ok(String(r.result).split(",")[1] || ""); r.onerror = bad; r.readAsDataURL(file); });
+function eventRows(events) {
+  const rows = [];
+  for (const e of events) (e.hits || []).forEach((h, i) => rows.push({ id: `${e.ts}:${e.requestId || ""}:${h.hash}:${h.rule}:${i}`, ts: e.ts, t: hhmmss(e.ts), rule: h.rule, name: h.name, hash: String(h.hash).slice(0, 6), fullHash: h.hash, preview: h.preview || "", context: h.context || "",
+    loc: e.type === "ocr" ? `${place(String(h.source || "").replace(/\/ocr$/, ""))} · image #${(e.imageIndex ?? 0) + 1}` : place(h.source), a: h.action === "ignored" ? "allowed" : h.action || "observe", model: e.model || "—", client: e.client || "—",
+    test: e.type === "test" || e.test === true, requestId: e.requestId || "", sessionId: e.sessionId || "", image: e.type === "ocr" ? e.sha256Prefix || null : null, imageIndex: e.imageIndex, req: e.requestId ? `${e.requestId.slice(0, 6)}…${e.requestId.slice(-2)}` : "—" }));
+  return rows;
+}
 
 export default function PiiGuardClient() {
   const router = useRouter();
@@ -40,6 +47,7 @@ export default function PiiGuardClient() {
   const [mode, setMode] = useState("loading");
   const [errorText, setErrorText] = useState("");
   const [eventData, setEventData] = useState({ key: null, status: "idle", rows: [], next: null });
+  const [hitLookup, setHitLookup] = useState({ key: null, status: "idle", hit: null });
   // Event log shows one fixed page. `evPage`: cursors of the pages above the current one (empty = newest page).
   const [evPageState, setEvPageState] = useState({ key: null, list: [] });
   const [samples, setSamples] = useState([]);
@@ -82,8 +90,11 @@ export default function PiiGuardClient() {
   const evBusy = !eventRequestCurrent || eventData.status === "loading";
   const rawEvents = useMemo(() => eventsReady ? eventData.rows : [], [eventsReady, eventData.rows]);
   const evNext = eventsReady ? eventData.next : null;
-  const hit = rawEvents.find((e) => `${e.requestId}:${e.fullHash}` === urlState.detailHit) || hitCache.current.get(urlState.detailHit);
-  const hitStatus = eventRequestCurrent ? eventData.status : "loading";
+  const hitCacheKey = urlState.detailHit ? `${rangeKey}:${urlState.detailHit}` : null;
+  const pageHit = rawEvents.find((e) => `${e.requestId}:${e.fullHash}` === urlState.detailHit) || (hitCacheKey && hitCache.current.get(hitCacheKey));
+  const currentHitLookup = hitCacheKey && hitLookup.key === hitCacheKey ? hitLookup : null;
+  const hit = pageHit || currentHitLookup?.hit;
+  const hitStatus = hit ? "success" : currentHitLookup?.status || "loading";
   const ui = useMemo(() => ({ ...local, ...urlState, q: searchInput, detail: urlState.at && urlState.view === "prompt" ? null : urlState.detailKey ? { kind: "value", key: urlState.detailKey } : urlState.detailHit ? hit ? { kind: "hit", hit } : { kind: "missing-hit", status: hitStatus } : null }), [local, urlState, searchInput, hit, hitStatus]);
   const currentUi = useRef(ui); currentUi.current = ui;
   const set = useCallback((update) => {
@@ -95,7 +106,7 @@ export default function PiiGuardClient() {
       if (key === "detail") {
         if (value?.kind === "hit") {
           const hitKey = `${value.hit.requestId}:${value.hit.fullHash}`;
-          hitCache.current.set(hitKey, value.hit);
+          hitCache.current.set(`${rangeKey}:${hitKey}`, value.hit);
           if (hitCache.current.size > 200) hitCache.current.delete(hitCache.current.keys().next().value);
         }
         next.detailKey = value?.kind === "value" ? value.key : null;
@@ -106,6 +117,7 @@ export default function PiiGuardClient() {
         if (["tab", "view", "session", "at", "range"].includes(key)) navigation = true;
       } else rest[key] = value;
     }
+    Object.assign(next, clearPromptLandingOnNavigation(pendingUrl.current, next));
     if (Object.keys(rest).length) setLocal((u) => ({ ...u, ...rest }));
     if (!changed) return;
     if ("q" in p) setSearchInput(p.q);
@@ -121,7 +133,7 @@ export default function PiiGuardClient() {
     };
     clearTimeout(searchTimer.current);
     if ("q" in p && !navigation) searchTimer.current = setTimeout(go, 300); else go();
-  }, [router]);
+  }, [router, rangeKey]);
   const [theme, setTheme] = useState("light");
   useEffect(() => {
     const el = document.documentElement, sync = () => setTheme(el.classList.contains("dark") ? "dark" : "light");
@@ -163,23 +175,54 @@ export default function PiiGuardClient() {
     const { from, to } = bounds(range);
     const cur = cursor ? `&before=${cursor.before}&skip=${cursor.skip}` : "";
     const { events = [], next = null } = await call(`/api/pii-guard?events=1&limit=50&from=${Math.round(from)}&to=${Math.round(to)}${cur}${evFilter}`, null, signal);
-    const rows = [];
-    for (const e of events) (e.hits || []).forEach((h, i) => rows.push({ id: `${e.ts}:${e.requestId || ""}:${h.hash}:${h.rule}:${i}`, ts: e.ts, t: hhmmss(e.ts), rule: h.rule, name: h.name, hash: String(h.hash).slice(0, 6), fullHash: h.hash, preview: h.preview || "", context: h.context || "",
-      loc: e.type === "ocr" ? `${place(String(h.source || "").replace(/\/ocr$/, ""))} · image #${(e.imageIndex ?? 0) + 1}` : place(h.source), a: h.action === "ignored" ? "allowed" : h.action || "observe", model: e.model || "—", client: e.client || "—",
-      test: e.type === "test" || e.test === true, requestId: e.requestId || "", sessionId: e.sessionId || "", image: e.type === "ocr" ? e.sha256Prefix || null : null, imageIndex: e.imageIndex, req: e.requestId ? `${e.requestId.slice(0, 6)}…${e.requestId.slice(-2)}` : "—" }));
-    return { rows, next };
+    return { rows: eventRows(events), next };
   }, [range, evFilter]);
   // The newest page follows `data` (the poll); older pages load once.
   const evTick = evNewest ? data : null;
   useEffect(() => {
-    if (ui.tab !== "findings" || ui.view !== "hit") return;
+    if ((ui.tab !== "findings" || ui.view !== "hit") && !urlState.detailHit) return;
     const ctl = new AbortController();
     const key = evRequestKey;
     setEventData({ key, status: "loading", rows: [], next: null });
     fetchEvents(evCursor, ctl.signal).then(({ rows, next }) => setEventData({ key, status: "success", rows, next }))
       .catch(() => { if (!ctl.signal.aborted) setEventData({ key, status: "error", rows: [], next: null }); });
     return () => ctl.abort();
-  }, [ui.tab, ui.view, evTick, evCursor, fetchEvents, evRequestKey]);
+  }, [ui.tab, ui.view, urlState.detailHit, evTick, evCursor, fetchEvents, evRequestKey]);
+  useEffect(() => {
+    if (!urlState.detailHit || !hitCacheKey) return;
+    const cached = hitCache.current.get(hitCacheKey);
+    if (cached) {
+      setHitLookup({ key: hitCacheKey, status: "success", hit: cached });
+      return;
+    }
+    const ctl = new AbortController();
+    setHitLookup({ key: hitCacheKey, status: "loading", hit: null });
+    const { from, to } = bounds(range);
+    const [requestId, fullHash] = urlState.detailHit.split(":");
+    const lookup = async () => {
+      let cursor = null, pageCount = 0;
+      try {
+        while (!ctl.signal.aborted) {
+          const cur = cursor ? `&before=${cursor.before}&skip=${cursor.skip}` : "";
+          const { events = [], next = null } = await call(`/api/pii-guard?events=1&limit=50&from=${Math.round(from)}&to=${Math.round(to)}${cur}`, null, ctl.signal);
+          pageCount++;
+          const found = eventRows(events).find((row) => row.requestId === requestId && row.fullHash === fullHash);
+          if (found) {
+            hitCache.current.set(hitCacheKey, found);
+            setHitLookup({ key: hitCacheKey, status: "success", hit: found });
+            return;
+          }
+          cursor = nextHitLookupCursor({ pageCount, next });
+          if (!cursor) break;
+        }
+        if (!ctl.signal.aborted) setHitLookup({ key: hitCacheKey, status: "missing", hit: null });
+      } catch {
+        if (!ctl.signal.aborted) setHitLookup({ key: hitCacheKey, status: "error", hit: null });
+      }
+    };
+    lookup();
+    return () => ctl.abort();
+  }, [urlState.detailHit, hitCacheKey, range, rangeKey]);
   useEffect(() => {
     if (!urlState.detailKey) return;
     const found = (data?.summary?.groups || []).some((v) => `${v.hash}:${v.rule}` === urlState.detailKey);
@@ -739,7 +782,7 @@ function PromptPeek({ query, mark, openSession }) {
   }, [query]);
   if (!res) return <span style={{ fontSize: "12px", color: "var(--tx3)" }}>Loading…</span>;
   if (!res.rows?.length) return <span style={{ fontSize: "12px", color: "var(--tx3)" }}>No stored prompt. Prompts are kept 14 days, starting Nov 7, 2026.</span>;
-  return <>{res.rows.map((r) => <Fragment key={r.id}><span style={{ fontSize: "11px", color: "var(--tx3)" }}>{r.role}{KIND[r.kind] ? ` · ${KIND[r.kind]}` : ""} · {promptWhen(r.ts)}</span><PromptText id={r.id} mark={mark} />{openSession && <button onClick={() => openSession(r.id, r.sessionId)} style={{ ...btn, alignSelf: "flex-start" }}>Show whole conversation</button>}</Fragment>)}
+  return <>{res.rows.map((r) => <Fragment key={r.id}><span style={{ fontSize: "11px", color: "var(--tx3)" }}>{r.role}{KIND[r.kind] ? ` · ${KIND[r.kind]}` : ""} · {promptWhen(r.ts)}</span><PromptText id={r.id} mark={mark} />{openSession && r.sessionId && <button onClick={() => openSession(r.id, r.sessionId)} style={{ ...btn, alignSelf: "flex-start" }}>Show whole conversation</button>}</Fragment>)}
     <span style={{ fontSize: "11px", color: "var(--tx3)" }}>Detected values are masked. Text the rules miss, like names, is stored as is.</span></>;
 }
 // Prompts view: server search, 300 ms after typing stops; a newer search cancels the older one.
@@ -815,7 +858,7 @@ function Drawer({ d }) {
     <div onClick={d.close} style={{ position: "fixed", inset: "0", background: "rgba(0,0,0,.25)", zIndex: 80 }} />
     <aside role="dialog" aria-modal="true" aria-label="Hit details" style={{ position: "fixed", top: "0", right: "0", bottom: "0", width: "min(420px,100vw)", zIndex: 81, background: "var(--card)", borderLeft: "1px solid var(--line2)", boxShadow: "-12px 0 32px rgba(0,0,0,.12)", display: "flex", flexDirection: "column" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "16px", borderBottom: "1px solid var(--line)" }}><strong>Hit details</strong><button onClick={d.close} aria-label="Close" style={{ ...btn, padding: "0", width: "28px", fontFamily: "'Material Symbols Outlined'", fontSize: "18px" }}>close</button></div>
-      <div style={{ padding: "20px 16px", color: "var(--tx2)", fontSize: "13px" }}>{d.hitStatus === "success" ? "This hit is not in the loaded range." : d.hitStatus === "error" ? "Could not load this hit for the current range and filters." : "Loading hit details…"}</div>
+      <div style={{ padding: "20px 16px", color: "var(--tx2)", fontSize: "13px" }}>{d.hitStatus === "missing" ? "This hit was not found in the selected range." : d.hitStatus === "error" ? "Could not look up this hit." : "Loading hit details…"}</div>
     </aside>
   </>;
   return (

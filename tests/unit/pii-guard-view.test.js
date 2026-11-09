@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildView, buildPromptFilterKey, buildPromptRequestKey, canLandOnPrompt, PAGE } from "../../src/app/(dashboard)/dashboard/pii-guard/view.js";
+import { buildView, buildPromptFilterKey, buildPromptRequestKey, canLandOnPrompt, sessionForOpenPrompt, PAGE } from "../../src/app/(dashboard)/dashboard/pii-guard/view.js";
 
 const ui = { tab: "findings", view: "value", q: "", fGroup: "", fAction: "", fClient: "", fModel: "", fSource: "", sel: {}, page: 0, leakPage: 0, testKind: "text", testText: "", imgSel: 0 };
 const base = (over = {}) => ({
@@ -84,5 +84,16 @@ describe("prompt landing request keys", () => {
     expect(canLandOnPrompt(currentRequest, currentRequest, true)).toBe(false);
     expect(canLandOnPrompt(currentRequest, olderPageRequest, false)).toBe(false);
     expect(canLandOnPrompt(currentRequest, buildPromptRequestKey("old-session", null), false)).toBe(false);
+  });
+});
+
+describe("prompt session choice", () => {
+  it("uses the clicked prompt's own session and rejects a missing session", () => {
+    expect(sessionForOpenPrompt("row-1", "prompt-session", "finding-session")).toBe("prompt-session");
+    expect(sessionForOpenPrompt("row-1", "", "finding-session")).toBeNull();
+  });
+
+  it("keeps the finding session fallback only when no prompt row is involved", () => {
+    expect(sessionForOpenPrompt("", "", "finding-session")).toBe("finding-session");
   });
 });

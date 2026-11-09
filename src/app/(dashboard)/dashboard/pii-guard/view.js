@@ -84,6 +84,10 @@ export function canLandOnPrompt(currentKey, loadedKey, busy) {
   return currentKey === loadedKey && !busy;
 }
 
+export function sessionForOpenPrompt(promptId, promptSessionId, fallbackSessionId) {
+  return promptId ? promptSessionId || null : fallbackSessionId || null;
+}
+
 export function buildView({ data, ui, set, act, range, fit, test, events, samples }) {
   const { config = {}, health: h = {}, summary: sm = {} } = data;
   const tab = ui.tab;
@@ -293,7 +297,11 @@ export function buildView({ data, ui, set, act, range, fit, test, events, sample
       request: hit?.requestId || v?.requestId || "", session: hit?.sessionId || v?.sessionId || "", hash,
       // Prompt lookup: newest stored messages holding this value (each message is stored once per session).
       promptQuery: `hash=${hash}`,
-      openSession: (hit?.sessionId || v?.sessionId) ? (id, sessionId) => set({ tab: "findings", view: "prompt", q: "", session: sessionId || hit?.sessionId || v?.sessionId, at: String(id || ""), detailKey: `${hash}:${rule}`, detailHit: null }) : null,
+      openSession: (id, sessionId) => {
+        const targetSession = sessionForOpenPrompt(id, sessionId, hit?.sessionId || v?.sessionId);
+        if (!targetSession) return;
+        set({ tab: "findings", view: "prompt", q: "", session: targetSession, at: String(id || ""), detailKey: `${hash}:${rule}`, detailHit: null });
+      },
       first: v ? stamp(v.firstSeen) : "—", last: v ? stamp(v.lastSeen) : hit ? stamp(hit.ts) : "—", reqs: v ? fmt(v.turns) : "—",
       image: image ? `/api/pii-guard/image?id=${image}` : null, imageLabel: image ? `Image #${(hit?.imageIndex ?? v?.imageIndex ?? 0) + 1}` : "",
       ruleBtns: rule ? ruleBtns(rule, "detail") : [], pending: pending("detail"),

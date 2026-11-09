@@ -38,6 +38,18 @@ export function buildEventsRequestKey(filterKey, cursor) {
   return JSON.stringify([filterKey, cursor?.before ?? null, cursor?.skip ?? 0]);
 }
 
+export const HIT_LOOKUP_PAGE_LIMIT = 10;
+
+export function nextHitLookupCursor({ pageCount, next, found = false }) {
+  return found || !next || pageCount >= HIT_LOOKUP_PAGE_LIMIT ? null : next;
+}
+
+export function clearPromptLandingOnNavigation(previous, next) {
+  const leftPrompt = previous.view === "prompt" && next.view !== "prompt";
+  const changedTab = previous.tab !== next.tab;
+  return previous.at && (leftPrompt || changedTab) ? { ...next, at: "", detailKey: null } : next;
+}
+
 // Router updates can echo a URL from an older debounced search after the user has typed again.
 export function shouldSyncSearchInput(search, ownSearchWrites, isExternal = false) {
   return isExternal || !ownSearchWrites.has(search);

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseUrlState, serialiseUrlState, dropMissingDetail, validDate, rangeLabel, buildRangeKey, buildEventsFilterKey, buildEventsRequestKey, shouldSyncSearchInput, shouldDropMissingDetail, DEFAULT_RANGE, occurrences } from "../../src/app/(dashboard)/dashboard/pii-guard/urlState.js";
+import { parseUrlState, serialiseUrlState, dropMissingDetail, validDate, rangeLabel, buildRangeKey, buildEventsFilterKey, buildEventsRequestKey, nextHitLookupCursor, clearPromptLandingOnNavigation, shouldSyncSearchInput, shouldDropMissingDetail, DEFAULT_RANGE, occurrences } from "../../src/app/(dashboard)/dashboard/pii-guard/urlState.js";
 
 describe("masked preview matches", () => {
   it("finds every non-overlapping occurrence", () => {
@@ -143,5 +143,33 @@ describe("pii-guard request state keys", () => {
     expect(shouldDropMissingDetail({ currentKey: "new", loadedKey: "new", succeeded: false, found: false })).toBe(false);
     expect(shouldDropMissingDetail({ currentKey: "new", loadedKey: "new", succeeded: true, found: true })).toBe(false);
     expect(shouldDropMissingDetail({ currentKey: "new", loadedKey: "new", succeeded: true, found: false })).toBe(true);
+  });
+});
+
+describe("prompt landing navigation", () => {
+  const prompt = parse("tab=findings&view=prompt&session=s1&at=p9&finding=abc:pan");
+
+  it("clears the prompt marker and its finding when leaving prompt view", () => {
+    expect(clearPromptLandingOnNavigation(prompt, { ...prompt, view: "hit" })).toMatchObject({ view: "hit", at: "", detailKey: null });
+  });
+
+  it("clears the prompt marker and its finding when changing tabs", () => {
+    expect(clearPromptLandingOnNavigation(prompt, { ...prompt, tab: "rules" })).toMatchObject({ tab: "rules", at: "", detailKey: null });
+  });
+
+  it("keeps prompt landing state for other changes and preserves findings without a marker", () => {
+    expect(clearPromptLandingOnNavigation(prompt, { ...prompt, q: "pan" })).toMatchObject({ at: "p9", detailKey: "abc:pan" });
+    const ordinary = { ...prompt, at: "", detailKey: "abc:pan" };
+    expect(clearPromptLandingOnNavigation(ordinary, { ...ordinary, tab: "rules" }).detailKey).toBe("abc:pan");
+  });
+});
+
+describe("cold hit lookup paging", () => {
+  it("continues with the API cursor until a hit, end of data, or the page cap", () => {
+    const cursor = { before: 10, skip: 2 };
+    expect(nextHitLookupCursor({ pageCount: 1, next: cursor })).toBe(cursor);
+    expect(nextHitLookupCursor({ pageCount: 1, next: null })).toBeNull();
+    expect(nextHitLookupCursor({ pageCount: 1, next: cursor, found: true })).toBeNull();
+    expect(nextHitLookupCursor({ pageCount: 10, next: cursor })).toBeNull();
   });
 });
