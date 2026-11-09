@@ -29,7 +29,7 @@ export function shortRange(from, to) {
 
 // Axis tick step: fewer labels on narrow screens so they do not overlap (S2).
 export function tickStep(count, { hourly = false, narrow = false } = {}) {
-  if (narrow && !hourly) return Math.max(1, Math.ceil(count / 5));
+  if (narrow && !hourly) return count >= 14 ? 7 : Math.max(1, Math.ceil(count / 5));
   return Math.max(1, Math.ceil(count / (hourly ? 12 : 10)));
 }
 

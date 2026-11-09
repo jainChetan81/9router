@@ -36,7 +36,7 @@ describe("tick step (S2)", () => {
     expect(tickStep(30)).toBe(3);
   });
   it("thins daily ticks on narrow widths", () => {
-    expect(tickStep(30, { narrow: true })).toBe(6);
+    expect(tickStep(30, { narrow: true })).toBe(7);
   });
   it("never returns less than 1", () => {
     expect(tickStep(0)).toBe(1);

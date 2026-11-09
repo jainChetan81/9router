@@ -15,6 +15,8 @@ export default function RangeBar({ preset, customLabel, onChange, today }) {
   const [m, setM] = useState(0);
   const [a, setA] = useState(null);
   const root = useRef(null);
+  const scrollRef = useRef(null);
+  const [atEnd, setAtEnd] = useState(false);
   // Same light-dismiss as HeaderMenu: a press outside or Escape closes the calendar.
   useEffect(() => {
     if (!open) return;
@@ -24,6 +26,14 @@ export default function RangeBar({ preset, customLabel, onChange, today }) {
     document.addEventListener("keydown", key);
     return () => { document.removeEventListener("mousedown", down); document.removeEventListener("keydown", key); };
   }, [open]);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const update = () => setAtEnd(el.scrollWidth <= el.clientWidth + 1 || el.scrollLeft + el.clientWidth >= el.scrollWidth - 1);
+    update(); el.addEventListener("scroll", update, { passive: true });
+    const ro = new ResizeObserver(update); ro.observe(el);
+    return () => { el.removeEventListener("scroll", update); ro.disconnect(); };
+  }, []);
   const T = today ? new Date(today + "T00:00:00") : new Date();
   const base = new Date(T.getFullYear(), T.getMonth() - m, 1);
   const off = (base.getDay() + 6) % 7, dim = new Date(base.getFullYear(), base.getMonth() + 1, 0).getDate();
@@ -38,14 +48,19 @@ export default function RangeBar({ preset, customLabel, onChange, today }) {
     onChange({ preset: "Custom", from: key(from), to: key(to), label });
   };
   return (
-    <div ref={root} style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 3, position: "relative", maxWidth: "100%" }}>
-      <div style={{ display: "flex", flexWrap: "nowrap", gap: 2, padding: 3, borderRadius: 9, background: "var(--seg)", maxWidth: "100%", overflowX: "auto", boxSizing: "border-box" }}>
-        {PRESETS.map((k) => <button key={k} onClick={() => { setOpen(false); setA(null); onChange({ preset: k }); }} style={seg(preset === k)}>{k}</button>)}
-        <button onClick={() => { setOpen((o) => !o); setA(null); }} style={seg(preset === "Custom")} aria-expanded={open}>
+    <div ref={root} className="r9-range-root">
+      <div ref={scrollRef} className={`r9-scroll-x r9-segment${atEnd ? " at-end" : ""}`} role="radiogroup" aria-label="Date range" onKeyDown={(e) => {
+        if (!["ArrowLeft", "ArrowRight"].includes(e.key)) return;
+        const radios = [...e.currentTarget.querySelectorAll('[role="radio"]')];
+        const index = radios.indexOf(document.activeElement);
+        if (index < 0) return;
+        e.preventDefault(); const next = radios[(index + (e.key === "ArrowRight" ? 1 : -1) + radios.length) % radios.length]; next?.focus(); next?.click();
+      }} style={{ display: "flex", flexWrap: "nowrap", gap: 2, padding: 3, borderRadius: 9, background: "var(--seg)", maxWidth: "100%", overflowX: "auto", boxSizing: "border-box" }}>
+        {PRESETS.map((k) => <button key={k} role="radio" aria-checked={preset === k} tabIndex={preset === k ? 0 : -1} onClick={() => { setOpen(false); setA(null); onChange({ preset: k }); }} style={seg(preset === k)}>{k}</button>)}
+        <button role="radio" aria-checked={preset === "Custom"} tabIndex={preset === "Custom" ? 0 : -1} onClick={() => { setOpen((o) => !o); setA(null); }} style={seg(preset === "Custom")} aria-expanded={open}>
           <span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: 15 }}>calendar_month</span><span style={{ whiteSpace: "nowrap" }}>{preset === "Custom" ? customLabel || "Custom" : "Custom"}</span>
         </button>
       </div>
-      <span style={{ fontSize: 11, color: "var(--tx3)", display: "flex", alignItems: "center", gap: 4 }}><span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: 14 }}>schedule</span>Times in IST (UTC+5:30)</span>
       {open && (
         <div style={{ position: "absolute", top: 38, right: 0, zIndex: 60, width: 280, background: "var(--card)", border: "1px solid var(--line2)", borderRadius: 12, boxShadow: "0 12px 32px rgba(40,20,10,.16)", padding: 14, display: "flex", flexDirection: "column", gap: 10 }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>

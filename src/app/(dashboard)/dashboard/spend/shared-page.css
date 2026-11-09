@@ -1,0 +1,27 @@
+[data-r9] .r9-page-header { padding: 24px 24px 16px; display: flex; flex-direction: column; gap: 8px; position: sticky; top: 0; z-index: 5; background: var(--bg); margin-left: -24px; margin-right: -24px; }
+[data-r9] .r9-page-titleblock { display: flex; flex-direction: column; gap: 8px; }
+[data-r9] .r9-header-main { display: flex; align-items: center; gap: 8px; }
+[data-r9] .r9-range-root { display: flex; align-items: center; position: relative; max-width: 100%; }
+[data-r9] .r9-spend-range { max-width: 1240px; margin: 0 auto; width: 100%; }
+[data-r9] .r9-spend-content { max-width: 1240px; margin: 0 auto; width: 100%; box-sizing: border-box; }
+[data-r9] .r9-segment button { height: 28px; padding: 0 12px; font-size: 13px; flex: none; white-space: nowrap; }
+[data-r9] .r9-card-footer button { height: 28px; }
+[data-r9] .r9-header-title { display: flex; align-items: center; gap: 8px; font-size: 28px; line-height: 1.2; font-weight: 700; color: var(--tx); margin: 0; }
+[data-r9] .r9-header-row { display: flex; align-items: center; gap: 8px; }
+[data-r9] .r9-header-subtitle { margin: 0; font-size: 12.5px; color: var(--tx2); }
+[data-r9] .r9-header-controls { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+[data-r9] .r9-tablist { display: flex; gap: 2px; padding: 3px; background: var(--seg); border-radius: 9px; }
+[data-r9] .r9-tablist button { flex: none; white-space: nowrap; height: 32px !important; padding: 0 12px !important; font-size: 13px !important; }
+[data-r9] button:focus-visible, [data-r9] a:focus-visible, [data-r9] select:focus-visible, [data-r9] input:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
+@media (max-width: 600px) {
+  [data-r9] .r9-page-header { padding: 16px 16px 12px; margin-left: -16px; margin-right: -16px; }
+  [data-r9] .r9-header-title { font-size: 20px; }
+  [data-r9] .r9-header-controls { flex-direction: column; align-items: stretch; gap: 8px; }
+  [data-r9] .r9-header-main { align-items: flex-start; flex-wrap: wrap; }
+  [data-r9] .r9-page-titleblock { padding: 0; }
+  [data-r9] .r9-segment button { height: 36px; }
+  [data-r9] .r9-card-footer button { height: 36px !important; flex: 1; }
+  [data-r9] .r9-spend-range { padding: 8px 16px !important; }
+  [data-r9] .r9-spend-content { padding: 12px 16px 40px !important; }
+  [data-r9] .r9-tablist { width: max-content; max-width: 100%; }
+}

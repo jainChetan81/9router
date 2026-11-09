@@ -2,7 +2,7 @@
 
 // Breakdown, ported from Spend.dc.html (round 2): Group by, Share by, tokens split, provider -> model -> effort drill-down.
 // Rows come from /api/spend: providerTree for Provider, the existing groups for every other grouping.
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { fN, fP, fR, fT, fV, fVpr, sum } from "@/lib/spend/uiHelpers";
 import useWidth from "./useWidth";
 import { fmtFee } from "./view";
@@ -36,10 +36,18 @@ export default function BreakdownDrill({ data, state, group, onGroup, onRetry, o
   const [tip, setTip] = useState(false);
   const [exp, setExp] = useState({});
   const [ref, w] = useWidth();
+  const groupScroll = useRef(null), shareScroll = useRef(null);
+  useEffect(() => {
+    const els = [groupScroll.current, shareScroll.current].filter(Boolean);
+    const update = (el) => el.classList.toggle("at-end", el.scrollWidth <= el.clientWidth + 1 || el.scrollLeft + el.clientWidth >= el.scrollWidth - 1);
+    const handlers = els.map((el) => { const fn = () => update(el); fn(); el.addEventListener("scroll", fn, { passive: true }); return [el, fn]; });
+    const ro = new ResizeObserver(() => els.forEach(update)); els.forEach((el) => ro.observe(el));
+    return () => { handlers.forEach(([el, fn]) => el.removeEventListener("scroll", fn)); ro.disconnect(); };
+  }, []);
   const wide = w >= 640;
 
   const mv = (o) => (metric === "value" ? o.v : metric === "real" ? o.re : metric === "req" ? o.r : o.t);
-  const sortM = (a) => a.slice().sort((x, y) => (mv(y) ?? -1) - (mv(x) ?? -1) || y.v - x.v);
+  const sortM = (a) => a.slice().sort((x, y) => (x.muted ? 1 : 0) - (y.muted ? 1 : 0) || (mv(y) ?? -1) - (mv(x) ?? -1) || y.v - x.v);
   const fMetric = (v) => (v == null ? "—" : metric === "value" ? fV(v) : metric === "real" ? fR(v) : metric === "req" ? fN(v) : fT(v));
   const toggle = (k) => () => setExp((e) => ({ ...e, [k]: !e[k] }));
   const tokSplit = data?.groups?.tokenSplit || {};
@@ -51,15 +59,15 @@ export default function BreakdownDrill({ data, state, group, onGroup, onRetry, o
     if (opt.mix) { const tm = sum(opt.mix, (x) => x.val) || 1; mix = opt.mix.map((x, i) => ({ w: (x.val / tm) * 100 + "%", op: OPS[Math.min(i, OPS.length - 1)] })); mixTitle = opt.mix.map((x) => x.n + " " + fP((x.val / tm) * 100)).join(" · "); }
     const sp = o.sp;
     return {
-      key: opt.key || o.name, isRow: true, name: o.name, desc: o.desc || "", font: opt.mono ? "var(--mono)" : "inherit", fs: opt.mono ? "12.5px" : "13px", fw: opt.mono ? 400 : 600, nameColor: opt.muted ? "var(--tx3)" : "var(--tx)",
-      pad: depth * 20 + "px", bg: depth ? "var(--bg)" : "transparent", chev: opt.open ? "expand_more" : "chevron_right", chevVis: opt.toggle ? "visible" : "hidden", cursor: opt.toggle ? "pointer" : "default", onToggle: opt.toggle || undefined, open: !!opt.open,
+      key: opt.key || o.name, isRow: true, isModel: !!opt.mono, provider: opt.provider || "", name: o.name, desc: o.desc || "", font: opt.mono ? "var(--mono)" : "inherit", fs: opt.mono ? "12.5px" : "13px", fw: opt.mono ? 400 : 600, nameColor: opt.muted ? "var(--tx3)" : "var(--tx)",
+      pad: depth * 20 + "px", bg: depth ? "var(--bg)" : "transparent", chev: opt.open ? "expand_more" : "chevron_right", chevVis: opt.toggle ? "visible" : "hidden", cursor: opt.toggle ? "pointer" : "default", onToggle: opt.toggle || undefined, controls: opt.controls, open: !!opt.open,
       mix, mixTitle, req: fN(o.r), tok: fT(o.t), real: opt.muted ? "not logged" : fR(o.re), realColor: o.re && !opt.muted ? "var(--acc)" : "var(--tx3)", realFw: o.re && !opt.muted ? 600 : 400, hasEst: (o.es || 0) >= 0.005, est: fR(o.es),
       value: fV(o.v), vpr: o.r ? fVpr(o.v / o.r) + " / req" : "—",
       split: sp ? sp.map((x, i) => ({ w: x * 100 + "%", c: SPC[i] })) : [], splitTitle: sp ? sp.map((x, i) => SPN[i] + " " + Math.round(x * 100) + "%").join(" · ") : "Token split not recorded",
       shareLabel: has ? fP(sh) : "—", w1: w1 + "%", w2: w2 + "%", metricVal: fMetric(m),
     };
   };
-  const subRow = (label, depth) => ({ key: "sub:" + label, isSub: true, label, subPad: depth * 20 + 29 + "px" });
+  const subRow = (label, depth, id) => ({ key: "sub:" + label, id, isSub: true, label, subPad: depth * 20 + 29 + "px" });
 
   const rows = [];
   if (data) {
@@ -73,16 +81,18 @@ export default function BreakdownDrill({ data, state, group, onGroup, onRetry, o
       const den = sum(tree, mv);
       sortM(tree).forEach((p) => {
         const open = !!exp[p.id];
-        rows.push(mkRow(p, den, 0, { key: p.id, toggle: toggle(p.id), open, mix: sortM(p.models).map((x) => ({ n: x.name, val: mv(x) ?? x.v })) }));
+        const modelRowsId = "r9-breakdown-models-" + p.id;
+        rows.push(mkRow(p, den, 0, { key: p.id, toggle: toggle(p.id), open, controls: modelRowsId, mix: sortM(p.models).map((x) => ({ n: x.name, val: mv(x) ?? x.v })) }));
         if (!open) return;
-        rows.push(subRow("Models in " + p.name + " · share within provider", 1));
+        rows.push(subRow("Models in " + p.name + " · share within provider", 1, modelRowsId));
         const pd = mv(p);
         sortM(p.models).forEach((md) => {
           const k = p.id + "|" + md.name, canOpen = md.efforts.length > 1 || (md.efforts.length === 1 && md.efforts[0].name !== "Unknown");
           const mo = !!exp[k] && canOpen;
-          rows.push(mkRow(md, pd, 1, { key: k, mono: true, toggle: canOpen ? toggle(k) : null, open: mo }));
+          const effortRowsId = "r9-breakdown-efforts-" + p.id + "-" + md.name.replace(/[^a-zA-Z0-9_-]/g, "-");
+          rows.push(mkRow(md, pd, 1, { key: k, mono: true, provider: PROV[p.k] || p.k, toggle: canOpen ? toggle(k) : null, open: mo, controls: canOpen ? effortRowsId : undefined }));
           if (!mo) return;
-          rows.push(subRow("Effort for " + md.name + " · share within model", 2));
+          rows.push(subRow("Effort for " + md.name + " · share within model", 2, effortRowsId));
           const ed = mv(md);
           sortM(md.efforts).forEach((e) => rows.push(mkRow(e, ed, 2, { key: k + "|" + e.name, mono: true })));
         });
@@ -119,7 +129,7 @@ export default function BreakdownDrill({ data, state, group, onGroup, onRetry, o
         <span style={{ fontSize: "11.5px", fontWeight: "600", letterSpacing: ".05em", color: "var(--tx2)", textTransform: "uppercase" }}>Breakdown</span>
         <div style={{ display: "flex", alignItems: "center", gap: "8px", minWidth: "0", maxWidth: "100%" }}>
           <span style={{ fontSize: "12px", color: "var(--tx3)", flex: "none" }}>Group by</span>
-          <div className="r9-segment" style={{ overflowX: "auto", minWidth: "0" }}><div style={{ display: "flex", gap: "2px", padding: "3px", borderRadius: "9px", background: "var(--seg)", width: "max-content" }}>
+          <div ref={groupScroll} className="r9-scroll-x r9-segment" style={{ overflowX: "auto", minWidth: "0", maxWidth: "100%" }}><div style={{ display: "flex", gap: "2px", padding: "3px", borderRadius: "9px", background: "var(--seg)", width: "max-content" }}>
             {GROUPS.map(([k, l]) => <button key={k} onClick={() => onGroup(k)} style={segStyle(group === k)}>{l}</button>)}
           </div></div>
         </div>
@@ -127,7 +137,7 @@ export default function BreakdownDrill({ data, state, group, onGroup, onRetry, o
       <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "space-between", alignItems: "center", gap: "8px 16px" }}>
         <div style={{ display: "flex", alignItems: "center", gap: "8px", minWidth: "0", maxWidth: "100%" }}>
           <span style={{ fontSize: "12px", color: "var(--tx3)", flex: "none" }}>Share by</span>
-          <div className="r9-segment" style={{ overflowX: "auto", minWidth: "0" }}><div style={{ display: "flex", gap: "2px", padding: "3px", borderRadius: "9px", background: "var(--seg)", width: "max-content" }}>
+          <div ref={shareScroll} className="r9-scroll-x r9-segment" style={{ overflowX: "auto", minWidth: "0", maxWidth: "100%" }}><div style={{ display: "flex", gap: "2px", padding: "3px", borderRadius: "9px", background: "var(--seg)", width: "max-content" }}>
             {[["value", "Value"], ["real", "Real spend"], ["req", "Requests"], ["tok", "Tokens"]].map(([k, l]) => <button key={k} onClick={() => setMetric(k)} style={segStyle(metric === k)}>{l}</button>)}
           </div></div>
         </div>
@@ -162,14 +172,14 @@ export default function BreakdownDrill({ data, state, group, onGroup, onRetry, o
               </div>
             </div>
             {rows.map((r) => r.isSub ? (
-              <div key={r.key} style={{ padding: `6px 8px 6px ${r.subPad}`, margin: "0 -8px", borderTop: "1px solid var(--line)", background: "var(--bg)", fontSize: "10.5px", fontWeight: "600", letterSpacing: ".04em", color: "var(--tx3)", textTransform: "uppercase" }}>{r.label}</div>
+            <div key={r.key} id={r.id} style={{ padding: `6px 8px 6px ${r.subPad}`, margin: "0 -8px", borderTop: "1px solid var(--line)", background: "var(--bg)", fontSize: "10.5px", fontWeight: "600", letterSpacing: ".04em", color: "var(--tx2)", textTransform: "uppercase" }}>{r.label}</div>
             ) : (
-              <div key={r.key} role={r.onToggle ? "button" : undefined} tabIndex={r.onToggle ? 0 : undefined} aria-expanded={r.onToggle ? !!r.open : undefined} onClick={r.onToggle} onKeyDown={r.onToggle ? (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); r.onToggle(); } } : undefined} style={{ display: "grid", gridTemplateColumns: cols, gap: "12px", alignItems: "center", padding: "9px 8px", margin: "0 -8px", borderTop: "1px solid var(--line)", background: r.bg, cursor: r.cursor, fontVariantNumeric: "tabular-nums" }}>
+              <div key={r.key} role={r.onToggle ? "button" : undefined} tabIndex={r.onToggle ? 0 : undefined} aria-expanded={r.onToggle ? !!r.open : undefined} aria-controls={r.controls} onClick={r.onToggle} onKeyDown={r.onToggle ? (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); r.onToggle(); } } : undefined} style={{ display: "grid", gridTemplateColumns: cols, gap: "12px", alignItems: "center", padding: "9px 8px", margin: "0 -8px", borderTop: "1px solid var(--line)", background: r.bg, cursor: r.cursor, fontVariantNumeric: "tabular-nums" }}>
                 <div style={{ minWidth: "0", display: "flex", gap: "4px", paddingLeft: r.pad }}>
                   <span style={{ ...MS, fontSize: "17px", color: "var(--tx3)", width: "17px", flex: "none", visibility: r.chevVis }}>{r.chev}</span>
                   <div style={{ minWidth: "0", flex: "1" }}>
-                    <div style={{ fontFamily: r.font, fontSize: r.fs, fontWeight: r.fw, color: r.nameColor, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.name}</div>
-                    <div style={{ fontSize: "11.5px", color: "var(--tx3)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.desc}</div>
+                    <div className={r.isModel ? "r9-breakdown-model" : ""} style={{ fontFamily: r.font, fontSize: r.fs, fontWeight: r.fw, color: r.nameColor, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.name}</div>
+                    <div className={r.isModel ? "r9-breakdown-provider" : ""} style={{ fontSize: "11.5px", color: "var(--tx2)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.isModel ? r.provider : r.desc}</div>
                     {r.mix && <div title={r.mixTitle} style={{ display: "flex", gap: "1px", height: "4px", marginTop: "5px", borderRadius: "2px", overflow: "hidden", maxWidth: "220px", background: "var(--seg)" }}>{r.mix.map((s, i) => <div key={i} style={{ width: s.w, background: "var(--violet)", opacity: s.op }}></div>)}</div>}
                     {splitNarrow && <div title={r.splitTitle} style={{ display: "flex", gap: "1px", height: "5px", marginTop: "5px", borderRadius: "2px", overflow: "hidden", maxWidth: "220px", background: "var(--seg)" }}>{r.split.map((s, i) => <div key={i} style={{ width: s.w, background: s.c }}></div>)}</div>}
                   </div>

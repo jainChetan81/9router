@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildView, chip } from "../../src/app/(dashboard)/dashboard/agents/view.js";
+import { buildView, chip, formatIdle, formatTps, formatP50, stateChip, clientCategory, sessionMatchesFilters, sessionFilterCount, istDayStart } from "../../src/app/(dashboard)/dashboard/agents/view.js";
 
 const NOW = Date.parse("2026-11-09T08:00:00Z");
 const ui = (o = {}) => ({ tab: "live", mode: "ready", exp: {}, ...o });
@@ -14,6 +14,14 @@ const live = {
 };
 
 describe("agents view fixes", () => {
+  it("groups client names and filters direct models", () => {
+    expect(clientCategory("OpenCode Go")).toBe("OpenCode");
+    const session = { session: "abc123", client: "Claude Code", roles: [{ role: "main", models: [{ model: "claude-opus-5-5" }] }] };
+    expect(sessionMatchesFilters(session, { query: "s·abc", client: "Claude Code" })).toBe(true);
+    expect(sessionMatchesFilters(session, { role: "claude-opus-5-5" })).toBe(true);
+    expect(sessionFilterCount(17, 1748, true)).toBe("17 of 1748");
+    expect(sessionFilterCount(1748, 1748, false)).toBe("1748 in range");
+  });
   const sess = (id, lastTs, model = "claude-opus-5-5") => ({ session: id, client: "Claude Code", firstTs: lastTs, lastTs, requests: 1, tokens: 1, value: 0, errors: 0, roles: [{ role: "main", model, requests: 1, models: [] }] });
   const sessions = [sess("aaaaaaaaaaaa", "2026-11-09T07:59:00Z"), sess("bbbbbbbbbbbb", "2026-11-09T07:50:00Z")];
 
@@ -31,6 +39,36 @@ describe("agents view fixes", () => {
     expect(v.tree.count).toBe("0 of 1748");
     const all = buildView({ live: null, sessions, totalSessions: 1748, analytics: null, range: { preset: "7D" }, ui: ui({ tab: "sessions" }), now: NOW });
     expect(all.tree.count).toBe("1748 in range");
+  });
+  it("builds session facts and per-model totals from detail data", () => {
+    const row = { ...sess("aaaaaaaaaaaa", "2026-11-09T07:59:00Z"), firstTs: "2026-11-09T07:00:00Z", parent: { session: "bbbbbbbbbbbb", parentGuessed: true } };
+    const detail = { session: row.session, client: "Claude Code", firstTs: row.firstTs, lastTs: row.lastTs, agents: [{ role: "main", requests: [
+      { ts: row.firstTs, model: "claude-opus-5-5", promptTokens: 10, completionTokens: 20, value: 0.2, status: "ok" },
+      { ts: row.lastTs, model: "gpt-6-luna", promptTokens: 5, completionTokens: 10, value: 0.1, status: "aborted" },
+    ] }] };
+    const v = buildView({ live, sessions: [row], detail, analytics: null, range: { preset: "7D" }, ui: ui({ drawer: row.session, drawerMode: "details" }), now: NOW });
+    expect(v.dd.hasData).toBe(true);
+    expect(v.dd.roles.map((r) => r.model)).toEqual(["claude-opus-5-5", "gpt-6-luna"]);
+    expect(v.dd.stats[0]).toEqual(["Requests", "1", ""]);
+    expect(v.dd.facts.find(([label]) => label === "Project")[1]).toBe("Not recorded");
+    expect(v.dd.facts.find(([label]) => label === "Parent")[1]).toContain("likely");
+  });
+  it("keeps aggregate session totals when detail requests are sampled", () => {
+    const row = { ...sess("aaaaaaaaaaaa", "2026-11-09T07:59:00Z"), requests: 2505, tokens: 90000, value: 42, errors: 5 };
+    const detail = { session: row.session, truncated: true, agents: [{ role: "main", requests: [
+      { ts: row.lastTs, model: "claude-opus-5-5", promptTokens: 10, completionTokens: 20, value: 0.2, status: "ok" },
+    ] }] };
+    const v = buildView({ live: null, sessions: [row], detail, detailsBySession: { [row.session]: detail }, analytics: null, range: { preset: "7D" }, ui: ui({ drawer: row.session, drawerMode: "details" }), now: NOW });
+    expect(v.dd.stats[0]).toEqual(["Requests", "2,505", "5 failed"]);
+    expect(v.dd.stats[1][1]).toBe("90.0k");
+    expect(v.dd.stats[2][1]).toBe("$42.00");
+    expect(v.dd.roleSampled).toBe(true);
+  });
+  it("uses the drawer session detail when routing a different session", () => {
+    const other = { ...sess("bbbbbbbbbbbb", "2026-11-09T07:50:00Z"), roles: [] };
+    const detail = { session: other.session, client: "Claude Code", agents: [{ role: "reviewer", requests: [{ model: "gpt-6-luna" }] }] };
+    const v = buildView({ live: null, sessions: [...sessions, other], detailsBySession: { [other.session]: detail }, analytics: null, range: { preset: "7D" }, ui: ui({ drawer: other.session, drawerMode: "routing" }), combos: [{ name: "reviewer", models: ["gpt-6-luna"] }], now: NOW });
+    expect(v.dr.rows.map((row) => row.role)).toContain("reviewer");
   });
   it("uses the 4-column session row grid (A12)", () => {
     const v = buildView({ live: null, sessions, totalSessions: 2, analytics: null, range: { preset: "7D" }, ui: ui({ tab: "sessions" }), now: NOW });
@@ -73,6 +111,7 @@ describe("agents view fixes", () => {
     const v = buildView({ live: live2, sessions: [], analytics: null, range: { preset: "7D" }, ui: ui({ drawer: "aaaaaaaaaaaa" }), now: NOW, combos, models, overrides: [], draft });
     expect(v.dr.rows[0].warn).toContain("cost much more");
     expect(v.dr.changes[0].warn).toBe(true);
+    expect(v.dr.changes[0].expectedCurrent).toBe("glm-5.3-flash");
   });
   it("uses a 8 px minimum hit area for timeline bars (A20)", () => {
     const det = { session: "aaaaaaaaaaaa", client: "Claude Code", firstTs: "2026-11-09T07:00:00Z", lastTs: "2026-11-09T07:59:00Z",
@@ -81,14 +120,14 @@ describe("agents view fixes", () => {
     expect(v.g.lanes[0].bars[0].style.minWidth).toBe(8);
   });
 
-  it("clamps the 6h window end to now and labels Day ranges with dates (A18, A33)", () => {
+  it("clamps the 6h window and starts Day at IST midnight (A18, A33)", () => {
     const det = { session: "aaaaaaaaaaaa", client: "Claude Code", firstTs: "2026-11-09T07:00:00Z", lastTs: "2026-11-09T07:30:00Z",
       agents: [{ role: "main", requests: [{ ts: "2026-11-09T07:10:00Z", totalMs: 1000, model: "claude-opus-5-5", status: "ok" }] }] };
     const v = buildView({ live: null, sessions, detail: det, analytics: null, range: { preset: "7D" }, ui: ui({ tab: "sessions", sel: "aaaaaaaaaaaa", zoom: "6h" }), now: NOW });
     expect(v.g.window).toMatch(/IST · 6h view/);
     const day = buildView({ live: null, sessions, detail: det, analytics: null, range: { preset: "7D" }, ui: ui({ tab: "sessions", sel: "aaaaaaaaaaaa", zoom: "Day" }), now: NOW });
-    // Day view is 24 h ending at now (13:30 IST), so it starts on Nov 8.
-    expect(day.g.window).toMatch(/^Nov 8 13:30 – Nov 9 13:30 IST · Day view$/);
+    expect(day.g.window).toMatch(/^Nov 9 00:00 – 13:30 IST · Day view$/);
+    expect(istDayStart(NOW)).toBe(Date.parse("2026-11-08T18:30:00Z"));
   });
 
   it("drops the detail when its session is filtered out (A16)", () => {
@@ -96,10 +135,32 @@ describe("agents view fixes", () => {
       agents: [{ role: "main", requests: [{ ts: "2026-11-09T07:10:00Z", totalMs: 1000, model: "claude-opus-5-5", status: "ok" }] }] };
     const v = buildView({ live: null, sessions, detail: det, analytics: null, range: { preset: "7D" }, ui: ui({ tab: "sessions", sel: "aaaaaaaaaaaa", q: "bbbb" }), now: NOW });
     expect(v.g).toBe(null);
+    expect(v.noSelText).toBe("The selected session is hidden by the filters.");
   });
 });
 
 describe("agents view", () => {
+  it("formats live role state and measurements", () => {
+    expect(formatIdle(42_000)).toBe("idle 42 s");
+    expect(formatIdle(180_000)).toBe("idle 3 m");
+    expect(formatTps(63.7)).toBe("64 t/s");
+    expect(formatTps(null)).toBe("");
+    expect(formatP50(4200)).toBe("p50 4.2 s");
+    expect(stateChip("streaming", null, NOW, 2)).toMatchObject({ label: "streaming · 2", color: "var(--green)" });
+    expect(stateChip("thinking", null, NOW)).toMatchObject({ label: "thinking", color: "var(--amber)" });
+    expect(stateChip("idle", NOW - 42_000, NOW).label).toBe("idle 42 s");
+  });
+
+  it("uses live registry fields for in-flight and per-role metrics", () => {
+    const payload = { inFlight: 3, sessions: [{ session: "live-session", lastActivityMs: NOW - 42000, inFlight: 2,
+      roles: [{ role: "implementer", state: "thinking", inFlight: 2, lastActivityMs: NOW - 42000, idleSeconds: 42, tps: 64, p50Ms: 4200 }] }] };
+    const v = buildView({ live: payload, sessions: [], analytics: null, range: { preset: "7D" }, ui: ui(), now: NOW });
+    const row = v.live.cards[0].rows[0];
+    expect(v.live.kpis.find((k) => k.label === "IN FLIGHT").value).toBe("3");
+    expect(row).toMatchObject({ st: "thinking", tps: "64 t/s", p50: "p50 4.2 s" });
+    expect(v.live.cards[0].inFlight).toBe(2);
+  });
+
   it("builds live KPIs and nests inferred children under the parent", () => {
     const v = buildView({ live, sessions: [], analytics: null, range: { preset: "7D" }, ui: ui(), now: NOW });
     const byLabel = Object.fromEntries(v.live.kpis.map((k) => [k.label, k]));
@@ -114,8 +175,8 @@ describe("agents view", () => {
     const old = { sessions: [{ ...live.sessions[1], parent: null, tpsRecent: null, p50TotalMs: null }] };
     const v = buildView({ live: old, sessions: [], analytics: null, range: { preset: "7D" }, ui: ui(), now: NOW });
     const byLabel = Object.fromEntries(v.live.kpis.map((k) => [k.label, k]));
-    expect(byLabel["TOKENS / S"].value).toBe("—");
-    expect(byLabel["LATENCY P50"].value).toBe("—");
+    expect(byLabel["TOKENS / S"].value).toBe("No samples");
+    expect(byLabel["LATENCY P50"].value).toBe("No samples");
   });
 
   it("handles an empty response without throwing", () => {
@@ -137,6 +198,31 @@ describe("agents view", () => {
     expect(filtered.tl.rows[0]).toMatchObject({ calls: 4, errors: 1, pct: "25.0%" });
     expect(filtered.tl.rows[0].split.map((r) => r.role)).toEqual(["scout"]);
     expect(buildView({ ...args, tools: { tools: [], topToolsByRole: [] } }).tl).toMatchObject({ hasData: false, emptyTitle: "Tool tracking started Nov 9, 2026" });
+  });
+  it("shares requests across roles and direct model segments (A25, A27, A28)", () => {
+    const analytics = { totalRequests: 10, sessionRequests: 7, byRole: [
+      { role: "implementer", requests: 4, tokens: 40, value: 4 }, { role: "direct", requests: 6, tokens: 60, value: 6 },
+    ], modelByRole: [
+      { role: "implementer", model: "gpt-6-luna", requests: 4, tokens: 40, value: 4, samples: 0 },
+      { role: "direct", model: "claude-opus-5-5", requests: 4, tokens: 40, value: 4, samples: 0 },
+      { role: "direct", model: "gpt-6-luna", requests: 2, tokens: 20, value: 2, samples: 1, tpsP50: 20, ttftP50: 300, totalP50: 500, totalP95: 800 },
+    ], delegationRate: 0.1, childrenPerSession: 0.5 };
+    const v = buildView({ analytics, range: { preset: "7D" }, ui: ui({ tab: "roles" }) });
+    expect(v.ro.totalRequests).toBe("10");
+    expect(v.ro.sessionRequests).toBe("7");
+    expect(v.ro.legendDirect.map((x) => x.model)).toEqual(["claude-opus-5-5", "gpt-6-luna"]);
+    expect(v.ro.share[0].segs.reduce((n, s) => n + Number(s.f), 0)).toBeCloseTo(1000, 0);
+    expect(v.ro.rows.find((r) => r.model === "claude-opus-5-5").noSamples).toBe(true);
+  });
+  it("groups direct model tool filters separately from roles (A32)", () => {
+    const tools = { tools: [{ name: "Read", calls: 12, errors: 1, byRole: [
+      { role: "implementer", calls: 9, errors: 0 }, { role: "direct", model: "claude-opus-5-5", calls: 3, errors: 1 },
+    ], topModel: { model: "claude-opus-5-5", calls: 3 } }] };
+    const args = { tools, range: { preset: "7D" }, ui: ui({ tab: "tools" }) };
+    const all = buildView(args);
+    expect(all.tl.roleBtns.map((b) => b.label)).toEqual(["All", "implementer"]);
+    expect(all.tl.directModelBtns.map((b) => b.label)).toEqual(["claude-opus-5-5"]);
+    expect(buildView({ ...args, ui: ui({ tab: "tools", toolRole: "claude-opus-5-5" }) }).tl.rows[0].calls).toBe(3);
   });
 
   it("exposes page-state flags under v.v so the Sessions tab renders", () => {
@@ -194,11 +280,11 @@ describe("agents view", () => {
   });
 
   it("shows pending, active override, changed member, and effective card models", () => {
-    const overridesBySession = { aaaaaaaaaaaa: [
+    const overridesBySession = { aaaaaaaaaaaa: { revisions: {}, overrides: [
       { combo: "main", model: "gpt-6-luna", mode: "override", status: "active" },
       { combo: "scout", model: "ocg/glm-5.3", mode: "member", status: "active" },
       { combo: "background", model: "gpt-6.1-sol", mode: "override", status: "pending" },
-    ] };
+    ] } };
     const v = buildView({ live, sessions: [], analytics: null, range: { preset: "7D" }, ui: ui(), overridesBySession, now: NOW });
     const card = v.live.cards.find((c) => c.id === "s·aaaaaaaaaaaa");
     const rows = Object.fromEntries(card.rows.map((r) => [r.role, r]));
@@ -209,5 +295,14 @@ describe("agents view", () => {
     expect(card.hasOverride).toBe(true);
     expect(card.hasChanged).toBe(true);
     expect(card.hasPending).toBe(true);
+  });
+});
+
+describe("roundShares", () => {
+  it("makes whole percents add up to 100", async () => {
+    const { roundShares } = await import("@/app/(dashboard)/dashboard/agents/view.js");
+    expect(roundShares([1, 1, 1])).toEqual([34, 33, 33]);
+    expect(roundShares([0, 0])).toEqual([0, 0]);
+    expect(roundShares([0.5, 0.25, 0.25]).reduce((a, x) => a + x, 0)).toBe(100);
   });
 });
