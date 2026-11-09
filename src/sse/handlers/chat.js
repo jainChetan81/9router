@@ -60,7 +60,8 @@ export async function handleChat(request, clientRawRequest = null) {
   if (process.env.PII_GUARD_MODULE) {
     const guardSettings = (await getSettings()).piiGuard;
     const requested = stripModelContextMarker(body.model).model;
-    const combo = guardSettings?.mode !== "off" && await getComboModels(requested) ? requested : undefined;
+    // Malformed models stay for the normal 400 path below; the combo label is best effort.
+    const combo = guardSettings?.mode !== "off" && typeof requested === "string" && requested && await getComboModels(requested).catch(() => null) ? requested : undefined;
     guard = await observeRequest(body, { endpoint: clientRawRequest.endpoint, userAgent: clientRawRequest.headers?.["user-agent"], model: body?.model, sessionId: session?.random ? null : session?.sessionId, combo }, guardSettings);
     if (guard?.blocked) return errorResponse(HTTP_STATUS.BAD_REQUEST, blockMessage(guard.blocked, true, guard.stuck));
   }
