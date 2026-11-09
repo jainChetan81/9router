@@ -19,6 +19,8 @@ export default function AgentsClient() {
   const [live, setLive] = useState(null);
   const [sessions, setSessions] = useState(null);
   const [totalSessions, setTotalSessions] = useState(0);
+  const [moreCursor, setMoreCursor] = useState(null);
+  const [moreBusy, setMoreBusy] = useState(false);
   const [detail, setDetail] = useState(null);
   const [analytics, setAnalytics] = useState(null);
   const [tools, setTools] = useState(null);
@@ -58,7 +60,7 @@ export default function AgentsClient() {
       for (const change of changes) {
         const res = await fetch(`/api/agents/sessions/${encodeURIComponent(sid)}/overrides`, {
           method: "PUT", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ combo: change.role, model: change.to, mode: change.mode, fallback: change.mode === "member", expiry: change.expiry === "Session end" ? "session" : change.expiry, revision: revisions[change.role] ?? 0, confirmExpensive: /opus|fable/i.test(change.to) }),
+          body: JSON.stringify({ combo: change.role, model: change.to, mode: change.mode, fallback: change.mode === "member", expiry: change.expiry === "Session end" ? "session" : change.expiry, revision: revisions[change.role] ?? 0, confirmExpensive: !!change.warn }),
         });
         const body = await res.json().catch(() => ({}));
         if (res.status === 409) { await refreshOverrides(sid); setToast("Changed elsewhere. Reloaded."); return; }
@@ -159,6 +161,7 @@ export default function AgentsClient() {
       if (id !== rangeId.current) return;
       setSessions(s.sessions || []);
       setTotalSessions(s.total ?? (s.sessions || []).length);
+      setMoreCursor(s.nextCursor || null);
       setAnalytics(a);
       setMode("ready");
     } catch (e) {
@@ -191,12 +194,34 @@ export default function AgentsClient() {
       setDetail(d);
     } catch { setDetail(null); }
   }, []);
-  const sel = ui.sel || sessions?.[0]?.session || null;
+  // Select the first row only once, when nothing is selected. Live refreshes keep the selection (A15).
+  const firstSid = sessions?.[0]?.session || null;
+  useEffect(() => {
+    if (!ui.sel && firstSid) set({ sel: firstSid });
+  }, [ui.sel, firstSid, set]);
+  const sel = ui.sel || null;
   useEffect(() => {
     if (ui.tab !== "sessions" || !sel) return;
     const t = setTimeout(() => loadDetail(sel), 0);
     return () => clearTimeout(t);
   }, [ui.tab, sel, tick, loadDetail]);
+
+  const loadMore = useCallback(async () => {
+    if (!moreCursor || moreBusy) return;
+    setMoreBusy(true);
+    try {
+      const q = new URLSearchParams({ preset: range.preset, cursor: moreCursor });
+      if (range.preset === "Custom") { q.set("from", range.from); q.set("to", range.to); }
+      const page = await getJson(`/api/agents/sessions?${q}`);
+      setSessions((old) => {
+        const seen = new Set((old || []).map((s) => s.session));
+        return [...(old || []), ...(page.sessions || []).filter((s) => !seen.has(s.session))];
+      });
+      setMoreCursor(page.nextCursor || null);
+    } catch (error) {
+      setToast(error.message || "Unable to load more sessions.");
+    } finally { setMoreBusy(false); }
+  }, [moreCursor, moreBusy, range]);
 
   // Prime the mode once live answers arrive.
   useEffect(() => {
@@ -220,18 +245,55 @@ export default function AgentsClient() {
     pick: (p) => set({ pick: p }),
     zoom: (k) => set({ zoom: k, gOff: 0 }),
     pan: (d) => set((u) => ({ ...u, gOff: Math.max(0, (u.gOff || 0) + d) })),
-    openDrawer: (sid) => { set({ drawer: sid }); if (!sid) { setOverrides([]); setDraft({}); setCf(false); } },
+    // Every drawer opens from a clean draft, so no edit from another session or an earlier open leaks in (A6).
+    openDrawer: (sid) => { setDraft({}); setCf(false); set({ drawer: sid }); if (!sid) setOverrides([]); },
+    loadMore,
     openTimeline: (sid) => { if (sid) { set({ tab: "sessions", sel: sid }); } else set({ tab: "sessions" }); setTick((x) => x + 1); },
-  }), [set]);
+  }), [set, loadMore]);
 
-  const v = useMemo(() => buildView({ live, sessions, totalSessions, detail, analytics, tools, range, ui: { ...ui, mode, errorText }, act, vw, combos, models, overrides, overridesBySession, revisions, draft, cf, toast,
+  const v = useMemo(() => buildView({ live, sessions, totalSessions, detail, analytics, tools, range, ui: { ...ui, mode, errorText }, act, vw, combos, models, overrides, overridesBySession, revisions, draft, cf, toast, moreCursor,
     setDraft: (update) => setDraft((old) => ({ ...old, ...(typeof update === "function" ? update(old) : update) })),
     setCf, setToast, applyOverrides, reloadOverrides: refreshOverrides,
-    act: { ...act, applyOverrides, revertOverride } }), [live, sessions, totalSessions, detail, analytics, tools, range, ui, mode, errorText, act, vw, combos, models, overrides, overridesBySession, revisions, draft, cf, toast, applyOverrides, refreshOverrides, revertOverride]);
+    act: { ...act, applyOverrides, revertOverride } }), [live, sessions, totalSessions, detail, analytics, tools, range, ui, mode, errorText, act, vw, combos, models, overrides, overridesBySession, revisions, draft, cf, toast, moreCursor, applyOverrides, refreshOverrides, revertOverride]);
 
   const isLoading = mode === "loading", isError = mode === "error", ready = !isLoading && !isError;
   const onRange = (r) => { setRange(r); set({ hov: null, pick: null, focus: null, sel: null }); setDetail(null); };
   const retry = act.retry;
+
+  // Drawer: Escape closes, focus moves in on open, Tab stays inside, focus returns to the trigger on close (A9).
+  const drawerRef = useRef(null);
+  const returnFocus = useRef(null);
+  const dOpen = !!v.dr;
+  useEffect(() => {
+    if (!dOpen) return;
+    returnFocus.current = document.activeElement;
+    const first = drawerRef.current?.querySelector("select, button, input, [href]");
+    first?.focus();
+    const onKey = (e) => {
+      if (e.key === "Escape") { e.preventDefault(); act.openDrawer(null); return; }
+      if (e.key !== "Tab" || !drawerRef.current) return;
+      const items = [...drawerRef.current.querySelectorAll("button:not([disabled]), select, input, a[href]")];
+      if (!items.length) return;
+      const a = items[0], b = items[items.length - 1];
+      if (e.shiftKey && document.activeElement === a) { e.preventDefault(); b.focus(); }
+      else if (!e.shiftKey && document.activeElement === b) { e.preventDefault(); a.focus(); }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      const back = returnFocus.current;
+      if (back && typeof back.focus === "function" && document.contains(back)) back.focus();
+    };
+  }, [dOpen, act]);
+
+  // Timeline request popover: Escape closes it (A21).
+  const pickOpen = !!v.g?.pick;
+  useEffect(() => {
+    if (!pickOpen) return;
+    const onKey = (e) => { if (e.key === "Escape") act.pick(null); };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [pickOpen, act]);
 
   return (
     <div data-r9={theme}>
@@ -245,7 +307,7 @@ export default function AgentsClient() {
                 <span className="material-symbols-outlined" style={{ fontSize: 14 }}>smart_toy</span>{v.status.text}
               </span>
             </div>
-            <p style={{ margin: "4px 0 0", fontSize: 12.5, color: "var(--tx2)" }}>Async subagents (T3 Code) and sync implementers (combos), mixed in one live view.</p>
+            <p style={{ margin: "4px 0 0", fontSize: 12.5, color: "var(--tx2)" }}>Live and past agent sessions, by role and model.</p>
           </div>
           <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
             <div style={{ display: "flex", gap: 2, padding: 3, borderRadius: 9, background: "var(--seg)" }}>
@@ -290,13 +352,13 @@ export default function AgentsClient() {
           </div>
         )}
         {ready && !v.v.empty && ui.tab === "live" && <LiveTab v={v} />}
-        {ready && !v.v.empty && ui.tab === "sessions" && <SessionsTab v={v} ui={ui} />}
+        {ready && !v.v.empty && ui.tab === "sessions" && <SessionsTab v={v} ui={ui} moreBusy={moreBusy} />}
         {ready && !v.v.empty && ui.tab === "roles" && <RolesTab v={v} />}
         {ready && !v.v.empty && ui.tab === "tools" && <ToolsTab v={v} error={toolsError} loading={!tools && !toolsError} />}
 
         {v.dr && (
           <div role="dialog" aria-modal="true" aria-label={v.dr.aria} onClick={v.closeDrawer} style={{ position: "fixed", inset: 0, zIndex: 70, background: "rgba(20,12,8,.4)", display: "flex", justifyContent: "flex-end" }}>
-            <div onClick={(e) => e.stopPropagation()} style={{ width: v.dr.w, maxWidth: "100vw", height: "100%", overflowY: "auto", background: "var(--card)", borderLeft: "1px solid var(--line2)", padding: "20px 22px 28px" }}>
+            <div ref={drawerRef} onClick={(e) => e.stopPropagation()} style={{ width: v.dr.w, maxWidth: "100vw", height: "100%", overflowY: "auto", background: "var(--card)", borderLeft: "1px solid var(--line2)", padding: "20px 22px 28px" }}>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
                 <div>
                   <div style={{ fontSize: 15, fontWeight: 700 }}>Change routing · {v.dr.sid}</div>
@@ -314,14 +376,19 @@ export default function AgentsClient() {
                   </div>
                 {r.locked ? <p style={{ margin: 0, fontSize: 12, color: "var(--tx2)" }}>🔒 {r.lockText}</p> : <>
                   <label style={{ display: "flex", flexDirection: "column", gap: 4 }}><span style={{ fontSize: 11, fontWeight: 600, color: "var(--tx3)" }}>MODEL</span><select value={r.sel} onChange={r.onSel} style={{ height: 32, border: "1px solid var(--line2)", borderRadius: 7, background: "var(--bg)", color: "var(--tx)", fontFamily: "var(--mono)", fontSize: 12, padding: "0 8px" }}>{r.opts.map((o) => <option key={o.v} value={o.v}>{o.label}</option>)}</select></label>
-                  {r.isOther && <label style={{ display: "flex", flexDirection: "column", gap: 4 }}><span style={{ fontSize: 11, fontWeight: 600, color: "var(--tx3)" }}>OTHER MODEL</span><select value={r.other} onChange={r.onOther} style={{ height: 32, border: "1px solid var(--line2)", borderRadius: 7, background: "var(--bg)", color: "var(--tx)", fontFamily: "var(--mono)", fontSize: 12, padding: "0 8px" }}>{r.otherOpts.map((o) => <option key={o.v} value={o.v}>{o.label}</option>)}</select></label>}
+                  {r.isOther && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                      <input value={r.otherQ} onChange={r.onQ} placeholder="Search models…" aria-label={"Search models for " + r.role} style={{ height: 30, padding: "0 10px", borderRadius: 7, border: "1px solid var(--line2)", background: "var(--bg)", color: "var(--tx)", font: "inherit", fontSize: 12 }} />
+                      <label style={{ display: "flex", flexDirection: "column", gap: 4 }}><span style={{ fontSize: 11, fontWeight: 600, color: "var(--tx3)" }}>OTHER MODEL</span><select value={r.other} onChange={r.onOther} style={{ height: 32, border: "1px solid var(--line2)", borderRadius: 7, background: "var(--bg)", color: "var(--tx)", fontFamily: "var(--mono)", fontSize: 12, padding: "0 8px" }}>{r.otherGroups.map((g) => <optgroup key={g.label} label={g.label}>{g.opts.map((o) => <option key={o.v} value={o.v}>{o.label}</option>)}</optgroup>)}</select></label>
+                    </div>
+                  )}
                   {r.warn && <div style={{ padding: "8px 12px", borderRadius: 8, background: "var(--amberbg)", fontSize: 12, color: "var(--tx)" }}>⚠ {r.warn}</div>}
-                  <div style={{ display: "flex", alignItems: "flex-end", gap: 12, flexWrap: "wrap" }}><div><div style={{ fontSize: 11, fontWeight: 600, color: "var(--tx3)", marginBottom: 4 }}>MODE</div><div role="group" aria-label={r.modeAria} style={{ display: "flex", gap: 2, padding: 2, borderRadius: 8, background: "var(--seg)" }}>{r.modes.map((m) => <button key={m.label} onClick={m.on} aria-pressed={m.on2} title={m.tip} style={m.style}>{m.label}</button>)}</div></div><label style={{ display: "flex", flexDirection: "column", gap: 4 }}><span style={{ fontSize: 11, fontWeight: 600, color: "var(--tx3)" }}>UNTIL</span><select value={r.expiry} onChange={r.onExp} style={{ height: 28, border: "1px solid var(--line2)", borderRadius: 7, background: "var(--bg)", color: "var(--tx)", font: "inherit", fontSize: 12 }}><option value="Session end">Session end</option><option value="1h">1 hour</option><option value="2h">2 hours</option></select></label></div>
+                  <div style={{ display: "flex", alignItems: "flex-end", gap: 12, flexWrap: "wrap" }}><div><div style={{ fontSize: 11, fontWeight: 600, color: "var(--tx3)", marginBottom: 4 }}>MODE</div><div role="group" aria-label={r.modeAria} style={{ display: "flex", gap: 2, padding: 2, borderRadius: 8, background: "var(--seg)" }}>{r.modes.map((m) => <button key={m.label} onClick={m.on} aria-pressed={m.on2} title={m.tip} style={m.style}>{m.label}</button>)}</div></div><label style={{ display: "flex", flexDirection: "column", gap: 4 }}><span style={{ fontSize: 11, fontWeight: 600, color: "var(--tx3)" }}>UNTIL</span><select value={r.expiry} onChange={r.onExp} style={{ height: 32, border: "1px solid var(--line2)", borderRadius: 7, background: "var(--bg)", color: "var(--tx)", font: "inherit", fontSize: 12 }}><option value="Session end">Session end</option><option value="1h">1 hour</option><option value="2h">2 hours</option></select></label></div>
                   {r.strict && <span style={{ fontSize: 11.5, color: "var(--tx2)" }}>No fallback. If this model fails, the request fails visibly.</span>}
                 </>}
                 </div>
               ))}
-            <div style={{ padding: "10px 12px", borderRadius: 8, background: "var(--seg)", fontSize: 12, color: "var(--tx2)" }}>Applies from the next request only. Requests in flight keep their model. Codex sessions can only use OpenAI models. <a href="/dashboard/combos">Edit combo members for everyone →</a></div>
+            <div style={{ padding: "10px 12px", borderRadius: 8, background: "var(--seg)", fontSize: 12, color: "var(--tx2)" }}>Applies from the next request only. Requests in flight keep their model.{v.dr.isCodex && " Codex sessions can only use OpenAI models."} <a href="/dashboard/combos">Edit combo members for everyone →</a></div>
             <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 8, paddingTop: 12, borderTop: "1px solid var(--line)" }}><span style={{ marginRight: "auto", fontSize: 12, color: "var(--tx3)" }}>{v.dr.changeText}</span><button onClick={v.closeDrawer} style={{ height: 32, padding: "0 16px", borderRadius: 8, border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: 12.5, cursor: "pointer" }}>Cancel</button><button onClick={v.dr.apply} disabled={v.dr.noChanges} style={v.dr.applyStyle}>Apply</button></div>
             </div>
           </div>
@@ -397,14 +464,18 @@ function LiveCard({ c, narrow }) {
       </div>
       <div style={{ display: "flex", flexDirection: "column", marginTop: 6 }}>
         {c.rows.map((r) => (
-          <div key={r.role} style={{ display: "flex", alignItems: "center", gap: 8, padding: "5px 0", borderTop: "1px solid var(--line)", opacity: r.op }}>
-            <span style={r.chip}>{r.role}</span>
-            <span title={r.model} style={{ maxWidth: 170, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12, color: "var(--tx)" }}><span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: r.mc, marginRight: 5 }} />{r.model}</span>
-            <span style={{ fontSize: 11, color: "var(--tx3)" }}>{r.prov}</span>
-            <span style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 2, fontSize: 11, color: r.stC }}><span style={r.dot} />{r.st}</span>
-            <span title={r.sparkTip} style={{ fontSize: 11, color: "var(--tx3)", fontVariantNumeric: "tabular-nums" }}>{r.rpm}/m · {r.tps}t/s · {r.p50}</span>
-            <span style={{ fontSize: 11, color: r.succC, fontVariantNumeric: "tabular-nums" }}>{r.succ}</span>
-            {r.tag && <span style={r.tagStyle}>{r.tag}</span>}
+          <div key={r.role} style={{ display: "flex", flexDirection: "column", gap: 3, padding: "6px 0", borderTop: "1px solid var(--line)", opacity: r.op, minWidth: 0 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+              <span style={r.chip}>{r.role}</span>
+              <span title={r.model} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12, color: "var(--tx)" }}><span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: r.mc, marginRight: 5 }} />{r.model}</span>
+              {r.tag && <span style={r.tagStyle}>{r.tag}</span>}
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", fontSize: 11, color: "var(--tx3)", paddingLeft: 2 }}>
+              <span>{r.prov}</span>
+              <span style={{ display: "flex", alignItems: "center", gap: 3, color: r.stC }}><span style={r.dot} />{r.st}</span>
+              <span title={r.sparkTip} style={{ fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>{r.rpm}/m · {r.tps}t/s · {r.p50}</span>
+              <span style={{ color: r.succC, fontVariantNumeric: "tabular-nums" }}>{r.succ}</span>
+            </div>
           </div>
         ))}
       </div>
@@ -416,7 +487,7 @@ function LiveCard({ c, narrow }) {
   );
 }
 
-function SessionsTab({ v, ui }) {
+function SessionsTab({ v, ui, moreBusy }) {
   if (!v.v.sess) return null;
   const t = v.tree, g = v.g, sm = v.sm;
   return (
@@ -445,20 +516,34 @@ function SessionsTab({ v, ui }) {
               {t.none && <p style={{ padding: "24px 16px", fontSize: 12.5, color: "var(--tx3)", textAlign: "center" }}>No sessions match this filter.</p>}
               {t.rows.map((r, i) => (
                 <button key={(r.isSess ? "s" : r.isRole ? "r" : "m") + i + r.label} onClick={r.on} style={{ ...r.style, paddingLeft: `calc(8px + ${r.pad})` }}>
-                  {r.isSess && <span className="material-symbols-outlined" style={{ fontSize: 16, color: "var(--tx3)" }}>{r.chev}</span>}
-                  {r.isKid && <span className="material-symbols-outlined" style={{ fontSize: 14, color: "var(--tx3)" }} title="Delegated child (T3). Link inferred.">subdirectory_arrow_right</span>}
-                  {r.isRole && <span style={r.chip}>{r.label}</span>}
-                  {r.isModel && <span><span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: r.mc, marginRight: 5 }} />{r.label}</span>}
-                  {r.isSess && <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.label}<span style={{ color: "var(--tx3)", fontSize: 11 }}> · {r.sub}</span></span>}
-                  {r.live && <span style={{ width: 7, height: 7, borderRadius: "50%", background: "var(--green)", flex: "none" }} title="Live now" />}
-                  <span style={{ marginLeft: "auto", fontSize: 11.5, color: "var(--tx3)", fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>{r.req} · {r.tok} · {r.val}{+r.err > 0 && <span style={{ color: "var(--red)" }}> · {r.err}✕</span>}</span>
+                  <span style={{ gridColumn: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                    {r.isSess && <span className="material-symbols-outlined" style={{ fontSize: 16, color: "var(--tx3)" }}>{r.chev}</span>}
+                    {r.isKid && <span className="material-symbols-outlined" style={{ fontSize: 14, color: "var(--tx3)" }} title="Delegated child (T3). Link inferred.">subdirectory_arrow_right</span>}
+                  </span>
+                  <span style={{ gridColumn: 2, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {r.isRole && <span style={r.chip}>{r.label}</span>}
+                    {r.isModel && <span><span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: r.mc, marginRight: 5 }} />{r.label}</span>}
+                    {r.isSess && <>{r.label}<span style={{ color: "var(--tx3)", fontSize: 11 }}> · {r.sub}</span></>}
+                  </span>
+                  <span style={{ gridColumn: 3, display: "flex", justifyContent: "center" }}>
+                    {r.live && <span style={{ width: 7, height: 7, borderRadius: "50%", background: "var(--green)" }} title="Live now" />}
+                  </span>
+                  <span style={{ gridColumn: 4, justifySelf: "end", fontSize: 11.5, color: "var(--tx3)", fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>{r.req} · {r.tok} · {r.val}{+r.err > 0 && <span title={`${r.err} failed ${+r.err === 1 ? "request" : "requests"}`} style={{ color: "var(--red)" }}> · {r.err}✕</span>}</span>
                 </button>
               ))}
             </div>
+            {t.canMore && (
+              <div style={{ padding: "10px 14px", borderTop: "1px solid var(--line)", display: "flex", alignItems: "center", gap: 10 }}>
+                <button onClick={t.onMore} disabled={moreBusy} style={{ height: 28, padding: "0 12px", borderRadius: 7, border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: 12, fontWeight: 600, cursor: moreBusy ? "default" : "pointer", whiteSpace: "nowrap" }}>{moreBusy ? "Loading…" : "Load more"}</button>
+                <span style={{ fontSize: 11.5, color: "var(--tx3)" }}>More sessions are in range</span>
+              </div>
+            )}
           </div>
         </div>
         <div style={{ flex: v.lay.rf, minWidth: 320 }}>
-          {g && sm && <Gantt v={v} ui={ui} />}
+          {g && sm ? <Gantt v={v} ui={ui} /> : (
+            <div style={{ background: "var(--card)", border: "1px dashed var(--line2)", borderRadius: 12, padding: "40px 20px", textAlign: "center", color: "var(--tx2)", fontSize: 13 }}>{v.noSelText}</div>
+          )}
         </div>
       </div>
     </div>
@@ -473,11 +558,11 @@ function Gantt({ v, ui }) {
         <span style={{ fontSize: 14, fontWeight: 700 }}>{sm.id}</span>
         <span style={{ fontSize: 12, color: "var(--tx2)" }}>{sm.client} · {sm.when}</span>
         {sm.live && <span style={{ width: 7, height: 7, borderRadius: "50%", background: "var(--green)" }} title="Live now" />}
-        <span style={{ marginLeft: "auto", display: "flex", gap: 2, padding: 3, borderRadius: 8, background: "var(--seg)" }}>
+        <span style={{ marginLeft: "auto", display: "flex", alignItems: "center", flexWrap: "nowrap", gap: 2, padding: 3, borderRadius: 8, background: "var(--seg)" }}>
           {g.zooms.map((z) => <button key={z.label} onClick={z.on} style={z.style}>{z.label}</button>)}
+          <button onClick={g.prev} disabled={g.noPrev} aria-label="Pan earlier" style={{ ...g.prevStyle, width: 26, height: 26, flex: "none" }}>chevron_left</button>
+          <button onClick={g.next} disabled={g.noNext} aria-label="Pan later" style={{ ...g.nextStyle, width: 26, height: 26, flex: "none" }}>chevron_right</button>
         </span>
-        <button onClick={g.prev} disabled={g.noPrev} aria-label="Pan earlier" style={g.prevStyle}>chevron_left</button>
-        <button onClick={g.next} disabled={g.noNext} aria-label="Pan later" style={g.nextStyle}>chevron_right</button>
       </div>
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", margin: "8px 0" }}>
         {sm.stats.map((s) => (

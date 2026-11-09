@@ -52,7 +52,7 @@ export default function BreakdownDrill({ data, state, group, onGroup, onRetry, o
     const sp = o.sp;
     return {
       key: opt.key || o.name, isRow: true, name: o.name, desc: o.desc || "", font: opt.mono ? "var(--mono)" : "inherit", fs: opt.mono ? "12.5px" : "13px", fw: opt.mono ? 400 : 600, nameColor: opt.muted ? "var(--tx3)" : "var(--tx)",
-      pad: depth * 20 + "px", bg: depth ? "var(--bg)" : "transparent", chev: opt.open ? "expand_more" : "chevron_right", chevVis: opt.toggle ? "visible" : "hidden", cursor: opt.toggle ? "pointer" : "default", onToggle: opt.toggle || undefined,
+      pad: depth * 20 + "px", bg: depth ? "var(--bg)" : "transparent", chev: opt.open ? "expand_more" : "chevron_right", chevVis: opt.toggle ? "visible" : "hidden", cursor: opt.toggle ? "pointer" : "default", onToggle: opt.toggle || undefined, open: !!opt.open,
       mix, mixTitle, req: fN(o.r), tok: fT(o.t), real: opt.muted ? "not logged" : fR(o.re), realColor: o.re && !opt.muted ? "var(--acc)" : "var(--tx3)", realFw: o.re && !opt.muted ? 600 : 400, hasEst: (o.es || 0) >= 0.005, est: fR(o.es),
       value: fV(o.v), vpr: o.r ? fVpr(o.v / o.r) + " / req" : "—",
       split: sp ? sp.map((x, i) => ({ w: x * 100 + "%", c: SPC[i] })) : [], splitTitle: sp ? sp.map((x, i) => SPN[i] + " " + Math.round(x * 100) + "%").join(" · ") : "Token split not recorded",
@@ -164,7 +164,7 @@ export default function BreakdownDrill({ data, state, group, onGroup, onRetry, o
             {rows.map((r) => r.isSub ? (
               <div key={r.key} style={{ padding: `6px 8px 6px ${r.subPad}`, margin: "0 -8px", borderTop: "1px solid var(--line)", background: "var(--bg)", fontSize: "10.5px", fontWeight: "600", letterSpacing: ".04em", color: "var(--tx3)", textTransform: "uppercase" }}>{r.label}</div>
             ) : (
-              <div key={r.key} onClick={r.onToggle} style={{ display: "grid", gridTemplateColumns: cols, gap: "12px", alignItems: "center", padding: "9px 8px", margin: "0 -8px", borderTop: "1px solid var(--line)", background: r.bg, cursor: r.cursor, fontVariantNumeric: "tabular-nums" }}>
+              <div key={r.key} role={r.onToggle ? "button" : undefined} tabIndex={r.onToggle ? 0 : undefined} aria-expanded={r.onToggle ? !!r.open : undefined} onClick={r.onToggle} onKeyDown={r.onToggle ? (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); r.onToggle(); } } : undefined} style={{ display: "grid", gridTemplateColumns: cols, gap: "12px", alignItems: "center", padding: "9px 8px", margin: "0 -8px", borderTop: "1px solid var(--line)", background: r.bg, cursor: r.cursor, fontVariantNumeric: "tabular-nums" }}>
                 <div style={{ minWidth: "0", display: "flex", gap: "4px", paddingLeft: r.pad }}>
                   <span style={{ ...MS, fontSize: "17px", color: "var(--tx3)", width: "17px", flex: "none", visibility: r.chevVis }}>{r.chev}</span>
                   <div style={{ minWidth: "0", flex: "1" }}>
