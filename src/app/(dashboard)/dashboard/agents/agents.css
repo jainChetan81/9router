@@ -9,3 +9,9 @@
 [data-r9] .r9-h1 { color: var(--tx); }
 [data-r9] select option { background: var(--card); color: var(--tx); }
 [data-r9] input::placeholder { color: var(--tx3); }
+
+/* Phone widths: the KPI strip and the segmented controls scroll inside their own box, never the page (A4, S3, S5). */
+@media (max-width: 480px) {
+  [data-r9] .r9-scroll-x { overflow-x: auto; scroll-snap-type: x proximity; -webkit-overflow-scrolling: touch; }
+  [data-r9] .r9-scroll-x > * { scroll-snap-align: start; }
+}

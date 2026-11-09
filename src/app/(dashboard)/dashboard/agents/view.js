@@ -2,6 +2,7 @@
 // Claude Design "Agents.dc.html" renderVals so markup bindings stay 1:1.
 // Pure function: no fetch, no DOM. Callbacks come in via `act`.
 import { RC, SHORT, usd, cnt } from "../spend/view.js";
+import { clampWindow, pickSelection } from "../spend/helpers.js";
 
 const IST = "Asia/Kolkata";
 const ROLE_ORDER = ["main", "implementer", "scout", "reviewer", "thinker", "background", "direct"];
@@ -49,6 +50,15 @@ export function chip(role) {
 }
 
 const call = (fn, ...args) => () => fn?.(...args);
+const modelIdOf = (m) => typeof m === "string" ? m : m?.fullModel || m?.routedModel || m?.id || m?.model || "";
+// "cc/claude-opus-5-5" and "claude-opus-5-5" name the same model.
+export const baseMatch = (a, b) => !!a && !!b && (a === b || a.endsWith("/" + b) || b.endsWith("/" + a));
+const NON_CHAT_ID = /tts|voice|flux|black-forest|assemblyai|embed|whisper|dall-e|stable-diffusion/i;
+export const isChatEntry = (m) => {
+  const k = m?.kind || m?.type;
+  if (k && k !== "llm" && k !== "imageToText") return false;
+  return !NON_CHAT_ID.test(modelIdOf(m));
+};
 
 function statusOf(q) {
   const s = String(q.status ?? "ok");
@@ -57,7 +67,7 @@ function statusOf(q) {
   return [s, "var(--red)", "var(--redbg)"];
 }
 
-export function buildView({ live, sessions, totalSessions, detail, analytics, tools, range, ui, act = {}, vw = 1440, now = Date.now(), combos = [], models = [], overrides = [], overridesBySession = {}, revisions = {}, draft = {}, cf = false, toast = null, setDraft = () => {}, setCf = () => {}, setToast = () => {}, applyOverrides = async () => {}, reloadOverrides = async () => {} }) {
+export function buildView({ live, sessions, totalSessions, detail, analytics, tools, range, ui, act = {}, vw = 1440, now = Date.now(), combos = [], models = [], overrides = [], overridesBySession = {}, revisions = {}, draft = {}, cf = false, toast = null, moreCursor = null, setDraft = () => {}, setCf = () => {}, setToast = () => {}, applyOverrides = async () => {}, reloadOverrides = async () => {} }) {
   const tab = ui.tab || "live";
   const mode = ui.mode || "loading"; // loading | ready | empty | error | stale
   const ok = mode === "ready" || mode === "stale";
@@ -130,9 +140,10 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
   const matches = (s) => (!qq || s.session.toLowerCase().includes(qq)) && (!ui.fClient || s.client === ui.fClient) && (!ui.fRole || (s.roles || []).some((r) => r.role === ui.fRole));
   const parentOf = (s) => { const p = s.parent && (s.parent.session || s.parent); return p && byId.get(p) ? p : null; };
   const topList = sessList.filter((s) => !parentOf(s)).filter((s) => matches(s) || kidsOf(s.session).some(matches)).sort((a, b) => Date.parse(b.lastTs) - Date.parse(a.lastTs));
-  const selId = (ui.sel && byId.get(ui.sel)) ? ui.sel : (topList[0] ? topList[0].session : null);
+  // The selection is only ever set by the user or the first-load effect in AgentsClient. Live refreshes never move it.
+  const selId = pickSelection(ui.sel, sessList.map((s) => s.session));
 
-  const rowStyle = (selected, focused) => ({ display: "grid", gridTemplateColumns: "minmax(0,1fr) 44px 54px 62px 30px", gap: 8, alignItems: "center", width: "100%", minHeight: 32, flexShrink: 0, padding: "5px 8px", border: 0, borderTop: "1px solid var(--line)", background: selected ? "var(--acc2)" : focused ? "var(--seg)" : "transparent", color: "var(--tx)", font: "inherit", fontSize: 12, textAlign: "left", cursor: "pointer", fontVariantNumeric: "tabular-nums", boxSizing: "border-box" });
+  const rowStyle = (selected, focused) => ({ display: "grid", gridTemplateColumns: "16px minmax(0,1fr) 8px auto", gap: 8, alignItems: "center", width: "100%", minHeight: 32, flexShrink: 0, padding: "5px 8px", border: 0, borderTop: "1px solid var(--line)", background: selected ? "var(--acc2)" : focused ? "var(--seg)" : "transparent", color: "var(--tx)", font: "inherit", fontSize: 12, textAlign: "left", cursor: "pointer", fontVariantNumeric: "tabular-nums", boxSizing: "border-box" });
   const metric = (req, tok, val, err, bold) => ({ req: req.toLocaleString("en-US"), tok: cnt(tok), val: usd(val), fw: bold ? 600 : 400, err: String(err), errC: err ? "var(--red)" : "var(--tx3)" });
   const sumAll = (s) => ({ req: s.requests || 0, tok: s.tokens || 0, val: s.value || 0, err: s.errors || 0 });
   const treeRows = [];
@@ -143,7 +154,7 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
     const rootId = parentOf(s) || s.session;
     const firstMs = Date.parse(s.firstTs), lastMs = Date.parse(s.lastTs);
     treeRows.push({
-      isSess: true, isRole: false, isModel: false, isKid, label: "s·" + s.session,
+      isSess: true, isRole: false, isModel: false, isKid, sid: s.session, label: "s·" + s.session,
       sub: (s.client || "Unknown") + " · " + (Number.isFinite(firstMs) ? dayLabel(firstMs) + " " + hm(firstMs) : ""),
       live: Number.isFinite(lastMs) && now - lastMs < 5 * 60 * 1000, inferred: isKid,
       chev: open ? "expand_more" : "chevron_right", exp: open, pad: depth * 16 + "px",
@@ -171,7 +182,11 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
   const clientSet = [...new Set(sessList.map((s) => s.client).filter(Boolean))].sort();
   const roleSet = [...new Set(sessList.flatMap((s) => (s.roles || []).map((r) => r.role)))].sort();
   const tree = {
-    rows: treeRows, none: treeRows.length === 0, count: (totalSessions ?? sessList.length) + " in range",
+    rows: treeRows, none: treeRows.length === 0,
+    count: qq || ui.fClient || ui.fRole
+      ? treeRows.filter((r) => r.isSess).length + " of " + (totalSessions ?? sessList.length)
+      : (totalSessions ?? sessList.length) + " in range",
+    canMore: !!moreCursor, onMore: call(act.loadMore),
     q: ui.q || "", fClient: ui.fClient || "", fRole: ui.fRole || "",
     clientOpts: [{ v: "", label: "All clients" }, ...clientSet.map((c) => ({ v: c, label: c }))],
     roleOpts: [{ v: "", label: "All roles" }, ...roleSet.map((r) => ({ v: r, label: r }))],
@@ -180,7 +195,10 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
 
   // ---------- gantt ----------
   let g = null, sm = null;
-  const det = detail && detail.session ? detail : null;
+  // A detail shows only when its session is still in the filtered list (A16).
+  const visibleSids = new Set(treeRows.filter((r) => r.isSess).map((r) => r.sid));
+  const selShown = !!selId && visibleSids.has(selId);
+  const det = detail && detail.session && detail.session === selId && selShown ? detail : null;
   if (det && (det.agents || []).length) {
     const kidDetails = [];
     const laneList = (det.agents || []).map((a) => ({ s: det, l: a, kid: false }));
@@ -191,10 +209,13 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
     const Z = { "15m": 900e3, "1h": 3600e3, "6h": 21600e3, Day: 86400e3 };
     const auto = spanS <= 840e3 ? "15m" : spanS <= 3420e3 ? "1h" : spanS <= 19800e3 ? "6h" : "Day";
     const zoom = ui.zoom || auto, len = Z[zoom];
-    let w0, canPan = false;
+    let w0, w1, canPan = false;
+    // w0/w1 are reassigned by clampWindow below.
     if (zoom === "Day" || len >= spanS) w0 = Math.max(0, T0 - (len - spanS) / 2);
     else { canPan = true; w0 = Math.max(T0 - 30e3, T1 + 30e3 - len - (ui.gOff || 0) * len / 2); }
-    const w1 = w0 + len;
+    // Never show time after now (A18): a window that runs past now slides back so it ends at now.
+    [w0, w1] = clampWindow(w0, len, now, T1);
+    const rl = (x) => (zoom === "Day" ? dayLabel(x) + " " : "") + hm(x);
     const L = (x) => ((x - w0) / len * 100);
     const step = { "15m": 180e3, "1h": 600e3, "6h": 3600e3, Day: 10800e3 }[zoom];
     const ticks = [];
@@ -221,7 +242,7 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
         const picked = ui.pick && ui.pick.li === li && ui.pick.ri === ri;
         const okQ = String(q.status ?? "ok") === "ok";
         bars.push({
-          style: { position: "absolute", top: 9, height: 20, left: L(qs).toFixed(3) + "%", width: Math.max(0, L(qs + d) - L(qs)).toFixed(3) + "%", minWidth: 3, padding: 0, borderRadius: 3, boxSizing: "border-box", cursor: "pointer", opacity: dim,
+          style: { position: "absolute", top: 9, height: 20, left: L(qs).toFixed(3) + "%", width: Math.max(0, L(qs + d) - L(qs)).toFixed(3) + "%", minWidth: 8, padding: 0, borderRadius: 3, boxSizing: "border-box", cursor: "pointer", opacity: dim,
             border: okQ ? 0 : "1px solid var(--red)", background: !okQ ? FAIL : mc(q.model),
             outline: picked ? "2px solid var(--tx)" : "none", outlineOffset: 1, zIndex: picked ? 2 : 1 },
           aria: o.l.role + ", " + q.model + ", " + hms(q.ts) + ", " + (okQ ? fs((q.totalMs || 0) / 1000) : "failed"),
@@ -242,7 +263,7 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
     const liveDet = Number.isFinite(Date.parse(det.lastTs)) && now - Date.parse(det.lastTs) < 5 * 60 * 1000;
     g = {
       lanes, ticks, gaps: gapsV, legend,
-      window: hm(w0) + " – " + hm(w1) + " IST · " + zoom + " view",
+      window: rl(w0) + " – " + rl(w1) + " IST · " + zoom + " view",
       now: liveDet && now >= w0 && now <= w1, nowL: L(now).toFixed(2) + "%",
       zooms: ["15m", "1h", "6h", "Day"].map((k) => ({ label: k, on2: zoom === k, style: seg(zoom === k), on: () => act.zoom?.(k) })),
       noPrev: !canPan, noNext: !canPan || !(ui.gOff > 0),
@@ -376,35 +397,45 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
   if (dId && dRoles.length) {
     const sessionOverrides = overrides || [];
     const isCodex = (dLive?.client || dDet?.client) === "Codex";
-    const modelId = (m) => typeof m === "string" ? m : m?.fullModel || m?.routedModel || m?.id || m?.model || "";
-    const available = models.map(modelId).filter(Boolean).filter((m) => !isCodex || /^(openai\/|gpt-|codex)/i.test(m));
+    const modelId = modelIdOf;
+    const available = models.filter(isChatEntry).map(modelId).filter(Boolean).filter((m) => !isCodex || /^(openai\/|gpt-|codex)/i.test(m));
     const changed = [];
     dr = {
       sid: "s·" + dId, client: (dLive?.client || dDet?.client) || "Unknown", started: dLive && Number.isFinite(Date.parse(dLive.lastTs)) ? hm(dLive.lastTs) : (dDet ? dayLabel(dDet.firstTs) + " " + hm(dDet.firstTs) : "—"),
-      aria: "Change routing for s·" + dId, w: vw < 900 ? "100vw" : "520px",
+      isCodex, aria: "Change routing for s·" + dId, w: vw < 900 ? "100vw" : "520px",
       rows: dRoles.map((r) => {
         const role = r.role, current = r.model || "unknown", entry = sessionOverrides.find((e) => e.combo === role), locked = role === "thinker" || role === "background";
         const edit = draft[role] || {};
         const members = combos.find((c) => c.name === role)?.models || [current];
         const memberIds = members.map(modelId).filter(Boolean);
         const otherKey = "__other__";
-        const selected = edit.sel ?? (memberIds.includes(entry?.model) ? entry.model : entry ? otherKey : memberIds.includes(current) ? current : otherKey);
-        const target = selected === otherKey ? edit.other || entry?.model || available[0] || "" : selected;
+        // Start from the model the session really uses, matched by resolved ID. No default is preselected for "Other".
+        const currentMember = memberIds.find((m) => baseMatch(m, current));
+        const entryMember = entry?.model ? memberIds.find((m) => baseMatch(m, entry.model)) : undefined;
+        const selected = edit.sel ?? (entryMember ?? (entry ? otherKey : currentMember ?? otherKey));
+        const target = selected === otherKey ? edit.other || entry?.model || "" : selected;
+        const differs = !!target && !baseMatch(target, current);
         const modeValue = edit.mode || (entry?.mode === "override" ? "override" : "member");
         const expiry = edit.expiry || (entry?.expiry === "1h" || entry?.expiry === "2h" ? entry.expiry : "Session end");
         const expiryValue = expiry === "Session end" ? "session" : expiry;
         const currentExpiry = entry?.expiry || "session";
-        const dirty = !locked && !!target && (target !== current || modeValue !== (entry?.mode || "member") || expiryValue !== currentExpiry);
-        if (dirty) changed.push({ role, from: current, to: target, mode: modeValue, expiry });
-        const options = [...new Set([...memberIds, ...(memberIds.includes(current) ? [] : [current]), otherKey])].map((id) => ({ v: id, label: id === otherKey ? "Other model…" : id === current ? id + "  (current)" : id }));
-        const otherOpts = [...new Set([...available, ...(entry?.model && !available.includes(entry.model) ? [entry.model] : [])])].map((id) => ({ v: id, label: id }));
+        const dirty = !locked && !!target && (differs || modeValue !== (entry?.mode || "member") || expiryValue !== currentExpiry);
+        if (dirty) changed.push({ role, from: current, to: target, mode: modeValue, expiry, warn: differs && /opus|fable/i.test(target) });
+        const options = [...new Set([...memberIds, ...(currentMember ? [] : [current]), otherKey])].map((id) => ({ v: id, label: id === otherKey ? "Other model…" : baseMatch(id, current) ? id + "  (current)" : id }));
+        // "Other model…" list: chat models only, grouped by provider, filtered by the search text.
+        const q = (edit.q || "").trim().toLowerCase();
+        const pool = [...new Set([...available, ...(entry?.model ? [entry.model] : [])])].filter((id) => !q || id.toLowerCase().includes(q));
+        const otherOpts = pool.map((id) => ({ v: id, label: id }));
+        const groupMap = new Map();
+        pool.forEach((id) => { const g = id.includes("/") ? id.split("/")[0] : "Other"; if (!groupMap.has(g)) groupMap.set(g, []); groupMap.get(g).push({ v: id, label: id }); });
+        const otherGroups = [...groupMap].map(([label, opts]) => ({ label, opts }));
         const status = entry ? entry.status === "pending" ? "Pending · next request" : "Active · until " + (entry.expiry === "1h" ? "1 hour" : entry.expiry === "2h" ? "2 hours" : "session end") : "";
         return { role, chip: chip(role), cur: entry?.status === "active" ? entry.model : current, locked,
         lockText: role === "thinker" ? "thinker is fusion and cannot be overridden." : "Not routed by a combo. Fixed to claude-haiku-5-5 by Claude Code.",
         editable: !locked, status, statusStyle: { fontSize: 10.5, fontWeight: 600, padding: "1px 7px", borderRadius: 5, background: entry?.status === "pending" ? "var(--amberbg)" : "var(--greenbg)", color: entry?.status === "pending" ? "var(--amber)" : "var(--green)" }, canRevert: !!entry, revert: () => act.revertOverride?.(dId, role, revisions[role] ?? revisions[entry?.combo] ?? entry?.revision, entry),
         rowStyle: { display: "flex", flexDirection: "column", gap: 10, padding: "14px 0", borderTop: "1px solid var(--line)" },
-        sel: selected, opts: options, onSel: (e) => setDraft({ [role]: { ...edit, sel: e.target.value } }), isOther: selected === otherKey, other: edit.other || entry?.model || available[0] || "", otherOpts, onOther: (e) => setDraft({ [role]: { ...edit, other: e.target.value } }),
-        warn: /opus|fable/i.test(target) ? "This model can cost much more per request. Confirm before applying." : "",
+        sel: selected, opts: options, onSel: (e) => setDraft({ [role]: { ...edit, sel: e.target.value } }), isOther: selected === otherKey, other: target, otherOpts, otherGroups, otherQ: edit.q || "", onQ: (e) => setDraft({ [role]: { ...edit, q: e.target.value } }), onOther: (e) => setDraft({ [role]: { ...edit, other: e.target.value } }),
+        warn: differs && /opus|fable/i.test(target) ? "This model can cost much more per request. Confirm before applying." : "",
         modeAria: "Mode for " + role, modes: ["member", "override"].map((m) => ({ label: m === "member" ? "Combo member" : "Override", on2: modeValue === m, tip: m === "member" ? "Use this model as the combo member for this session." : "Route this role directly to this model.", style: seg(modeValue === m), on: () => setDraft({ [role]: { ...edit, mode: m } }) })), strict: modeValue === "override", expiry, onExp: (e) => setDraft({ [role]: { ...edit, expiry: e.target.value } }) };
       }),
       audit: [], noAudit: true,
@@ -419,7 +450,7 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
     status, tabs, fresh, paused: !!ui.paused, togglePause: () => act.pause?.(),
     isLiveTab: tab === "live", notLiveTab: tab !== "live", isSessTab: tab === "sessions", isTableTab: tab === "roles" || tab === "tools",
     preset, customLabel: range?.label || "", rangeTitle,
-    v, live: { kpis, cards: liveCards }, tree, g, sm, ro, dl: null,
+    v, live: { kpis, cards: liveCards }, tree, g, sm, noSelText: selShown ? "Loading session…" : "Select a session to see its timeline.", ro, dl: null,
     dlNote: "Per-day delegation history is not available from /api/agents/analytics yet.",
     tl, liveWide: vw >= 900, liveNarrow: vw < 900,
     lay: vw >= 1180 ? { tf: "0 0 calc(44% - 8px)", tmax: "calc(44% - 8px)", rf: "1 1 0" } : { tf: "1 1 100%", tmax: "100%", rf: "1 1 100%" },

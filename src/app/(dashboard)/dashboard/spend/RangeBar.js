@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { shortRange } from "./helpers.js";
 
 // Preset segment + month calendar for a custom range (design: Shared.dc.html "range").
 const PRESETS = ["Today", "24h", "7D", "30D", "60D", "All"];
@@ -32,7 +33,7 @@ export default function RangeBar({ preset, customLabel, onChange, today }) {
   const pick = (dt) => {
     if (dt > T) return;
     if (!a) return setA(dt);
-    const from = dt < a ? dt : a, to = dt < a ? a : dt, label = fmt(from) + " – " + fmt(to);
+    const from = dt < a ? dt : a, to = dt < a ? a : dt, label = shortRange(from, to);
     setA(null); setOpen(false);
     onChange({ preset: "Custom", from: key(from), to: key(to), label });
   };
@@ -41,7 +42,7 @@ export default function RangeBar({ preset, customLabel, onChange, today }) {
       <div style={{ display: "flex", flexWrap: "nowrap", gap: 2, padding: 3, borderRadius: 9, background: "var(--seg)", maxWidth: "100%", overflowX: "auto", boxSizing: "border-box" }}>
         {PRESETS.map((k) => <button key={k} onClick={() => { setOpen(false); setA(null); onChange({ preset: k }); }} style={seg(preset === k)}>{k}</button>)}
         <button onClick={() => { setOpen((o) => !o); setA(null); }} style={seg(preset === "Custom")} aria-expanded={open}>
-          <span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: 15 }}>calendar_month</span>{preset === "Custom" ? customLabel || "Custom" : "Custom"}
+          <span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: 15 }}>calendar_month</span><span style={{ whiteSpace: "nowrap" }}>{preset === "Custom" ? customLabel || "Custom" : "Custom"}</span>
         </button>
       </div>
       <span style={{ fontSize: 11, color: "var(--tx3)", display: "flex", alignItems: "center", gap: 4 }}><span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: 14 }}>schedule</span>Times in IST (UTC+5:30)</span>

@@ -13,6 +13,92 @@ const live = {
   ],
 };
 
+describe("agents view fixes", () => {
+  const sess = (id, lastTs, model = "claude-opus-5-5") => ({ session: id, client: "Claude Code", firstTs: lastTs, lastTs, requests: 1, tokens: 1, value: 0, errors: 0, roles: [{ role: "main", model, requests: 1, models: [] }] });
+  const sessions = [sess("aaaaaaaaaaaa", "2026-11-09T07:59:00Z"), sess("bbbbbbbbbbbb", "2026-11-09T07:50:00Z")];
+
+  it("keeps the selected session and does not jump to the top row (A15)", () => {
+    const v = buildView({ live: null, sessions, totalSessions: 2, analytics: null, range: { preset: "7D" }, ui: ui({ tab: "sessions", sel: "bbbbbbbbbbbb" }), now: NOW });
+    expect(v.tree.rows.find((r) => r.isSess && r.sid === "bbbbbbbbbbbb").style.background).toBe("var(--acc2)");
+  });
+  it("shows the no-selection state when nothing is selected", () => {
+    const v = buildView({ live: null, sessions, totalSessions: 2, analytics: null, range: { preset: "7D" }, ui: ui({ tab: "sessions", sel: null }), now: NOW });
+    expect(v.g).toBe(null);
+    expect(v.noSelText).toBe("Select a session to see its timeline.");
+  });
+  it("shows 'N of TOTAL' when filters reduce the list (A14)", () => {
+    const v = buildView({ live: null, sessions, totalSessions: 1748, analytics: null, range: { preset: "7D" }, ui: ui({ tab: "sessions", q: "zzzz" }), now: NOW });
+    expect(v.tree.count).toBe("0 of 1748");
+    const all = buildView({ live: null, sessions, totalSessions: 1748, analytics: null, range: { preset: "7D" }, ui: ui({ tab: "sessions" }), now: NOW });
+    expect(all.tree.count).toBe("1748 in range");
+  });
+  it("uses the 4-column session row grid (A12)", () => {
+    const v = buildView({ live: null, sessions, totalSessions: 2, analytics: null, range: { preset: "7D" }, ui: ui({ tab: "sessions" }), now: NOW });
+    expect(v.tree.rows[0].style.gridTemplateColumns).toBe("16px minmax(0,1fr) 8px auto");
+  });
+  it("offers Load more only when the API has a next cursor (A23)", () => {
+    const v = buildView({ live: null, sessions, totalSessions: 1748, moreCursor: "abc", analytics: null, range: { preset: "7D" }, ui: ui({ tab: "sessions" }), now: NOW });
+    expect(v.tree.canMore).toBe(true);
+    const none = buildView({ live: null, sessions, totalSessions: 2, moreCursor: null, analytics: null, range: { preset: "7D" }, ui: ui({ tab: "sessions" }), now: NOW });
+    expect(none.tree.canMore).toBe(false);
+  });
+  it("shows no cost warning or Apply when the target equals the current model (A6, A7)", () => {
+    const live2 = { sessions: [{ session: "aaaaaaaaaaaa", client: "Claude Code", lastTs: "2026-11-09T07:59:00Z", reqPerMin: 1, roles: [{ role: "implementer", model: "cc/claude-opus-5-5", requests: 5 }] }] };
+    const models = [{ provider: "cc", model: "claude-opus-5-5", fullModel: "cc/claude-opus-5-5" }];
+    const combos = [{ name: "implementer", models: ["claude-opus-5-5"] }];
+    const v = buildView({ live: live2, sessions: [], analytics: null, range: { preset: "7D" }, ui: ui({ drawer: "aaaaaaaaaaaa" }), now: NOW, combos, models, overrides: [] });
+    const row = v.dr.rows[0];
+    expect(row.warn).toBe("");
+    expect(v.dr.noChanges).toBe(true);
+    expect(v.dr.applyStyle.opacity).toBe(0.45);
+  });
+  it("filters non-chat models out of 'Other model…' (A8)", () => {
+    const live2 = { sessions: [{ session: "aaaaaaaaaaaa", client: "Claude Code", lastTs: "2026-11-09T07:59:00Z", reqPerMin: 1, roles: [{ role: "implementer", model: "claude-opus-5-5", requests: 5 }] }] };
+    const models = [
+      { provider: "ocg", model: "glm-5.3-flash", fullModel: "ocg/glm-5.3-flash" },
+      { provider: "ollama-local-tts-voices", model: "voice-a", fullModel: "ollama-local-tts-voices/voice-a" },
+      { provider: "assemblyai", model: "universal", fullModel: "assemblyai/universal" },
+      { provider: "black-forest-labs", model: "flux-pro", fullModel: "black-forest-labs/flux-pro" },
+    ];
+    const v = buildView({ live: live2, sessions: [], analytics: null, range: { preset: "7D" }, ui: ui({ drawer: "aaaaaaaaaaaa" }), now: NOW, combos: [{ name: "implementer", models: ["claude-opus-5-5"] }], models, overrides: [] });
+    const ids = v.dr.rows[0].otherGroups.flatMap((g) => g.opts.map((o) => o.v));
+    expect(ids).toContain("ocg/glm-5.3-flash");
+    expect(ids.some((id) => /voice|assemblyai|flux/.test(id))).toBe(false);
+  });
+  it("marks the expensive-model warning only for a changed target (A7)", () => {
+    const live2 = { sessions: [{ session: "aaaaaaaaaaaa", client: "Claude Code", lastTs: "2026-11-09T07:59:00Z", reqPerMin: 1, roles: [{ role: "implementer", model: "glm-5.3-flash", requests: 5 }] }] };
+    const models = [{ provider: "cc", model: "claude-opus-5-5", fullModel: "cc/claude-opus-5-5" }];
+    const combos = [{ name: "implementer", models: ["glm-5.3-flash", "claude-opus-5-5"] }];
+    const draft = { implementer: { sel: "claude-opus-5-5" } };
+    const v = buildView({ live: live2, sessions: [], analytics: null, range: { preset: "7D" }, ui: ui({ drawer: "aaaaaaaaaaaa" }), now: NOW, combos, models, overrides: [], draft });
+    expect(v.dr.rows[0].warn).toContain("cost much more");
+    expect(v.dr.changes[0].warn).toBe(true);
+  });
+  it("uses a 8 px minimum hit area for timeline bars (A20)", () => {
+    const det = { session: "aaaaaaaaaaaa", client: "Claude Code", firstTs: "2026-11-09T07:00:00Z", lastTs: "2026-11-09T07:59:00Z",
+      agents: [{ role: "main", requests: [{ ts: "2026-11-09T07:10:00Z", totalMs: 1, model: "claude-opus-5-5", status: "ok" }] }] };
+    const v = buildView({ live: null, sessions, detail: det, analytics: null, range: { preset: "7D" }, ui: ui({ tab: "sessions", sel: "aaaaaaaaaaaa" }), now: NOW });
+    expect(v.g.lanes[0].bars[0].style.minWidth).toBe(8);
+  });
+
+  it("clamps the 6h window end to now and labels Day ranges with dates (A18, A33)", () => {
+    const det = { session: "aaaaaaaaaaaa", client: "Claude Code", firstTs: "2026-11-09T07:00:00Z", lastTs: "2026-11-09T07:30:00Z",
+      agents: [{ role: "main", requests: [{ ts: "2026-11-09T07:10:00Z", totalMs: 1000, model: "claude-opus-5-5", status: "ok" }] }] };
+    const v = buildView({ live: null, sessions, detail: det, analytics: null, range: { preset: "7D" }, ui: ui({ tab: "sessions", sel: "aaaaaaaaaaaa", zoom: "6h" }), now: NOW });
+    expect(v.g.window).toMatch(/IST · 6h view/);
+    const day = buildView({ live: null, sessions, detail: det, analytics: null, range: { preset: "7D" }, ui: ui({ tab: "sessions", sel: "aaaaaaaaaaaa", zoom: "Day" }), now: NOW });
+    // Day view is 24 h ending at now (13:30 IST), so it starts on Nov 8.
+    expect(day.g.window).toMatch(/^Nov 8 13:30 – Nov 9 13:30 IST · Day view$/);
+  });
+
+  it("drops the detail when its session is filtered out (A16)", () => {
+    const det = { session: "aaaaaaaaaaaa", client: "Claude Code", firstTs: "2026-11-09T07:00:00Z", lastTs: "2026-11-09T07:30:00Z",
+      agents: [{ role: "main", requests: [{ ts: "2026-11-09T07:10:00Z", totalMs: 1000, model: "claude-opus-5-5", status: "ok" }] }] };
+    const v = buildView({ live: null, sessions, detail: det, analytics: null, range: { preset: "7D" }, ui: ui({ tab: "sessions", sel: "aaaaaaaaaaaa", q: "bbbb" }), now: NOW });
+    expect(v.g).toBe(null);
+  });
+});
+
 describe("agents view", () => {
   it("builds live KPIs and nests inferred children under the parent", () => {
     const v = buildView({ live, sessions: [], analytics: null, range: { preset: "7D" }, ui: ui(), now: NOW });
@@ -91,9 +177,10 @@ describe("agents view", () => {
       combos: [{ name: "main", models: ["claude-haiku-5-5", "claude-opus-5-5"] }],
       draft: { main: { sel: "claude-opus-5-5", mode: "override" } }, now: NOW });
     const row = v.dr.rows.find((r) => r.role === "main");
-    expect(row.warn).toMatch(/cost much more/i);
+    // The current model is already claude-opus-5-5, so the cost warning stays hidden (A7).
+    expect(row.warn).toBe("");
     expect(v.dr.noChanges).toBe(false);
-    expect(v.dr.changes[0]).toMatchObject({ role: "main", to: "claude-opus-5-5", mode: "override" });
+    expect(v.dr.changes[0]).toMatchObject({ role: "main", to: "claude-opus-5-5", mode: "override", warn: false });
   });
 
   it("enables Apply when only an override expiry changes", () => {
