@@ -132,6 +132,10 @@ export function spendMeta(clientRawRequest, tokens, telemetry = null) {
   if (clientRawRequest) {
     const ua = h["user-agent"] || "";
     meta.ua = ua.slice(0, 80); // always set: marks the row as attributed, even without a user-agent
+    // Caller address for the device column: Tailscale Serve and the Docker bridge set
+    // X-Forwarded-For; a direct loopback call has none. Telemetry only, never used for auth.
+    const forwardedFor = String(h["x-forwarded-for"] || "").split(",")[0].trim();
+    meta.ip = /^[0-9a-fA-F.:]{2,45}$/.test(forwardedFor) ? forwardedFor : "local";
   }
   if (clientRawRequest?.session) meta.session = createHash("sha256").update(String(clientRawRequest.session)).digest("hex").slice(0, 12);
   if (clientRawRequest?.combo) meta.combo = clientRawRequest.combo;

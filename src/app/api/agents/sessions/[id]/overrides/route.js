@@ -38,9 +38,27 @@ function busyError() {
   return NextResponse.json({ error: "busy" }, { status: 503, headers: { "Retry-After": "1", "Cache-Control": "no-store" } });
 }
 
+// Origins a reverse proxy (Tailscale Serve) exposes the dashboard on, such as
+// "https://vps.example.ts.net:20128". The proxy forwards to loopback, so the request URL
+// never equals the browser Origin. Forwarded headers stay untrusted; only listed origins pass.
+function trustedOrigins() {
+  return (process.env.DASHBOARD_TRUSTED_ORIGINS || "")
+    .split(",")
+    .map((value) => {
+      try {
+        const parsed = new URL(value.trim());
+        return parsed.pathname === "/" && !parsed.search && !parsed.hash ? parsed.origin : null;
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
 function isSameOrigin(request) {
   const origin = request.headers.get("origin");
   if (!origin) return false;
+  if (trustedOrigins().includes(origin)) return true;
   try {
     const url = new URL(request.url);
     const host = (request.headers.get("host") || url.host).toLowerCase();

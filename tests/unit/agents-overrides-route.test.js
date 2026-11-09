@@ -126,6 +126,20 @@ describe("agents session overrides route", () => {
     expect((await handlers.PUT(forwardedHostRequest, context)).status).toBe(403);
   });
 
+  it("accepts an Origin listed in DASHBOARD_TRUSTED_ORIGINS behind a loopback proxy", async () => {
+    const body = { combo: "assistant", mode: "override", model: "openai/gpt-4o-mini", fallback: false, expiry: "1h", revision: 999 };
+    const tailnet = "https://agents.example.ts.net:20128";
+    process.env.DASHBOARD_TRUSTED_ORIGINS = `${tailnet}, not a url`;
+    try {
+      const listed = await handlers.PUT(request("http://127.0.0.1:20128/api/agents/sessions/abcdef123456/overrides", "PUT", body, tailnet), context);
+      expect(listed.status).toBe(409);
+      const unlisted = await handlers.PUT(request("http://127.0.0.1:20128/api/agents/sessions/abcdef123456/overrides", "PUT", body, "https://evil.example.ts.net:20128"), context);
+      expect(unlisted.status).toBe(403);
+    } finally {
+      delete process.env.DASHBOARD_TRUSTED_ORIGINS;
+    }
+  });
+
   it("requires explicit confirmation for Opus and Fable targets", async () => {
     const response = await handlers.PUT(request("http://localhost/api/agents/sessions/abcdef123456/overrides", "PUT", {
       combo: "assistant", mode: "override", model: "cc/claude-opus-5-5", fallback: true, expiry: "session", revision: 2,
