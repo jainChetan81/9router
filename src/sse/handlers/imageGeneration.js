@@ -70,11 +70,10 @@ export async function handleImageGeneration(request) {
   if (!modelStr) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing model");
   if (!body.prompt) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing required field: prompt");
 
-  let routing = null, piiFinalize = null;
+  let guard;
   if (process.env.PII_GUARD_MODULE) {
-    routing = {};
-    const guard = await observeRequest(body, { endpoint: url.pathname, userAgent: request.headers.get("user-agent"), model: body?.model, routing }, settings.piiGuard);
-    if (typeof guard?.finalize === "function") piiFinalize = guard.finalize;
+    const combo = settings.piiGuard?.mode !== "off" && await getComboModels(modelStr) ? modelStr : undefined;
+    guard = await observeRequest(body, { endpoint: url.pathname, userAgent: request.headers.get("user-agent"), model: body?.model, combo }, settings.piiGuard);
     if (guard?.blocked) return errorResponse(HTTP_STATUS.BAD_REQUEST, blockMessage(guard.blocked, false));
     modelStr = body.model; // redaction may have rewritten it
   }
@@ -85,8 +84,6 @@ export async function handleImageGeneration(request) {
 
   // Combo expansion: model may be a combo name → run fallback/round-robin across models
   const comboModels = await getComboModels(modelStr);
-  if (comboModels && routing) routing.combo = modelStr;
-  else { const { provider, model } = await getModelInfo(modelStr); if (routing) { routing.provider = provider; if (modelStr !== `${provider}/${model}`) routing.resolvedModel = `${provider}/${model}`; } }
   if (comboModels) {
     const comboStrategies = settings.comboStrategies || {};
     const comboStrategy = comboStrategies[modelStr]?.fallbackStrategy || settings.comboStrategy || "fallback";
@@ -95,7 +92,7 @@ export async function handleImageGeneration(request) {
     return handleComboChat({
       body,
       models: comboModels,
-      handleSingleModel: (b, m) => handleSingleModelImage(b, m, { wantsStream, binaryOutput, preferredConnectionId, apiKey, endpoint: url.pathname, piiFinalize }),
+      handleSingleModel: (b, m) => handleSingleModelImage(b, m, { wantsStream, binaryOutput, preferredConnectionId, apiKey, endpoint: url.pathname, guard, combo: modelStr }),
       log,
       comboName: modelStr,
       comboStrategy,
@@ -103,10 +100,10 @@ export async function handleImageGeneration(request) {
     });
   }
 
-  return handleSingleModelImage(body, modelStr, { wantsStream, binaryOutput, preferredConnectionId, apiKey, endpoint: url.pathname, piiFinalize });
+  return handleSingleModelImage(body, modelStr, { wantsStream, binaryOutput, preferredConnectionId, apiKey, endpoint: url.pathname, guard });
 }
 
-async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutput, preferredConnectionId, apiKey, endpoint, piiFinalize } = {}) {
+async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutput, preferredConnectionId, apiKey, endpoint, guard, combo } = {}) {
   const modelInfo = await getModelInfo(modelStr);
   if (!modelInfo.provider) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid model format");
 
@@ -120,6 +117,7 @@ async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutpu
       credentials: null,
       binaryOutput,
     });
+    await guard?.recordRouting?.({ provider, resolvedModel: `${provider}/${model}`, account: null, ...(combo && { combo }) });
     if (result.success) return result.response;
     return errorResponse(result.status || HTTP_STATUS.BAD_GATEWAY, result.error || "Image generation failed");
   }
@@ -133,6 +131,7 @@ async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutpu
     const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { preferredConnectionId });
 
     if (!credentials || credentials.allRateLimited) {
+      if (excludeConnectionIds.size === 0) await guard?.recordRouting?.({ provider, resolvedModel: `${provider}/${model}`, account: null, ...(combo && { combo }) });
       if (credentials?.allRateLimited) {
         const errorMsg = lastError || credentials.lastError || "Unavailable";
         const status = lastStatus || Number(credentials.lastErrorCode) || HTTP_STATUS.SERVICE_UNAVAILABLE;
@@ -145,7 +144,6 @@ async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutpu
     }
 
     const refreshedCredentials = await checkAndRefreshToken(provider, credentials);
-    if (piiFinalize) piiFinalize({ account: credentials.connectionName });
 
     // Skip accounts the adapter knows cannot generate images (e.g. ChatGPT Free on codex)
     // without locking them: they stay usable for chat.
@@ -192,6 +190,7 @@ async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutpu
       }
     });
 
+    await guard?.recordRouting?.({ provider, resolvedModel: `${provider}/${model}`, account: credentials.connectionName, ...(combo && { combo }) });
     if (result.success) return result.response;
 
     const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model);

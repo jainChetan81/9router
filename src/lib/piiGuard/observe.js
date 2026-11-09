@@ -6,7 +6,7 @@ import { dirname, isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { performance } from "node:perf_hooks";
 import { clientOf } from "../spendClient.js";
-import { capture as capturePrompts, collect as collectPrompts, stats as promptStats } from "./prompts.js";
+import { capture as capturePrompts, collect as collectPrompts, stats as promptStats, cleanId, updateRouting as updatePromptRouting } from "./prompts.js";
 
 const since = new Date().toISOString();
 let loading, library, detector, knownMtime, lastCheck = -Infinity, warnedAt = -Infinity;
@@ -351,7 +351,7 @@ function handleOcrResult(result, requestId, imageIndex, meta, config, model, ua)
       mode: ocrMode(config),
       requestId,
       imageIndex,
-      ...validateRouting(meta?.routing, detector),
+      ...validateRouting(meta, detector),
       endpoint: meta?.endpoint,
       model: model || meta?.model,
       ua,
@@ -374,58 +374,28 @@ function handleOcrResult(result, requestId, imageIndex, meta, config, model, ua)
   }
 }
 
-// Routing context the request handlers fill in around the scan: provider id, combo name and
-// account label when upstream resolution completes. Identifiers only; handlers must never put a
-// key, token, or email here. Identifiers the client or routing layers choose: validated as
-// labels first, then scanned against the same PII rules. Fail closed: a value is omitted.
-const ID_RE = /^[A-Za-z0-9._:/\\/-]{1,64}$/;
-const ID_FIELDS = ["provider", "combo", "resolvedModel"];
 function validateRouting(routing, det) {
   const out = {};
-  if (!routing || typeof routing !== "object") return out;
-  if (typeof routing.finalize === "function") routing = { ...routing, finalize: undefined };
-  for (const field of [...ID_FIELDS, "account"]) {
-    const v = typeof routing[field] === "string" ? routing[field].trim() : "";
-    if (!v) { if (field in routing) out[field] = null; continue; }
-    if (field === "account" ? !ID_RE.test(v) : !(ID_RE.test(v) && !v.includes("@"))) continue;
-    try { if (det && det.scan(v).length) continue; } catch {}
-    out[field] = v;
+  for (const field of ["provider", "combo", "account", "resolvedModel"]) {
+    const value = cleanId(routing?.[field], det);
+    if (value !== null) out[field] = value;
   }
   return out;
 }
 
-function makeFinalizer(meta, base, blockedNames, promptNodes, bodyFindings, sessionKey, model, ua0) {
-  if (!meta.routing || typeof meta.routing !== "object") meta.routing = {};
-  let written = false, writeTimer = null;
-  const write = () => {
-    if (written) return;
-    written = true;
-    if (writeTimer) { clearTimeout(writeTimer); writeTimer = null; }
-    try {
-      const routing = validateRouting(meta.routing, detector);
-      void append({ ...base, ts: new Date().toISOString(), ...routing }).catch(() => failure("write"));
-      capturePrompts({ nodes: promptNodes, bodyFindings, requestId: base.requestId, sessionId: sessionKey, model: base.model, client: clientOf(ua0), routing: meta.routing }, library, detector);
-      const summary = Object.entries(base.counts || {}).map(([k, n]) => `${k}=${n}`).join(", ");
-      const line = `[pii-guard] ${base.model || "-"} ${base.endpoint || "-"}: ${summary}`;
-      if (blockedNames?.length) console.error(`${line} BLOCKED: ${blockedNames.join(", ")}`);
-      else if (Object.keys(base.leaked || {}).length) console.error(`${line} LEAKED (not rewritable): ${Object.entries(base.leaked).map(([k, n]) => `${k}=${n}`).join(", ")}`);
-      else if (Object.keys(base.redacted || {}).length) console.warn(`${line} redacted: ${Object.entries(base.redacted).map(([k, n]) => `${k}=${n}`).join(", ")}`);
-      else if (base.new?.length) console.warn(`${line} (new: ${[...new Set(base.new.map(e => e.name || e.rule))].join(", ")})`);
-      else console.info(line);
-    } catch { failure("write"); }
+// Keep only identifiers and the request id alive after the scan, never prompt text.
+function routingRecorder(requestId, initial, det) {
+  let writes = Promise.resolve();
+  return async (routing) => {
+    const fields = validateRouting({ ...initial, ...routing }, det);
+    writes = writes.then(async () => {
+      try {
+        await append({ ts: new Date().toISOString(), kind: "routing", requestId, ...fields });
+        updatePromptRouting(requestId, fields, det);
+      } catch { failure("write"); }
+    });
+    await writes;
   };
-  // Each finalize merge resets a short debounce, so the single write happens after the last
-  // routing flavor; the safety timer covers a handler that never finalizes.
-  const finalize = (r) => {
-    if (r && typeof r === "object") Object.assign(meta.routing, r);
-    if (written) return;
-    if (writeTimer) clearTimeout(writeTimer);
-    writeTimer = setTimeout(write, 100);
-    writeTimer.unref();
-  };
-  const safety = setTimeout(write, 10_000);
-  safety.unref();
-  return { finalize };
 }
 
 export async function observeRequest(body, meta = {}, config = {}) {
@@ -489,6 +459,8 @@ export async function observeRequest(body, meta = {}, config = {}) {
     for (const f of findings) if (f.readonly) { const at = thinkingBlock(body, f); if (at) { delete f.readonly; drop.set(f, at); } }
     // meta.model is a pre-scan copy; log the body value, which redaction may have rewritten, and drop it if it held a finding.
     model = findings.some(f => /^\.?model$/.test(f.path)) ? "[redacted]" : body?.model ?? meta.model;
+    const routing = validateRouting(meta, detector);
+    const promptCount = capturePrompts({ nodes: promptNodes, bodyFindings: findings.map(f => ({ path: f.path, start: f.start, end: f.end, hash: f.hash, rule: f.rule, kind: f.kind })), requestId, sessionId: sessionKey, model, ...routing, client: clientOf(ua0) }, library, detector);
     for (const f of findings) foundActions.set(f, decide(f));
     const strip = new Map();
     for (const [f, at] of drop) if (foundActions.get(f) === "redact") { strip.set(`${at.i}:${at.j}`, at); redacted[label(f)] = (redacted[label(f)] || 0) + 1; }
@@ -499,10 +471,10 @@ export async function observeRequest(body, meta = {}, config = {}) {
     const scanMs = performance.now() - start;
     requests++; totalRequests++; if (samples.length === 10_000) samples.shift(); samples.push(scanMs); if (healthSamples.length === 10_000) healthSamples.shift(); healthSamples.push(scanMs); maxScanMs = Math.max(maxScanMs, scanMs); healthMaxScanMs = Math.max(healthMaxScanMs, scanMs);
     for (const k of Object.keys(unscanned)) unscanned[k] += result.unscanned[k] || 0;
-    const baseNoFindings = { requestId, ...(sessionKey && { sessionId: sessionKey }), endpoint: meta.endpoint, model: model, ua, chars: result.chars, images: result.images, imageBytes: result.imageBytes, unscanned: result.unscanned, scanMs };
     if (!findings.some(f => foundActions.get(f) !== "off")) {
-      const fin0 = makeFinalizer(meta, baseNoFindings, [], promptNodes, [], sessionKey, model, ua0);
-      return { finalize: fin0.finalize };
+      if (!promptCount) return;
+      await append({ ts: new Date().toISOString(), requestId, ...(sessionKey && { sessionId: sessionKey }), endpoint: meta.endpoint, model, ua, ...routing, hits: [] });
+      return { recordRouting: routingRecorder(requestId, routing, detector) };
     }
     const counts = Object.create(null), fresh = [], hitRows = new Map(), newHashes = [];
     for (const f of findings) {
@@ -519,18 +491,20 @@ export async function observeRequest(body, meta = {}, config = {}) {
     }
     const blocked = [...preliminaryBlocked], hits = [...hitRows.values()].sort((a, b) => RANK[a.action] - RANK[b.action]).slice(0, 200);
     withFindings++; totalWithFindings++;
+    const event = { ts: new Date().toISOString(), requestId, ...routing, ...(sessionKey && { sessionId: sessionKey }), endpoint: meta.endpoint, model: model, ua, chars: result.chars, images: result.images, imageBytes: result.imageBytes, unscanned: result.unscanned, scanMs, counts, new: fresh, hits, ...(hitRows.size > hits.length && { hitsDropped: hitRows.size - hits.length }), ...(blocked.length && { blocked }), ...(Object.keys(redacted).length && { redacted }), ...(Object.keys(leaked).length && { leaked }), ignored: findings.filter(f => foundActions.get(f) === "ignored").length };
     markSeen(newHashes);
-    // Late binding: the awaited scan is done, but the handler still fills routing after this
-    // returns; the event and prompt rows wait for finalize(routing) (safety timer at 10s so an
-    // exception or an early return can never lose the record).
-    const base = { requestId, ...(sessionKey && { sessionId: sessionKey }), endpoint: meta.endpoint, model, ua, chars: result.chars, images: result.images, imageBytes: result.imageBytes, unscanned: result.unscanned, scanMs, counts, new: fresh, hits, ...(hitRows.size > hits.length && { hitsDropped: hitRows.size - hits.length }), ...(blocked.length && { blocked }), ...(Object.keys(redacted).length && { redacted }), ...(Object.keys(leaked).length && { leaked }), ignored: findings.filter(f => foundActions.get(f) === "ignored").length };
-    const bodyFindings = findings.map(f => ({ path: f.path, start: f.start, end: f.end, hash: f.hash, rule: f.rule, kind: f.kind }));
-    const fin = makeFinalizer(meta, base, blocked, promptNodes, bodyFindings, sessionKey, model, ua0);
-    // A blocked request still writes its event (from outside the held client), even though the scan found hits.
-    fin.finalize();
-    if (blocked.length) return { blocked, ...(stuck && { stuck }), finalize: fin.finalize };
-    return { finalize: fin.finalize };
-
+    let stored = false;
+    try { await append(event); stored = true; } catch { failure("write"); }
+    const recordRouting = stored ? routingRecorder(requestId, routing, detector) : async () => {};
+    const summary = Object.entries(counts).map(([k, n]) => `${k}=${n}`).join(", ");
+    const line = `[pii-guard] ${model || "-"} ${meta.endpoint || "-"}: ${summary}`;
+    if (blocked.length) console.error(`${line} BLOCKED: ${blocked.join(", ")}`);
+    else if (Object.keys(leaked).length) console.error(`${line} LEAKED (not rewritable): ${Object.entries(leaked).map(([k, n]) => `${k}=${n}`).join(", ")}`);
+    else if (Object.keys(redacted).length) console.warn(`${line} redacted: ${Object.entries(redacted).map(([k, n]) => `${k}=${n}`).join(", ")}`);
+    else if (fresh.length) console.warn(`${line} (new: ${[...new Set(fresh.map(label))].join(", ")})`);
+    else console.info(line);
+    if (blocked.length) return { blocked, ...(stuck && { stuck }), recordRouting };
+    return { recordRouting };
   } catch { failure(stage); }
 }
 // The library masks previews; recheck shape here so a raw value can never reach the log from an old library build.

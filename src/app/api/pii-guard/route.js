@@ -4,7 +4,7 @@ import { open, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { getSettings, updateSettings } from "@/lib/localDb";
 import { ready, rules, groups, testText, testImage, eventsFile, health } from "@/lib/piiGuard/observe.js";
-import { summarize } from "@/lib/piiGuard/summary.js";
+import { summarize, routingByRequest } from "@/lib/piiGuard/summary.js";
 
 export const dynamic = "force-dynamic";
 const MODES = ["off", "observe", "redact", "block"];
@@ -87,7 +87,7 @@ async function readEvents(fromMs, visit) {
       for (const e of parseLines(buf.subarray(0, cut))) cache.events.push(e); // no spread: a big append would overflow the call stack
       cache.end += cut;
     }
-    const oldest = () => Date.parse(cache.events[0]?.ts);
+    const oldest = () => Date.parse(cache.events.find(e => e.kind !== "routing")?.ts);
     let back = CHUNK;
     while (cache.start > 0 && cache.end - cache.start < CAP && !(oldest() < fromMs)) {
       const from = Math.max(0, cache.start - back);
@@ -99,11 +99,16 @@ async function readEvents(fromMs, visit) {
       back = CHUNK;
     }
     const truncated = cache.start > 0 && !(oldest() <= fromMs);
+    // Routing may arrive after the requested range. Merge before filters and pagination.
+    const routing = routingByRequest(cache.events);
     const out = [];
     for (let i = cache.events.length - 1; i >= 0; i--) {
-      const ts = Date.parse(cache.events[i].ts);
+      const raw = cache.events[i];
+      if (raw.kind === "routing") continue;
+      const ts = Date.parse(raw.ts);
       if (ts < fromMs) break;
-      if (visit) { if (visit(cache.events[i], ts) === false) break; } else out.push(cache.events[i]);
+      const event = { ...raw, ...routing.get(raw.requestId) };
+      if (visit) { if (visit(event, ts) === false) break; } else out.push(event);
     }
     // Appends grow the cache past CAP over a long uptime; rebuild it on the next call.
     if (cache.end - cache.start > CAP * 1.5) cache = null;

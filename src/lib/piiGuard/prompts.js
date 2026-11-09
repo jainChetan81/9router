@@ -53,9 +53,9 @@ function open(file = promptsFile()) {
       try { cols = db.prepare("PRAGMA table_info(messages)").all().map(c => c.name); } catch { db.close(); db = null; failed = true; break; }
       const missing = [...REQUIRED].filter(c => !cols.includes(c));
       if (!missing.length) { ok = true; break; }
-      try { for (const col of missing) db.exec(`ALTER TABLE messages ADD COLUMN ${col} TEXT`); ok = true; chmodSync(file, 0o600); }
+      try { for (const col of missing) db.exec(`ALTER TABLE messages ADD COLUMN ${col} TEXT`); }
       catch (e) {
-        if (/duplicate column/i.test(String(e?.message))) { ok = true; break; } // another opener added it
+        if (/duplicate column/i.test(String(e?.message))) continue; // re-read all columns after a lost race
         if (!/busy|locked/i.test(String(e?.message)) || attempt === 4) { db.close(); db = null; failed = true; break; }
         db.close();
         db = new DatabaseSync(file);
@@ -63,6 +63,7 @@ function open(file = promptsFile()) {
         if (db.prepare("PRAGMA auto_vacuum").get().auto_vacuum !== 2) { db.exec("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;"); }
       }
     }
+    if (db) ok = [...REQUIRED].every(col => db.prepare("PRAGMA table_info(messages)").all().some(c => c.name === col));
     if (!ok) { failed = true; try { db?.close(); } catch {} db = null; }
     if (ok) {
       for (const f of [file, `${file}-wal`, `${file}-shm`]) try { chmodSync(f, 0o600); } catch {}
@@ -177,25 +178,34 @@ function remember(sessionId, digests) {
 /** Queues masked records; never blocks the request. Masking and the rescan happen here (sync, small);
  *  the SQLite write runs after the response starts. Full queue: the record is dropped and counted. */
 export function capture(meta, library, detector) {
-  if (!meta.nodes.length || typeof library?.maskText !== "function") return;
-  // Digests, masking and the rescan run after the request is forwarded.
-  const file = promptsFile(); // resolved now; the write runs later
-  setImmediate(() => { try { store({ ...meta, file }, library, detector); } catch { stats.errors++; } });
+  if (!meta.nodes.length || typeof library?.maskText !== "function") return 0;
+  // Only masked rows enter the asynchronous write queue.
+  try { return store({ ...meta, file: promptsFile() }, library, detector); }
+  catch { stats.errors++; return 0; }
 }
-const ID_RE = /^[A-Za-z0-9._:/\\/-]{1,64}$/;
+const ID_RE = /^[A-Za-z0-9._:/+-]{1,64}$/;
 /** A routing label is an identifier, never a value. Scanner hits or an `@` fail closed: the field stores null. */
-function cleanRouting(v, detector) {
-  if (v === null || v === undefined) return null;
-  const s = String(v);
-  if (!ID_RE.test(s)) return null;
-  if (s.includes("@")) return null;
-  if (detector /** @type {any} */?.scan && typeof detector.scan === "function" && detector.scan(s).length) return null;
-  return s;
+export function cleanId(value, detector) {
+  if (typeof value !== "string" || !ID_RE.test(value)) return null;
+  try { return detector.scan(value).length ? null : value; }
+  catch { return null; }
+}
+
+export function updateRouting(requestId, routing, detector) {
+  if (process.env.PII_GUARD_PROMPTS === "off") return;
+  const fields = Object.fromEntries(["provider", "combo", "account"].map(key => [key, cleanId(routing?.[key], detector)]));
+  const file = promptsFile();
+  for (const row of queue) if (row.file === file && row.requestId === requestId) Object.assign(row, fields);
+  if (!db || dbFile !== file) return;
+  try {
+    db.prepare("UPDATE messages SET provider=?, combo=?, account=? WHERE request_id=?")
+      .run(fields.provider, fields.combo, fields.account, requestId);
+  } catch { stats.errors++; }
 }
 function store({ nodes, bodyFindings = [], requestId, sessionId, model, provider, combo, account: rawAccount, tool: rawTool, client, file }, library, detector) {
   // Routing labels are identifiers, never values: validate each, fail closed to null.
-  const account = cleanRouting(rawAccount, detector);
-  const routing = { provider: cleanRouting(provider, detector), combo: cleanRouting(combo, detector), account, tool: cleanRouting(rawTool, detector) };
+  const account = cleanId(rawAccount, detector);
+  const routing = { provider: cleanId(provider, detector), combo: cleanId(combo, detector), account };
   for (const n of nodes) {
     // The request scan used context (sibling keys like "phone"); a rescan of the bare string may miss those.
     // Same path: reuse its spans. Inside the node but unmatched by hash: unsafe, so the node is not stored.
@@ -210,6 +220,7 @@ function store({ nodes, bodyFindings = [], requestId, sessionId, model, provider
   }
   const chosen = pick(nodes, sessionId, file);
   const ts = Date.now();
+  let captured = 0;
   for (const n of chosen) {
     if (n.unsafe) { stats.unsafe++; continue; }
     let masked;
@@ -217,13 +228,15 @@ function store({ nodes, bodyFindings = [], requestId, sessionId, model, provider
       const [text, cut] = cap(library.maskText(n.text, n.findings), n.kind);
       // Fail closed: anything still detected after masking means a span was missed.
       if (detector.scan(text).length) { stats.unsafe++; continue; }
-      masked = { file, ts, requestId, sessionId: sessionId || null, model: model || null, ...routing, client: client || null, role: n.role, kind: n.kind, path: n.path, digest: n.digest, tool: routing.tool || n.tool || null, text, cut, hashes: [...new Set(n.findings.map((f) => f.hash))].join(" ") };
+      masked = { file, ts, requestId, sessionId: sessionId || null, model: model || null, ...routing, client: client || null, role: n.role, kind: n.kind, path: n.path, digest: n.digest, tool: cleanId(rawTool ?? n.tool, detector), text, cut, hashes: [...new Set(n.findings.map((f) => f.hash))].join(" ") };
     } catch { stats.errors++; continue; }
     if (queue.length >= QUEUE_MAX || queued + masked.text.length > QUEUE_BYTES) { stats.dropped++; continue; }
     queue.push(masked); queued += masked.text.length;
+    captured++;
     if (sessionId) { let set = pending.get(sessionId); if (!set) pending.set(sessionId, set = new Set()); set.add(n.digest); }
   }
   if (!draining && queue.length) { draining = true; setImmediate(drain); }
+  return captured;
 }
 function drain() {
   const all = queue; queue = []; queued = 0; draining = false;

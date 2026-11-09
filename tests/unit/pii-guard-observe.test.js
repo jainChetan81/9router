@@ -28,7 +28,6 @@ beforeEach(async () => {
   ({ observeRequest, health } = await import("../../src/lib/piiGuard/observe.js"));
 });
 afterEach(async () => {
-  await new Promise(resolve => setTimeout(resolve, 150)); // let a deferred finalize write land before teardown
   delete process.env.PII_GUARD_MODULE; delete process.env.PII_GUARD_KNOWN; delete process.env.PII_GUARD_EVENTS;
   vi.restoreAllMocks(); await rm(dir, { recursive: true, force: true });
 });
@@ -43,7 +42,6 @@ describe("PII observation", () => {
     const info = vi.spyOn(console, "info").mockImplementation(() => {});
     await observeRequest(body(value), meta);
     await observeRequest(body(value), meta);
-    await new Promise(resolve => setTimeout(resolve, 150));
     expect(warn).toHaveBeenCalledWith("[pii-guard] test /v1/messages: own-test=1 (new: own-test)");
     expect(info).toHaveBeenCalledWith("[pii-guard] test /v1/messages: own-test=1");
     expect(JSON.stringify([warn.mock.calls, info.mock.calls])).not.toContain(value);
@@ -96,7 +94,7 @@ describe("PII guard modes", () => {
   it("redacts all scanned strings, including system and assistant history", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     const req = { system: pii, messages: [{ role: "user", content: pii }, { role: "assistant", content: pii }] };
-    expect((await observeRequest(req, meta, { mode: "redact" }))?.finalize).toEqual(expect.any(Function));
+    expect((await observeRequest(req, meta, { mode: "redact" }))?.recordRouting).toEqual(expect.any(Function));
     expect(req.messages[0].content).toMatch(/^call me on mobile \{\{pii:in_phone#[0-9a-f]{6}\}\}$/);
     expect(req.messages[1].content).toMatch(/^call me on mobile \{\{pii:in_phone#[0-9a-f]{6}\}\}$/);
     expect(req.system).toMatch(/^call me on mobile \{\{pii:in_phone#[0-9a-f]{6}\}\}$/);
@@ -110,8 +108,7 @@ describe("PII guard modes", () => {
   });
   it("blocks by rule override and logs an error", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    expect(await observeRequest(body(pii), meta, { mode: "observe", rules: { in_phone: "block" } })).toEqual({ blocked: ["in_phone"], finalize: expect.any(Function) });
-    await new Promise(resolve => setTimeout(resolve, 150));
+    expect(await observeRequest(body(pii), meta, { mode: "observe", rules: { in_phone: "block" } })).toEqual({ blocked: ["in_phone"], recordRouting: expect.any(Function) });
     expect(error.mock.calls[0][0]).toContain("BLOCKED: in_phone");
     expect(error.mock.calls[0][0]).not.toContain("9876543210");
   });
@@ -125,7 +122,7 @@ describe("PII guard block scope", () => {
   it("blocks a match in the system prompt too", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     const req = { system: "mobile 9876543210", messages: [{ role: "user", content: "hi" }] };
-    expect(await observeRequest(req, meta, { mode: "block" })).toEqual({ blocked: ["in_phone"], finalize: expect.any(Function) });
+    expect(await observeRequest(req, meta, { mode: "block" })).toEqual({ blocked: ["in_phone"], recordRouting: expect.any(Function) });
   });
 });
 describe("PII guard full-body coverage", () => {
@@ -156,7 +153,7 @@ describe("PII guard full-body coverage", () => {
   it("blocks unseen values once, then redacts same history", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     const first = body(value);
-    expect(await observeRequest(first, meta, { mode: "block" })).toEqual({ blocked: ["own-test"], finalize: expect.any(Function) });
+    expect(await observeRequest(first, meta, { mode: "block" })).toEqual({ blocked: ["own-test"], recordRouting: expect.any(Function) });
     expect(await lines(1)).toBeTruthy();
     const second = body(value);
     expect((await observeRequest(second, meta, { mode: "block" }))?.blocked).toBeUndefined();
@@ -187,7 +184,7 @@ describe("PII guard full-body coverage", () => {
     vi.resetModules();
     ({ observeRequest } = await import("../../src/lib/piiGuard/observe.js"));
     const first = body(value);
-    expect(await observeRequest(first, meta, { mode: "block" })).toEqual({ blocked: ["own-test"], finalize: expect.any(Function) });
+    expect(await observeRequest(first, meta, { mode: "block" })).toEqual({ blocked: ["own-test"], recordRouting: expect.any(Function) });
     await lines(2);
     await new Promise(resolve => setTimeout(resolve, 5100));
     vi.resetModules();
@@ -299,65 +296,83 @@ describe("PII guard test preview", () => {
   });
 });
 
-describe("PII guard routing context", () => {
-  it("records provider, combo, account and resolvedModel from the routing object", async () => {
-    const routing = {};
-    const meta = { endpoint: "/v1/messages", userAgent: "test/1", model: "test", routing };
+describe("PII guard routing records", () => {
+  it("writes the scan before returning, including blocked requests", async () => {
+    const guard = await observeRequest(body(value), { ...meta, combo: "daily" }, { mode: "block" });
+    const scan = JSON.parse((await readFile(events, "utf8")).trim());
+    expect(scan).toMatchObject({ model: "test", combo: "daily", blocked: ["own-test"] });
+    expect(guard.blocked).toEqual(["own-test"]);
+    expect(scan.kind).toBeUndefined();
+    expect(scan.provider).toBeUndefined();
+  });
+
+  it("appends complete attempt records without changing the original event", async () => {
+    const guard = await observeRequest(body(value), { ...meta, combo: "daily" });
+    const original = await readFile(events, "utf8");
+    await guard.recordRouting({ provider: "first", account: "acc-one", resolvedModel: "first/m" });
+    await guard.recordRouting({ provider: "second", account: "acc-two", resolvedModel: "second/m" });
+    const text = await readFile(events, "utf8");
+    expect(text.startsWith(original)).toBe(true);
+    const [scan, first, last] = text.trim().split("\n").map(JSON.parse);
+    expect(first).toMatchObject({ kind: "routing", requestId: scan.requestId, provider: "first", combo: "daily" });
+    expect(last).toMatchObject({ kind: "routing", requestId: scan.requestId, provider: "second", account: "acc-two", resolvedModel: "second/m", combo: "daily" });
+    expect(text).not.toContain(value);
+  });
+
+  it("does not write events or routing for requests without hits or prompts", async () => {
+    const guard = await observeRequest(body("ordinary words"), meta);
+    await guard?.recordRouting?.({ provider: "unused" });
+    await expect(stat(events)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("validates every routing identifier and drops detector hits", async () => {
     const guard = await observeRequest(body(value), meta);
-    // Late binding: the scan is done, but the handler fills routing after observeRequest
-    // returns; finalize merges it and the written event still carries the fields.
-    guard.finalize({ provider: "anthropic" });
-    guard.finalize({ combo: "daily" });
-    guard.finalize({ account: "acc-1", resolvedModel: "claude-opus/opus-5-5" });
-    const event = JSON.parse((await lines(1)).trim());
-    expect(event).toMatchObject({ provider: "anthropic", combo: "daily", account: "acc-1", resolvedModel: "claude-opus/opus-5-5" });
+    await guard.recordRouting({ provider: "bad id!", combo: "a".repeat(65), account: value, resolvedModel: "x/1+fast" });
+    const [, route] = (await readFile(events, "utf8")).trim().split("\n").map(JSON.parse);
+    expect(route.provider).toBeUndefined();
+    expect(route.combo).toBeUndefined();
+    expect(route.account).toBeUndefined();
+    expect(route.resolvedModel).toBe("x/1+fast");
   });
-  it("still writes the event when the handler never calls finalize", async () => {
-    const routing = {};
-    const meta = { endpoint: "/v1/messages", userAgent: "test/1", model: "test", routing };
-    await observeRequest(body(value), meta);
-    // No finalize call: the safety timer writes the event later.
-    const text = await lines(1);
-    expect(JSON.parse(text.trim()).requestId).toBeTruthy();
+
+  it("drops routing values when the detector throws", async () => {
+    const fake = join(dir, "throwing.mjs");
+    await writeFile(fake, `
+      export function createDetector() { return { scan(s) { if (s === 'bad-id') throw Error('scan failed'); return []; } }; }
+      export function scanBody() { return { findings: [{ hash: 'abcdef012345', rule: 'known', kind: 'known', source: 'user/text', path: 'messages[0].content' }], unscanned: {} }; }
+    `);
+    process.env.PII_GUARD_MODULE = fake;
+    const guard = await observeRequest(body("hello"), { ...meta, provider: "bad-id" });
+    await guard.recordRouting({ provider: "bad-id", combo: "bad-id", account: "bad-id", resolvedModel: "bad-id" });
+    const rows = (await readFile(events, "utf8")).trim().split("\n").map(JSON.parse);
+    for (const row of rows) for (const key of ["provider", "combo", "account", "resolvedModel"]) expect(row[key]).toBeUndefined();
   });
-  it("skips an account label that holds an email and trims empty routing", async () => {
-    const meta = { endpoint: "/v1/messages", userAgent: "test/1", model: "test", routing: { provider: "p", account: "user@corpmail.in" } };
-    await observeRequest(body(value), meta);
-    const event = JSON.parse((await lines(1)).trim());
-    expect(event.account).toBeUndefined();
-    expect(event.provider).toBe("p");
-    const plain = { endpoint: "/v1/messages", userAgent: "test/1", model: "test" };
-    await observeRequest(body(value), plain);
-    const second = JSON.parse((await lines(2)).trim().split("\n")[1]);
-    expect(second.provider).toBeUndefined();
-    expect(second.combo).toBeUndefined();
-    expect(second.account).toBeUndefined();
+
+  it("updates masked prompts when routing arrives before or after their write", async () => {
+    process.env.PII_GUARD_PROMPTS = join(dir, "prompts.db");
+    const P = await import("../../src/lib/piiGuard/prompts.js");
+    try {
+      const guard = await observeRequest(body("ordinary prompt words"), { ...meta, combo: "daily" });
+      const scan = JSON.parse((await readFile(events, "utf8")).trim());
+      await guard.recordRouting({ provider: "first", account: "acc-one", resolvedModel: "first/m" });
+      P.flush();
+      expect(P.search({ requestId: scan.requestId }).rows[0]).toMatchObject({ provider: "first", combo: "daily", account: "acc-one" });
+      await guard.recordRouting({ provider: "second", account: "acc-two", resolvedModel: "second/m" });
+      expect(P.search({ requestId: scan.requestId }).rows[0]).toMatchObject({ provider: "second", combo: "daily", account: "acc-two" });
+    } finally { P._reset(); }
   });
-  it("fails routing fields closed on the event: bad charset, a scanner hit, or a too-long value never land", async () => {
-    const meta = { endpoint: "/v1/charset-check", userAgent: "test/1", model: "test", routing: { provider: "bad id!", combo: "a".repeat(65), account: `acc@value-${Date.now()}`, resolvedModel: "x/1" } };
-    const guard = await observeRequest(body(value), meta);
-    guard.finalize({ provider: "bad id!", combo: "a".repeat(65), account: "has space", resolvedModel: "x/1" });
-    // Wait for the debounced write, then read the one event with this marker endpoint.
-    const text = await (async () => {
-      for (let i = 0; i < 100; i++) {
-        const lines = (await readFile(events, "utf8").catch(() => "")).trim().split("\n").filter(Boolean);
-        const mine = lines.map((l) => JSON.parse(l)).find((e) => e.endpoint === "/v1/charset-check");
-        if (mine) return JSON.stringify(mine);
-        await new Promise((r) => setTimeout(r, 10));
-      }
-      throw new Error("Event not written");
-    })();
-    const event = JSON.parse(text);
-    expect(event.provider).toBeUndefined();
-    expect(event.combo).toBeUndefined();
-    expect(event.account).toBeUndefined();
-    expect(event.resolvedModel).toBe("x/1");
-  });
-  it("writes old events without routing fields and stays backward compatible", async () => {
-    await observeRequest(body(value), { endpoint: "/v1/messages", userAgent: "test/1", model: "test" });
-    const event = JSON.parse((await lines(1)).trim());
-    expect(event.ts).toBeTruthy();
-    expect("provider" in event).toBe(false);
+
+  it("skips routing when a repeated prompt adds no stored rows", async () => {
+    process.env.PII_GUARD_PROMPTS = join(dir, "prompts.db");
+    const P = await import("../../src/lib/piiGuard/prompts.js");
+    try {
+      const context = { ...meta, sessionId: "repeat-session" };
+      await observeRequest(body("ordinary repeated prompt"), context);
+      const original = await readFile(events, "utf8");
+      const guard = await observeRequest(body("ordinary repeated prompt"), context);
+      await guard?.recordRouting?.({ provider: "unused" });
+      expect(await readFile(events, "utf8")).toBe(original);
+    } finally { P._reset(); }
   });
 });
 

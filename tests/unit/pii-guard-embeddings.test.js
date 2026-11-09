@@ -32,18 +32,18 @@ describe("PII guard embeddings hook", () => {
     expect(mocks.embeddingsCore).not.toHaveBeenCalled();
   });
 
-  it("passes the guard's finalize through and drives it with provider and account", async () => {
+  it("passes the guard's recordRouting through and drives it with provider and account", async () => {
     const calls = [];
-    mocks.observeRequest.mockImplementation(async () => ({ finalize: (r) => calls.push(r) }));
+    mocks.observeRequest.mockImplementation(async () => ({ recordRouting: (r) => calls.push(r) }));
     await handleEmbeddings(req({ model: "openai/text-embedding-3", input: "x" }));
     expect(mocks.embeddingsCore).toHaveBeenCalledTimes(1);
-    expect(calls).toEqual([{ provider: "openai" }, { account: "Key A" }]); // requested model already matches: no resolvedModel
+    expect(calls).toEqual([{ provider: "openai", resolvedModel: "openai/text-embedding-3", account: "Key A" }]);
   });
 
   it("records a resolvedModel when the provider resolves a bare model name", async () => {
     const calls = [];
-    mocks.observeRequest.mockImplementation(async () => ({ finalize: (r) => calls.push(r) }));
+    mocks.observeRequest.mockImplementation(async () => ({ recordRouting: (r) => calls.push(r) }));
     await handleEmbeddings(req({ model: "text-embedding-3", input: "x" }));
-    expect(calls).toEqual([{ provider: "openai", resolvedModel: "openai/text-embedding-3" }, { account: "Key A" }]);
+    expect(calls).toEqual([{ provider: "openai", resolvedModel: "openai/text-embedding-3", account: "Key A" }]);
   });
 });

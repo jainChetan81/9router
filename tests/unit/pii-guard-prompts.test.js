@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -252,5 +252,67 @@ describe("coverage guard", () => {
     await new Promise((r) => setImmediate(r)); P.flush();
     expect(P.stats.unsafe).toBe(1);
     expect(P.search({}).rows).toEqual([]);
+  });
+});
+
+
+describe("metadata validation and routing updates", () => {
+  it.each(["name@example.test", "sk-ant-" + "Q1w2E3r4T5y6U7i8O9p0AsDf"])("drops unsafe collected tool names: %s", async tool => {
+    await run({ input: [
+      { type: "function_call", call_id: "c1", name: tool, arguments: "{}" },
+      { type: "function_call_output", call_id: "c1", output: "ordinary tool output" },
+    ] });
+    const rows = P.search({ requestId: "r1" }).rows;
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every(row => row.tool === null)).toBe(true);
+  });
+
+  it("drops each identifier on detector exceptions and accepts the exact charset", () => {
+    const throwing = { scan() { throw Error("detector unavailable"); } };
+    expect(P.cleanId("valid-id", throwing)).toBeNull();
+    expect(P.cleanId("valid-id", null)).toBeNull();
+    expect(P.cleanId("route/a+b:c.d_e-f", detector)).toBe("route/a+b:c.d_e-f");
+    for (const value of ["name@example.test", "white space", "back\\slash", "a".repeat(65), 123]) expect(P.cleanId(value, detector)).toBeNull();
+  });
+
+  it("validates collected tool names when their detector throws", async () => {
+    const det = { scan(text) { if (text === "bad-tool") throw Error("failed"); return []; } };
+    P.capture({ nodes: [{ text: "ordinary output", role: "tool", kind: "tool_result", path: "input", tool: "bad-tool" }], requestId: "r1" }, library, det);
+    P.flush();
+    expect(P.search({ requestId: "r1" }).rows[0].tool).toBeNull();
+  });
+
+  it("updates both queued and persisted prompts without retaining rejected labels", async () => {
+    P.capture({ nodes: P.collect({ input: "ordinary output" }), requestId: "r1" }, library, detector);
+    P.updateRouting("r1", { provider: "first", combo: "daily", account: "work" }, detector);
+    P.flush();
+    expect(P.search({ requestId: "r1" }).rows[0]).toMatchObject({ provider: "first", combo: "daily", account: "work" });
+    P.updateRouting("r1", { provider: "last", combo: "daily", account: "name@example.test" }, detector);
+    expect(P.search({ requestId: "r1" }).rows[0]).toMatchObject({ provider: "last", combo: "daily", account: null });
+  });
+
+  it("continues migration after another opener adds only one missing column", async () => {
+    const file = process.env.PII_GUARD_PROMPTS;
+    const fs = await import("node:fs");
+    fs.mkdirSync(join(dir, "c"), { recursive: true });
+    const { DatabaseSync } = await import("node:sqlite");
+    const old = new DatabaseSync(file);
+    old.exec("CREATE TABLE messages (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, request_id TEXT NOT NULL, session_id TEXT, model TEXT, client TEXT, role TEXT, kind TEXT, path TEXT, text TEXT NOT NULL, cut INTEGER NOT NULL DEFAULT 0, hashes TEXT NOT NULL DEFAULT '', digest TEXT)");
+    old.close();
+    const original = DatabaseSync.prototype.exec;
+    let raced = false;
+    const spy = vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(function(sql) {
+      if (!raced && sql === "ALTER TABLE messages ADD COLUMN provider TEXT") {
+        raced = true;
+        original.call(this, sql);
+        throw Error("duplicate column name: provider");
+      }
+      return original.call(this, sql);
+    });
+    try {
+      await run({ input: "after migration" }, "s1", "r1", { provider: "p", combo: "daily", account: "work" });
+      expect(raced).toBe(true);
+      expect(P.search({ requestId: "r1" }).rows[0]).toMatchObject({ provider: "p", combo: "daily", account: "work", tool: null });
+    } finally { spy.mockRestore(); }
   });
 });

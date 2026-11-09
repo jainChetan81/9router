@@ -7,7 +7,7 @@ const { settings, updateSettings } = vi.hoisted(() => {
 vi.mock("@/lib/localDb", () => ({ getSettings: async () => settings, updateSettings }));
 vi.mock("@/lib/piiGuard/observe.js", () => ({ ready: async () => true, rules: () => [{ id: "r", group: "api_key", label: "Key rule" }, { id: "pan", group: "gov_id", label: "PAN" }], groups: () => [], testText: async () => null, testImage: async () => null, eventsFile: () => "/tmp/ev.jsonl", health: () => ({}) }));
 
-import { GET, POST } from "../../src/app/api/pii-guard/route.js";
+import { GET, POST, loadEvents } from "../../src/app/api/pii-guard/route.js";
 import { writeFile, rm, appendFile } from "node:fs/promises";
 
 beforeEach(async () => {
@@ -152,5 +152,38 @@ describe("route dismiss", () => {
     expect(settings.piiGuard.dismissed).toEqual({ aaaaaaaaaaaa: ["assistant/thinking"] });
     expect((await post({ undismiss: ["aaaaaaaaaaaa"] })).status).toBe(200);
     expect(settings.piiGuard.dismissed).toEqual({});
+  });
+});
+
+
+describe("routing record reads", () => {
+  it("merges the last routing record before filters and pagination, including cached polls", async () => {
+    const ts = new Date(Date.now() - 5000).toISOString();
+    const scan = { ts, requestId: "r1", model: "daily", combo: "daily", hits: [{ hash: "h1", rule: "r", action: "observe" }] };
+    const get = async query => (await GET(new Request(`http://localhost/api/pii-guard?events=1&${query}`))).json();
+    await writeFile("/tmp/ev.jsonl", JSON.stringify(scan) + "\n");
+    expect((await get("provider=served")).events).toHaveLength(0);
+    await appendFile("/tmp/ev.jsonl", [
+      { ts, kind: "routing", requestId: "r1", provider: "failed", account: "old" },
+      { ts, kind: "routing", requestId: "r1", provider: "served", account: "work", resolvedModel: "served/m" },
+    ].map(JSON.stringify).join("\n") + "\n");
+    const page = await get("provider=served&combo=daily&limit=1");
+    expect(page.events).toHaveLength(1);
+    expect(page.events[0]).toMatchObject({ ...scan, provider: "served", account: "work", resolvedModel: "served/m" });
+    expect((await get(`provider=served&combo=daily&before=${page.next.before}&skip=${page.next.skip}`)).events).toHaveLength(0);
+    expect((await get("provider=failed")).events).toHaveLength(0);
+    expect((await get("")).events).toHaveLength(1);
+  });
+
+  it("finds matching events across chunks in a 90-day window with later routing", async () => {
+    const to = Date.now(), from = to - 90 * 864e5, eventMs = from + 864e5;
+    const scan = { ts: new Date(eventMs).toISOString(), requestId: "old-request", hits: [{ hash: "old", rule: "r" }] };
+    const routing = { ts: new Date(to + 1000).toISOString(), kind: "routing", requestId: "old-request", provider: "served", combo: "daily" };
+    const padding = Array.from({ length: 12000 }, (_, i) => JSON.stringify({ ts: new Date(to).toISOString(), kind: "routing", requestId: `other-${i}`, provider: "padding-provider" }));
+    await writeFile("/tmp/ev.jsonl", [JSON.stringify(scan), ...padding, JSON.stringify(routing)].join("\n") + "\n");
+    const page = await (await GET(new Request(`http://localhost/api/pii-guard?events=1&from=${from}&to=${to}&provider=served`))).json();
+    expect(page.events).toHaveLength(1);
+    expect(page.events[0]).toMatchObject({ requestId: "old-request", provider: "served", combo: "daily", ts: scan.ts });
+    expect((await loadEvents(from)).truncated).toBe(false);
   });
 });

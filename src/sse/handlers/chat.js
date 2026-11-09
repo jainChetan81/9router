@@ -56,13 +56,13 @@ export async function handleChat(request, clientRawRequest = null) {
   }
   // Resolved before the scan so PII Guard can link stored prompts to the conversation.
   const session = resolveSessionIdentity({ headers: clientRawRequest?.headers, body });
-  // Routing fields (provider/combo/account) fill in after resolution; observeFinalize writes when they are known.
-  let piiRouting = null;
+  let guard;
   if (process.env.PII_GUARD_MODULE) {
-    const routing = {};
-    const guard = await observeRequest(body, { endpoint: clientRawRequest.endpoint, userAgent: clientRawRequest.headers?.["user-agent"], model: body?.model, sessionId: session?.random ? null : session?.sessionId, routing }, (await getSettings()).piiGuard);
+    const guardSettings = (await getSettings()).piiGuard;
+    const requested = stripModelContextMarker(body.model).model;
+    const combo = guardSettings?.mode !== "off" && await getComboModels(requested) ? requested : undefined;
+    guard = await observeRequest(body, { endpoint: clientRawRequest.endpoint, userAgent: clientRawRequest.headers?.["user-agent"], model: body?.model, sessionId: session?.random ? null : session?.sessionId, combo }, guardSettings);
     if (guard?.blocked) return errorResponse(HTTP_STATUS.BAD_REQUEST, blockMessage(guard.blocked, true, guard.stuck));
-    piiRouting = guard.finalize;
   }
   // Claude Code marks a 1M-context request as `<model>[1m]`; the marker matches
   // no combo, alias or provider/model pair, so it must not reach resolution.
@@ -122,7 +122,6 @@ export async function handleChat(request, clientRawRequest = null) {
   const comboModels = await getComboModels(modelStr);
   if (comboModels) {
     clientRawRequest.combo = modelStr;
-    if (piiRouting) piiRouting({ combo: modelStr });
     // Check for combo-specific strategy first, fallback to global
     const comboStrategies = settings.comboStrategies || {};
     const comboSpecificStrategy = comboStrategies[modelStr]?.fallbackStrategy;
@@ -141,7 +140,7 @@ export async function handleChat(request, clientRawRequest = null) {
             const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
             cleanRawReq = { ...clientRawRequest, body: cleanBody };
           }
-          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, null, !!isPanel);
+          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, null, !!isPanel, isPanel ? null : guard, modelStr);
         },
         log,
         comboName: modelStr,
@@ -157,7 +156,7 @@ export async function handleChat(request, clientRawRequest = null) {
       body,
       models: augmentedModels,
       handleSingleModel: withCapacityAdapterStripping(
-        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, true),
+        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, true, guard, comboModels ? modelStr : null),
         adapterAdded
       ),
       log,
@@ -189,7 +188,7 @@ export async function handleChat(request, clientRawRequest = null) {
       body,
       models: soloAugmented,
       handleSingleModel: withCapacityAdapterStripping(
-        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, true),
+        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, true, guard, comboModels ? modelStr : null),
         adapterAdded
       ),
       log,
@@ -198,13 +197,13 @@ export async function handleChat(request, clientRawRequest = null) {
     });
   }
 
-  return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey, contextMarker ? `${modelStr.slice(modelStr.indexOf("/") + 1)}[${contextMarker}]` : null);
+  return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey, contextMarker ? `${modelStr.slice(modelStr.indexOf("/") + 1)}[${contextMarker}]` : null, false, guard);
 }
 
 /**
  * Handle single model chat request
  */
-async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, requestedModel = null, bodyIsolated = false) {
+async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, requestedModel = null, bodyIsolated = false, piiGuard = null, piiCombo = null) {
   // Combo and fusion callers already isolate each attempt. Direct requests need
   // their own copy before translators and token savers mutate the body.
   if (!bodyIsolated) body = structuredClone(body);
@@ -237,7 +236,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
               const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
               cleanRawReq = { ...clientRawRequest, body: cleanBody };
             }
-            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, null, !!isPanel);
+            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, null, !!isPanel, isPanel ? null : piiGuard, piiCombo || modelStr);
           },
           log,
           comboName: modelStr,
@@ -255,7 +254,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         body,
         models: augmentedModels,
         handleSingleModel: withCapacityAdapterStripping(
-          (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, true),
+          (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, true, piiGuard, piiCombo || modelStr),
           adapterAdded
         ),
         log,
@@ -282,12 +281,6 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
   const { provider, model } = modelInfo;
 
-  // Record routing for PII Guard when it observed this request (identifiers only, never credentials).
-  if (piiRouting) {
-    const r = { provider };
-    if (requestedModel || modelStr !== `${provider}/${model}`) r.resolvedModel = `${provider}/${model}`;
-    piiRouting(r);
-  }
   // Routing shown in the unified "▶" line (client model → provider/model)
 
   // Extract userAgent from request
@@ -307,6 +300,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
     // All accounts unavailable
     if (!credentials || credentials.allRateLimited) {
+      if (excludeConnectionIds.size === 0) await piiGuard?.recordRouting?.({ provider, resolvedModel: `${provider}/${model}`, account: null, ...(piiCombo && { combo: piiCombo }) });
       if (credentials?.allRateLimited) {
         const errorMsg = lastError || credentials.lastError || "Unavailable";
         const status = HTTP_STATUS.SERVICE_UNAVAILABLE;
@@ -325,10 +319,6 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     try {
     // Account selection shown in the unified "▶" line (acc:...)
     const refreshedCredentials = await checkAndRefreshToken(provider, credentials);
-
-    // Record the account label for PII Guard: a connection display name, never a credential.
-    // Observe drops a value containing "@" when the event is written.
-    if (piiRouting) piiRouting({ account: credentials.connectionName });
 
     // Ensure real project ID is available for providers that need it (P0 fix: cold miss)
     if ((provider === "antigravity" || provider === "gemini-cli") && !refreshedCredentials.projectId) {
@@ -389,6 +379,8 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         clearAntigravityStrikes(credentials.connectionId, model);
       }
     });
+
+    await piiGuard?.recordRouting?.({ provider, resolvedModel: `${provider}/${model}`, account: credentials.connectionName, ...(piiCombo && { combo: piiCombo }) });
 
     if (result.success) {
       if (credentials.quotaProbe) {

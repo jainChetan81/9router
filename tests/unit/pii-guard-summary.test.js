@@ -137,3 +137,20 @@ describe("summary byAction", () => {
     expect(result.blocked24h).toBe(1);
   });
 });
+
+
+describe("summary routing records", () => {
+  it("uses the last appended attempt without counting routing as a request or changing event time", () => {
+    const now = Date.now(), ts = new Date(now - 5000).toISOString();
+    const hit = { hash: "aaaaaaaaaaaa", rule: "email", action: "observe" };
+    const events = [
+      { ts, requestId: "r1", combo: "daily", hits: [hit] },
+      { ts, kind: "routing", requestId: "r1", provider: "failed", account: "first" },
+      { ts: new Date(now + 1000).toISOString(), kind: "routing", requestId: "r1", provider: "served", combo: "daily", account: "last" },
+    ];
+    const result = summarize(events, { now });
+    expect(result.requests).toBe(1);
+    expect(result.groups[0]).toMatchObject({ provider: "served", combo: "daily", lastSeen: ts, turns: 1 });
+    expect(result.byRule.email.hits).toBe(1);
+  });
+});

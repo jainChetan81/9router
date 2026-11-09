@@ -1,8 +1,23 @@
 const DAY = 24 * 60 * 60 * 1000;
 const RANK = { leaked: 0, block: 1, redact: 2, observe: 3, ignored: 4 };
 
+// Input is file order; the last routing record replaces the previous attempt.
+export function routingByRequest(events) {
+  const routing = new Map();
+  for (const event of events) {
+    if (event?.kind !== "routing" || typeof event.requestId !== "string") continue;
+    const fields = {};
+    for (const key of ["provider", "account", "resolvedModel"]) fields[key] = typeof event[key] === "string" ? event[key] : null;
+    if (typeof event.combo === "string") fields.combo = event.combo;
+    routing.set(event.requestId, fields);
+  }
+  return routing;
+}
+
 // step/origin: bucket hits into a trend (ms per bucket, start of bucket 0). Off when step is not set.
 export function summarize(events, { since, until, now = Date.now(), ignore = [], step, origin } = {}) {
+  events = Array.isArray(events) ? events : [];
+  const routing = routingByRequest(events);
   const sinceMs = Number.isFinite(since) ? since : now - DAY;
   const untilMs = Number.isFinite(until) ? until : now;
   const groups = new Map();
@@ -21,7 +36,9 @@ export function summarize(events, { since, until, now = Date.now(), ignore = [],
   let totalOcrEvents = 0;
   const recentOcr = [], reasons = Object.create(null);
 
-  for (const event of Array.isArray(events) ? events : []) {
+  for (const rawEvent of events) {
+    if (rawEvent?.kind === "routing") continue;
+    const event = { ...rawEvent, ...routing.get(rawEvent?.requestId) };
     if (event?.type === "test" || event?.test === true) continue;
     const ts = Date.parse(event?.ts);
     if (!Number.isFinite(ts) || ts < sinceMs || ts > untilMs) continue;

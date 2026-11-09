@@ -70,12 +70,11 @@ export async function handleSearch(request) {
     return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing required field: query");
   }
 
-  let piiFinalize = null;
+  let guard;
   if (process.env.PII_GUARD_MODULE) {
-    const routing = {};
-    const guard = await observeRequest(body, { endpoint: url.pathname, userAgent: request.headers.get("user-agent"), model: providerInput, routing }, settings.piiGuard);
+    const combo = settings.piiGuard?.mode !== "off" && getComboModelsFromData(providerInput, await getCombos()) ? providerInput : undefined;
+    guard = await observeRequest(body, { endpoint: url.pathname, userAgent: request.headers.get("user-agent"), model: providerInput, combo }, settings.piiGuard);
     if (guard?.blocked) return errorResponse(HTTP_STATUS.BAD_REQUEST, blockMessage(guard.blocked, false));
-    if (typeof guard?.finalize === "function") piiFinalize = guard.finalize;
     providerInput = body.provider || body.model; // redaction may have rewritten it
     query = body.query;
   }
@@ -88,7 +87,6 @@ export async function handleSearch(request) {
   // restricted key needs the provider id (or the combo) on its list.
   const keyAccessDenied = await enforceKeyAccessProvider(await getKeyAccessContext(request), providerInput, comboModels);
   if (keyAccessDenied) return keyAccessDenied;
-  if (piiFinalize) piiFinalize(comboModels ? { combo: providerInput } : { provider: providerInput });
   if (comboModels) {
     const comboStrategies = settings.comboStrategies || {};
     const comboStrategy = comboStrategies[providerInput]?.fallbackStrategy || settings.comboStrategy || "fallback";
@@ -97,7 +95,7 @@ export async function handleSearch(request) {
     return handleComboChat({
       body,
       models: comboModels,
-      handleSingleModel: (b, m) => handleSingleProviderSearch(b, m, request, apiKey, settings, piiFinalize),
+      handleSingleModel: (b, m) => handleSingleProviderSearch(b, m, request, apiKey, settings, guard, providerInput),
       log,
       comboName: providerInput,
       comboStrategy,
@@ -105,10 +103,10 @@ export async function handleSearch(request) {
     });
   }
 
-  return handleSingleProviderSearch(body, providerInput, request, apiKey, settings, piiFinalize);
+  return handleSingleProviderSearch(body, providerInput, request, apiKey, settings, guard);
 }
 
-async function handleSingleProviderSearch(body, providerInput, request, apiKey, settings, piiFinalize) {
+async function handleSingleProviderSearch(body, providerInput, request, apiKey, settings, guard, combo) {
   const query = body.query;
   const providerId = resolveProviderId(providerInput);
   const resolvedProvider = AI_PROVIDERS[providerId];
@@ -157,6 +155,7 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
       credentials: null,
       log
     });
+    await guard?.recordRouting?.({ provider: providerId, resolvedModel: providerId, account: null, ...(combo && { combo }) });
     if (result.success) return result.response;
     return result.response;
   }
@@ -195,6 +194,7 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
     }
 
     if (!credentials || credentials.allRateLimited) {
+      if (excludeConnectionIds.size === 0) await guard?.recordRouting?.({ provider: providerId, resolvedModel: providerId, account: null, ...(combo && { combo }) });
       if (credentials?.allRateLimited) {
         const errorMsg = lastError || credentials.lastError || "Unavailable";
         const status = lastStatus || Number(credentials.lastErrorCode) || HTTP_STATUS.SERVICE_UNAVAILABLE;
@@ -210,7 +210,6 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
     }
 
     log.info("AUTH", `\x1b[32mUsing ${providerId} account: ${credentials.connectionName}\x1b[0m`);
-    if (piiFinalize) piiFinalize({ account: credentials.connectionName });
 
     const refreshedCredentials = await checkAndRefreshToken(providerId, credentials);
 
@@ -233,6 +232,7 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
       }
     });
 
+    await guard?.recordRouting?.({ provider: providerId, resolvedModel: providerId, account: credentials.connectionName, ...(combo && { combo }) });
     if (result.success) return result.response;
 
     const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, credentialProviderId, searchLockKey);

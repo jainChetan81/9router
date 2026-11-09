@@ -43,6 +43,7 @@ describe("PII guard image-generation hook", () => {
     mocks.combos.mockReturnValue(["a/m1", "a/m2"]);
     await handleImageGeneration(req({ model: "daily", prompt: "p" }));
     expect(mocks.comboChat).toHaveBeenCalledTimes(1);
+    expect(mocks.modelInfo).not.toHaveBeenCalled();
     expect(mocks.comboChat.mock.calls[0][0].models).toEqual(["a/m1", "a/m2"]);
     mocks.observeRequest.mockReset();
   });
@@ -54,15 +55,12 @@ describe("PII guard image-generation hook", () => {
     expect(mocks.comboChat).toHaveBeenCalledTimes(1);
   });
 
-  it("a single model passes the guard's finalize through and drives it with the account", async () => {
+  it("a single model passes the guard's recordRouting through and drives it with the account", async () => {
     const calls = [];
-    let routing = null;
-    mocks.observeRequest.mockImplementation(async (body, meta) => { routing = meta.routing; return { finalize: (r) => calls.push(r) }; });
+    mocks.observeRequest.mockImplementation(async () => ({ recordRouting: (r) => calls.push(r) }));
     await handleImageGeneration(req({ model: "gpt-6/mini", prompt: "p" }));
     expect(mocks.imageCore).toHaveBeenCalledTimes(1);
-    // The requested model already names the route, so there is no resolvedModel to add.
-    expect(routing).toEqual({ provider: "gpt-6" });
-    expect(calls).toEqual([{ account: "Plan Pro" }]);
+    expect(calls).toEqual([{ provider: "gpt-6", resolvedModel: "gpt-6/mini", account: "Plan Pro" }]);
   });
 
   it("passes through a core failure to the error response", async () => {
@@ -70,4 +68,30 @@ describe("PII guard image-generation hook", () => {
     const res = await handleImageGeneration(req({ model: "gpt-6/mini", prompt: "p" }));
     expect(res.status).toBe(403);
   });
+});
+
+
+it.each([true, false])("records the final combo member, success=%s", async success => {
+  process.env.PII_GUARD_MODULE = "/scanner.js";
+  const recordRouting = vi.fn();
+  mocks.observeRequest.mockResolvedValue({ recordRouting });
+  mocks.combos.mockResolvedValue(["first/a", "last/b"]);
+  mocks.modelInfo.mockImplementation(async model => { const [provider, name] = model.split("/"); return { provider, model: name }; });
+  mocks.comboChat.mockImplementation(async ({ body, models, handleSingleModel }) => {
+    let response;
+    for (const model of models) {
+      response = await handleSingleModel(body, model);
+      if (response.ok) break;
+    }
+    return response;
+  });
+  mocks.imageCore.mockImplementation(async ({ modelInfo }) => ({
+    success: success && modelInfo.provider === "last", status: 502, error: "failed",
+    response: Response.json({}, { status: success && modelInfo.provider === "last" ? 200 : 502 }),
+  }));
+  mocks.creds.mockResolvedValue({ connectionId: "c1", connectionName: "work" });
+  mocks.unavail.mockResolvedValue({ shouldFallback: false });
+  expect((await handleImageGeneration(req({ model: "daily", prompt: "ordinary image" }))).status).toBe(success ? 200 : 502);
+  expect(mocks.observeRequest.mock.lastCall[1].combo).toBe("daily");
+  expect(recordRouting).toHaveBeenLastCalledWith({ provider: "last", resolvedModel: "last/b", account: "work", combo: "daily" });
 });

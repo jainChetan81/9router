@@ -77,11 +77,10 @@ export async function handleEmbeddings(request) {
     return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing required field: input");
   }
 
-  let piiFinalize = null;
+  let guard;
   if (process.env.PII_GUARD_MODULE) {
-    const guard = await observeRequest(body, { endpoint: url.pathname, userAgent: request.headers.get("user-agent"), model: body?.model }, settings.piiGuard);
+    guard = await observeRequest(body, { endpoint: url.pathname, userAgent: request.headers.get("user-agent"), model: body?.model }, settings.piiGuard);
     if (guard?.blocked) return errorResponse(HTTP_STATUS.BAD_REQUEST, blockMessage(guard.blocked, false));
-    piiFinalize = typeof guard?.finalize === "function" ? guard.finalize : null;
     modelStr = body.model; // redaction may have rewritten it
   }
 
@@ -92,11 +91,6 @@ export async function handleEmbeddings(request) {
   }
 
   const { provider, model } = modelInfo;
-  if (piiFinalize) {
-    const r = { provider };
-    if (modelStr !== `${provider}/${model}`) r.resolvedModel = `${provider}/${model}`;
-    piiFinalize(r);
-  }
 
   // Per-key access control: checked before any credential lookup.
   const keyAccessDenied = await enforceKeyAccessResolved(await getKeyAccessContext(request), modelStr, provider, model);
@@ -118,6 +112,7 @@ export async function handleEmbeddings(request) {
 
     // All accounts unavailable
     if (!credentials || credentials.allRateLimited) {
+      if (excludeConnectionIds.size === 0) await guard?.recordRouting?.({ provider, resolvedModel: `${provider}/${model}`, account: null });
       if (credentials?.allRateLimited) {
         const errorMsg = lastError || credentials.lastError || "Unavailable";
         const status = lastStatus || Number(credentials.lastErrorCode) || HTTP_STATUS.SERVICE_UNAVAILABLE;
@@ -133,7 +128,6 @@ export async function handleEmbeddings(request) {
     }
 
     log.info("AUTH", `\x1b[32mUsing ${provider} account: ${credentials.connectionName}\x1b[0m`);
-    if (piiFinalize) piiFinalize({ account: credentials.connectionName });
 
     const refreshedCredentials = await checkAndRefreshToken(provider, credentials);
 
@@ -153,6 +147,8 @@ export async function handleEmbeddings(request) {
         await clearAccountError(credentials.connectionId, credentials, model);
       }
     });
+
+    await guard?.recordRouting?.({ provider, resolvedModel: `${provider}/${model}`, account: credentials.connectionName });
 
     if (result.success) {
       const usage = exactEmbeddingUsage(result.usage);
