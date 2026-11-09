@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildView, PAGE } from "../../src/app/(dashboard)/dashboard/pii-guard/view.js";
+import { buildView, buildPromptFilterKey, buildPromptRequestKey, canLandOnPrompt, PAGE } from "../../src/app/(dashboard)/dashboard/pii-guard/view.js";
 
 const ui = { tab: "findings", view: "value", q: "", fGroup: "", fAction: "", fClient: "", fModel: "", fSource: "", sel: {}, page: 0, leakPage: 0, testKind: "text", testText: "", imgSel: 0 };
 const base = (over = {}) => ({
@@ -64,5 +64,25 @@ describe("couldn't-redact review", () => {
     expect(JSON.stringify(open.cards)).not.toMatch(/leak/i);
     expect(make(["assistant/thinking"], { aaaaaaaaaaaa: ["assistant/thinking"] }).leaks).toHaveLength(0);
     expect(make(["assistant/thinking", "key"], { aaaaaaaaaaaa: ["assistant/thinking"] }).leaks).toHaveLength(1);
+  });
+});
+
+describe("prompt landing request keys", () => {
+  it("keeps prompt rows and cursors scoped to the filter key", () => {
+    const range = { preset: "7D" };
+    const key = buildPromptFilterKey("pan", "session-a", range);
+    expect(buildPromptFilterKey("pan", "session-a", { ...range })).toBe(key);
+    expect(buildPromptFilterKey("pan", "session-b", range)).not.toBe(key);
+    expect(buildPromptRequestKey(key, 50)).not.toBe(buildPromptRequestKey(key, null));
+  });
+
+  it("lands only on rows loaded for the current filter and cursor", () => {
+    const key = buildPromptFilterKey("", "session-a", { preset: "24h" });
+    const currentRequest = buildPromptRequestKey(key, null);
+    const olderPageRequest = buildPromptRequestKey(key, 50);
+    expect(canLandOnPrompt(currentRequest, currentRequest, false)).toBe(true);
+    expect(canLandOnPrompt(currentRequest, currentRequest, true)).toBe(false);
+    expect(canLandOnPrompt(currentRequest, olderPageRequest, false)).toBe(false);
+    expect(canLandOnPrompt(currentRequest, buildPromptRequestKey("old-session", null), false)).toBe(false);
   });
 });

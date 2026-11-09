@@ -9,13 +9,50 @@ const DEFAULT_TAB = "overview", DEFAULT_VIEW = "value";
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
 const pick = (v, list, fallback) => (list.includes(v) ? v : fallback);
 const text = (v) => (typeof v === "string" ? v.trim() : "");
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+// Real calendar day only: 2026-02-30 and 2026-99-99 are rejected by the UTC round-trip.
+export function validDate(v) {
+  if (!DATE.test(v)) return false;
+  const [y, m, d] = v.split("-").map(Number);
+  const t = new Date(Date.UTC(y, m - 1, d));
+  return t.getUTCFullYear() === y && t.getUTCMonth() === m - 1 && t.getUTCDate() === d;
+}
+// Same shape as the range picker label: "Nov 1 – Nov 5".
+export function rangeLabel(from, to) {
+  const f = (v) => { const [, m, d] = v.split("-").map(Number); return `${MONTHS[m - 1]} ${d}`; };
+  return `${f(from)} – ${f(to)}`;
+}
+
+export function buildRangeKey(range) {
+  return JSON.stringify([range?.preset || "", range?.from || "", range?.to || ""]);
+}
+
+export function buildEventsFilterKey(range, filters = {}) {
+  return JSON.stringify([
+    buildRangeKey(range), filters.client || "", filters.model || "", filters.source || "",
+    filters.action || "", filters.group || "", filters.q || "", !!filters.tests,
+  ]);
+}
+
+export function buildEventsRequestKey(filterKey, cursor) {
+  return JSON.stringify([filterKey, cursor?.before ?? null, cursor?.skip ?? 0]);
+}
+
+// Router updates can echo a URL from an older debounced search after the user has typed again.
+export function shouldSyncSearchInput(search, ownSearchWrites, isExternal = false) {
+  return isExternal || !ownSearchWrites.has(search);
+}
+
+export function shouldDropMissingDetail({ currentKey, loadedKey, succeeded, found }) {
+  return !!succeeded && currentKey === loadedKey && !found;
+}
 
 // Returns { preset, from?, to?, label? }. Unknown presets and bad custom dates fall back to the default.
 export function parseRange(sp) {
   const r = sp.get("range");
   if (r === "custom") {
     const from = sp.get("from") || "", to = sp.get("to") || "";
-    if (DATE.test(from) && DATE.test(to) && from <= to) return { preset: "Custom", from, to, label: "" };
+    if (validDate(from) && validDate(to) && from <= to) return { preset: "Custom", from, to, label: rangeLabel(from, to) };
     return { ...DEFAULT_RANGE };
   }
   return PRESETS.includes(r) && r !== "24h" ? { preset: r } : { ...DEFAULT_RANGE };
@@ -29,7 +66,7 @@ export function parseUrlState(sp) {
   return {
     tab,
     view,
-    q: text(sp.get("q")),
+    q: sp.get("q") || "", // raw: the editing value keeps spaces; trim only where it is compared or sent
     fGroup: text(sp.get("group")),
     fAction: pick(sp.get("action"), ACTIONS, ""),
     fClient: text(sp.get("client")),
@@ -59,7 +96,7 @@ export function serialiseUrlState(s, keep = new URLSearchParams()) {
   const set = (k, v) => { if (v) out.set(k, v); };
   set("tab", s.tab !== DEFAULT_TAB ? s.tab : "");
   set("view", s.view !== DEFAULT_VIEW && s.tab === "findings" ? s.view : "");
-  set("q", s.q);
+  if (s.q && s.q.trim()) out.set("q", s.q);
   set("group", s.fGroup);
   set("action", s.fAction);
   set("client", s.fClient);

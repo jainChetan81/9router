@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseUrlState, serialiseUrlState, dropMissingDetail, DEFAULT_RANGE, occurrences } from "../../src/app/(dashboard)/dashboard/pii-guard/urlState.js";
+import { parseUrlState, serialiseUrlState, dropMissingDetail, validDate, rangeLabel, buildRangeKey, buildEventsFilterKey, buildEventsRequestKey, shouldSyncSearchInput, shouldDropMissingDetail, DEFAULT_RANGE, occurrences } from "../../src/app/(dashboard)/dashboard/pii-guard/urlState.js";
 
 describe("masked preview matches", () => {
   it("finds every non-overlapping occurrence", () => {
@@ -36,7 +36,7 @@ describe("pii-guard url state: parse", () => {
     expect(s.tests).toBe(false);
   });
   it("reads a custom range and rejects bad dates", () => {
-    expect(parse("range=custom&from=2026-11-01&to=2026-11-05").range).toEqual({ preset: "Custom", from: "2026-11-01", to: "2026-11-05", label: "" });
+    expect(parse("range=custom&from=2026-11-01&to=2026-11-05").range).toEqual({ preset: "Custom", from: "2026-11-01", to: "2026-11-05", label: "Nov 1 – Nov 5" });
     expect(parse("range=custom&from=2026-11-05&to=2026-11-01").range).toEqual(DEFAULT_RANGE);
     expect(parse("range=custom&from=yesterday&to=2026-11-01").range).toEqual(DEFAULT_RANGE);
     expect(parse("range=bogus").range).toEqual(DEFAULT_RANGE);
@@ -47,8 +47,12 @@ describe("pii-guard url state: parse", () => {
     expect(parse("finding=nocolon").detailKey).toBeNull();
     expect(parse("hit=a:b:c").detailHit).toBeNull();
   });
-  it("trims free text", () => {
-    expect(parse("q=%20%20pan%20").q).toBe("pan");
+  it("keeps the raw search text so a trailing space survives the round-trip", () => {
+    expect(parse("q=pan%20").q).toBe("pan ");
+    expect(parse("q=%20%20pan%20").q).toBe("  pan ");
+  });
+  it("builds the custom range label in picker format", () => {
+    expect(parse("range=custom&from=2026-11-01&to=2026-11-05").range.label).toBe("Nov 1 – Nov 5");
   });
 });
 
@@ -77,6 +81,10 @@ describe("pii-guard url state: serialise", () => {
     expect(out.get("utm")).toBe("x");
     expect(out.get("tab")).toBe("test");
   });
+  it("keeps a search typed in pieces and drops only a blank one", () => {
+    expect(serialiseUrlState({ ...parse(""), q: "John " }).get("q")).toBe("John ");
+    expect(serialiseUrlState({ ...parse(""), q: "   " }).has("q")).toBe(false);
+  });
   it("writes only the drawer param that is set", () => {
     expect(serialiseUrlState({ ...parse(""), detailHit: "r:h" }).toString()).toBe("hit=r%3Ah");
   });
@@ -91,5 +99,49 @@ describe("pii-guard url state: drawer deep links", () => {
   it("keeps a finding that is loaded", () => {
     const s = dropMissingDetail(parse("finding=abc:pan"), (k) => k === "abc:pan", () => false);
     expect(s.detailKey).toBe("abc:pan");
+  });
+});
+
+describe("pii-guard url state: calendar dates", () => {
+  it("accepts real days and rejects impossible ones", () => {
+    expect(validDate("2026-11-05")).toBe(true);
+    expect(validDate("2028-02-29")).toBe(true);
+    expect(validDate("2026-02-29")).toBe(false);
+    expect(validDate("2026-99-99")).toBe(false);
+    expect(validDate("2026-1-5")).toBe(false);
+  });
+  it("rejects a custom range with an impossible day", () => {
+    expect(parse("range=custom&from=2026-99-99&to=2026-11-05").range).toEqual(DEFAULT_RANGE);
+  });
+  it("formats the label like the picker", () => {
+    expect(rangeLabel("2026-01-09", "2026-12-31")).toBe("Jan 9 – Dec 31");
+  });
+});
+
+describe("pii-guard request state keys", () => {
+  const range = { preset: "Custom", from: "2026-11-01", to: "2026-11-05" };
+
+  it("keys summary and event data by the range and event filters", () => {
+    const rangeKey = buildRangeKey(range);
+    const filterKey = buildEventsFilterKey(range, { client: "Claude", q: "pan", tests: true });
+    expect(buildRangeKey({ ...range })).toBe(rangeKey);
+    expect(buildRangeKey({ ...range, to: "2026-11-06" })).not.toBe(rangeKey);
+    expect(buildEventsFilterKey(range, { client: "Claude", q: "pan", tests: true })).toBe(filterKey);
+    expect(buildEventsFilterKey(range, { client: "Claude", q: "pan ", tests: true })).not.toBe(filterKey);
+    expect(buildEventsRequestKey(filterKey, { before: 10, skip: 4 })).not.toBe(buildEventsRequestKey(filterKey, null));
+  });
+
+  it("syncs URL search only for external navigation, not our pending writes", () => {
+    const ownWrites = new Set(["tab=findings&q=old", "tab=findings&q=new"]);
+    expect(shouldSyncSearchInput("tab=findings&q=old", ownWrites)).toBe(false);
+    expect(shouldSyncSearchInput("tab=findings&q=external", ownWrites)).toBe(true);
+    expect(shouldSyncSearchInput("tab=findings&q=old", ownWrites, true)).toBe(true);
+  });
+
+  it("drops a missing detail only after the current request succeeds", () => {
+    expect(shouldDropMissingDetail({ currentKey: "new", loadedKey: "old", succeeded: true, found: false })).toBe(false);
+    expect(shouldDropMissingDetail({ currentKey: "new", loadedKey: "new", succeeded: false, found: false })).toBe(false);
+    expect(shouldDropMissingDetail({ currentKey: "new", loadedKey: "new", succeeded: true, found: true })).toBe(false);
+    expect(shouldDropMissingDetail({ currentKey: "new", loadedKey: "new", succeeded: true, found: false })).toBe(true);
   });
 });
