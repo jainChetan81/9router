@@ -187,8 +187,8 @@ export async function PATCH(request) {
     const fees = {};
     for (const s of SUBS) {
       const v = body?.fees?.[s.k];
-      if (v === undefined) continue;
-      if (v === null || v === "") return NextResponse.json({ error: `Invalid fee for ${s.name}` }, { status: 400 });
+      // Blank or null clears the fee, as before.
+      if (v === undefined || v === null || v === "") continue;
       const n = Number(v);
       if (!Number.isFinite(n) || n < 0 || n > 100000) return NextResponse.json({ error: `Invalid fee for ${s.name}` }, { status: 400 });
       fees[s.k] = n;
