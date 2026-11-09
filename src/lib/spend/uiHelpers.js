@@ -72,7 +72,9 @@ export function mapQuotaRows(apiRows = []) {
   }
   for (const [name, list] of agModels) {
     list.sort((a, b) => (b.pct ?? -1) - (a.pct ?? -1));
-    out.push({ ...list[0], id: `antigravity:${name}:models`, more: list.slice(1) });
+    const used = list.filter((r) => Number(r.pct) > 0), unused = list.filter((r) => !(Number(r.pct) > 0));
+    const primary = used[0] || unused.shift() || list[0];
+    out.push({ ...primary, id: `antigravity:${name}:models`, more: used.length ? used.slice(1) : [], unused, unusedCount: unused.length });
   }
   for (const o of muse.values()) out.push({ ...o, usage: `${fLoc(o.req || 0)} req · ${fT(o.tok || 0)} tok` });
   return out;
@@ -83,7 +85,7 @@ export function sortQuotaRunway(rows = []) {
   return [...rows].sort((a, b) => (RISK_RANK[a.risk] ?? 4) - (RISK_RANK[b.risk] ?? 4) || usedRank(b) - usedRank(a));
 }
 // Total row count for "Show all N": parents plus every collapsed child.
-export const quotaTotal = (rows) => rows.length + sum(rows, (r) => (r.more ? r.more.length : 0));
+export const quotaTotal = (rows) => rows.length + sum(rows, (r) => (r.more ? r.more.length : 0) + (r.unused ? r.unused.length : 0));
 
 // ---------- Routing map ----------
 // API routes (combo->provider and provider->model edges) -> design links {combo, prov, model, req, value, real, est, paid}.

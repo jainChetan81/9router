@@ -87,7 +87,7 @@ describe("agents helpers", () => {
       if (child || !page.nextCursor) break;
       cursor = page.nextCursor;
     }
-    expect(child?.parent).toEqual({ session: "parent111111", inferred: true });
+    expect(child?.parent).toEqual({ session: "parent111111", inferred: true, parentGuessed: true });
   });
 
   it("getSessionDetail returns agents with requests", async () => {
@@ -95,7 +95,7 @@ describe("agents helpers", () => {
     const adapter = await (await import("@/lib/db/driver.js")).getAdapter();
     const detail = await getSessionDetail(adapter, "parent111111");
     expect(detail.agents.length).toBeGreaterThan(0);
-    expect(detail.children).toContainEqual({ session: "child22222222", inferred: true });
+    expect(detail.children).toContainEqual({ session: "child22222222", inferred: true, parentGuessed: true });
     const totalReqs = detail.agents.reduce((a, g) => a + g.requests.length, 0);
     expect(totalReqs).toBe(15);
     const firstReq = detail.agents[0].requests[0];

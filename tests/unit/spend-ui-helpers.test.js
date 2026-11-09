@@ -24,7 +24,9 @@ describe("quota runway mapping", () => {
     const models = rows.find((r) => r.more);
     expect(models.win).toBe("Model B");
     expect(models.used).toBe("300 / 1,000");
-    expect(models.more.map((m) => m.win)).toEqual(["Model A", "Model C"]);
+    expect(models.more.map((m) => m.win)).toEqual(["Model A"]);
+    expect(models.unused.map((m) => m.win)).toEqual(["Model C"]);
+    expect(models.unusedCount).toBe(1);
     expect(quotaTotal(rows)).toBe(4);
   });
 

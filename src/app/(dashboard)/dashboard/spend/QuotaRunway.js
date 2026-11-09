@@ -54,12 +54,12 @@ export default function QuotaRunway() {
       usedW: pct + "%", projW: proj != null && pr > pct ? pr - pct + "%" : "0%", markL: "calc(" + pr + "% - 1px)", markD: proj != null ? "block" : "none", color: c,
       usedLabel: r.used || (r.pct == null ? "—" : Math.round(r.pct) + "%"), projLabel: proj != null ? " → " + projR + "%" : "", fText, fSub, fColor,
       cd: r.usageOnly || !r.reset ? "—" : "in " + dur(r.reset - now), resetAbs: r.usageOnly || !r.reset ? "Not reported" : (sameDayIST(r.reset, now) ? "today " + fTime(r.reset) : fDT(r.reset)) + " IST",
-      hasMore: !!r.more?.length && !all, moreLabel: agOpen ? "Hide models" : "+" + (r.more?.length || 0) + " models", moreIcon: agOpen ? "expand_less" : "expand_more",
+      hasMore: !!(r.more?.length || r.unused?.length) && !all, moreLabel: agOpen ? "Hide models" : r.more?.length ? "+" + (r.more.length + (r.unused?.length || 0)) + " models" : "+" + (r.unused?.length || 0) + " unused models", moreIcon: agOpen ? "expand_less" : "expand_more",
       indent: child ? "18px" : "0px", bg: child ? "var(--bg)" : "transparent",
     };
   };
   const rows = [];
-  shown.forEach((r) => { rows.push(qRow(r)); if (r.more && (agOpen || all)) r.more.forEach((m) => rows.push(qRow(m, true))); });
+  shown.forEach((r) => { rows.push(qRow(r)); if (agOpen || all) { (r.more || []).forEach((m) => rows.push(qRow(m, true))); (r.unused || []).forEach((m) => rows.push(qRow(m, true))); } });
 
   return (
     <section ref={ref} data-screen-label="Quota runway" style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: "12px", boxShadow: "var(--shadow)", padding: "16px 18px", display: "flex", flexDirection: "column", gap: "8px", minWidth: "0" }}>

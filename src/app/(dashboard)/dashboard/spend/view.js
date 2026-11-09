@@ -1,5 +1,6 @@
 // Builds the Spend page view model from /api/spend data. Ported from the
 // Claude Design "Spend.dc.html" renderVals so markup bindings stay 1:1.
+import { feeError, feesValid, tickStep } from "./helpers.js";
 
 export const SHORT = {
   "claude-opus-5-5": "opus-5-5", "claude-haiku-5-5": "haiku-5-5", "claude-sonnet-5-5": "sonnet-5-5", "claude-fable-5-1": "fable-5-1",
@@ -64,7 +65,7 @@ export function buildView({ data, quota, ui, set, fit, range, feeRefs, saveFees 
   const H = 220;
   const lastIdx = bars.length - 1 - [...bars].reverse().findIndex((b) => !b.future);
   const hi = ui.hover != null && ui.hover < bars.length ? ui.hover : lastIdx;
-  const step = Math.ceil(bars.length / (hourly ? 12 : 10));
+  const step = tickStep(bars.length, { hourly, narrow: (fit?.aW ?? 1000) < 480 });
   const fmtAxis = (v) => (v >= 1000 ? "$" + (v / 1000).toFixed(1) + "k" : "$" + (v < 10 ? v.toFixed(1) : Math.round(v)));
   const chart = {
     title: hourly ? "PER HOUR (IST)" : "PER DAY (IST)",
@@ -140,6 +141,7 @@ export function buildView({ data, quota, ui, set, fit, range, feeRefs, saveFees 
       name: s.name, plan: "Subscription", fee: fs ? fmtFee(fees[s.k]) : "Not set", draft: draft[s.k] ?? "", value: usd(totals.subs[s.k]),
       ratio: rt ? (rt >= 10 ? rt.toFixed(0) : rt.toFixed(1)) + "×" : "", c: rt < 1 ? "var(--red)" : "var(--green)",
       onFee: (e) => { const val = e.target.value; set((u) => ({ draft: { ...(u.draft || fees), [s.k]: val } })); },
+      feeErr: ui.editing ? feeError(draft[s.k]) : "",
     };
   });
 
@@ -168,7 +170,7 @@ export function buildView({ data, quota, ui, set, fit, range, feeRefs, saveFees 
   } else rowsSrc = G.provider.map((o) => mk(PROV[o.k] || o.k, SUBN[o.k] ? (o.k in { openrouter: 1, deepseek: 1 } ? "Pay per token" : SUBN[o.k] === "local" ? "Local · free" : "Subscription") : "Provider", o));
   if (["role", "client", "session"].includes(ui.group) && totals.nrReq > 0)
     rowsSrc.push({ name: "Not recorded", desc: "requests before " + loggedLabel, v: totals.nrList, real: 0, req: cnt(totals.nrReq), tok: cnt(totals.nrTok), nr: true });
-  rowsSrc.sort((a, b) => (ui.group === "session" ? (a.nr ? 2 : a.other ? 1 : 0) - (b.nr ? 2 : b.other ? 1 : 0) : 0) || b.v - a.v);
+  rowsSrc.sort((a, b) => (a.nr ? 1 : 0) - (b.nr ? 1 : 0) || (ui.group === "session" ? (a.other ? 1 : 0) - (b.other ? 1 : 0) : 0) || b.v - a.v);
   const rows = rowsSrc.map((x) => ({
     name: x.name, desc: x.desc, hasMix: !!x.mix, mix: x.mix || [], req: x.req, tok: x.tok,
     real: x.nr ? "not logged" : x.real >= 0.005 ? usd(x.real, 1) : x.real > 0 ? "<$0.01" : "—", realC: x.real > 0 && !x.nr ? "var(--acc)" : "var(--tx3)",
@@ -240,6 +242,7 @@ export function buildView({ data, quota, ui, set, fit, range, feeRefs, saveFees 
     or, ds, trend, chart, readout, subs, dayCount,
     editing: ui.editing, notEditing: !ui.editing,
     startEdit: () => set({ editing: true, draft: { ...fees } }), cancelEdit: () => set({ editing: false, draft: null }), saveEdit: saveFees,
+    feesOk: !ui.editing || Object.values(ui.draft || {}).every((x) => !feeError(x)),
     groups, groupHead, rows, rankBtns, outliers: outl, noOutliers: outl.length === 0, topDays, topDaysTitle: hourly ? "TOP 5 HOURS" : "TOP 5 DAYS", ag,
     aWpx: Math.max(260, fit.aW - 44) + "px", detCols: fit.aW < 640 ? "minmax(0,1fr)" : "minmax(0,1fr) minmax(0,1fr)",
     maskA: fit.fadeA ? "linear-gradient(to right,#000 calc(100% - 40px),transparent)" : "none", maskR: fit.fadeR ? "linear-gradient(to right,#000 calc(100% - 40px),transparent)" : "none",

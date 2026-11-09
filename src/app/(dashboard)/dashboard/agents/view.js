@@ -2,6 +2,7 @@
 // Claude Design "Agents.dc.html" renderVals so markup bindings stay 1:1.
 // Pure function: no fetch, no DOM. Callbacks come in via `act`.
 import { RC, SHORT, usd, cnt } from "../spend/view.js";
+import { pickSelection } from "../spend/helpers.js";
 
 const IST = "Asia/Kolkata";
 const ROLE_ORDER = ["main", "implementer", "scout", "reviewer", "thinker", "background", "direct"];
@@ -41,14 +42,63 @@ const dayLabel = (ts) => { const d = new Date(ts); return Number.isNaN(+d) ? "" 
 const durF = (ms) => { const m = Math.max(1, Math.round(ms / 60000)); return m < 60 ? m + " min" : Math.floor(m / 60) + " h " + (m % 60) + " min"; };
 const fs = (s) => (s == null || !Number.isFinite(s) ? "—" : s < 10 ? s.toFixed(1) + " s" : s < 60 ? Math.round(s) + " s" : Math.floor(s / 60) + " m " + Math.round(s % 60) + " s");
 const med = (a) => { if (!a.length) return 0; const b = [...a].sort((x, y) => x - y); const i = (b.length - 1) / 2; return (b[Math.floor(i)] + b[Math.ceil(i)]) / 2; };
-const seg = (on) => ({ border: 0, height: 26, padding: "0 10px", borderRadius: 7, font: "inherit", fontSize: 12, cursor: "pointer", whiteSpace: "nowrap", background: on ? "var(--segon)" : "transparent", color: on ? "var(--tx)" : "var(--tx2)", fontWeight: on ? 600 : 400, boxShadow: on ? "0 1px 2px rgba(0,0,0,.08)" : "none" });
+const seg = (on) => ({ border: 0, height: 28, padding: "0 10px", borderRadius: 7, font: "inherit", fontSize: 12.5, cursor: "pointer", whiteSpace: "nowrap", background: on ? "var(--segon)" : "transparent", color: on ? "var(--tx)" : "var(--tx2)", fontWeight: on ? 600 : 400, boxShadow: on ? "0 1px 2px rgba(0,0,0,.08)" : "none" });
 
 export function chip(role) {
   const c = RC[role] || ["var(--seg)", "var(--tx2)"];
-  return { display: "inline-block", fontSize: 10.5, fontWeight: 600, padding: "1px 7px", borderRadius: 5, background: c[0], color: role === "background" ? "var(--tx2)" : c[1], border: role === "background" ? "1px dashed var(--tx3)" : "1px solid transparent", whiteSpace: "nowrap", lineHeight: "16px" };
+  return { display: "inline-block", fontSize: 11, fontWeight: 600, padding: "2px 8px", borderRadius: 5, background: c[0], color: role === "background" ? "var(--tx2)" : role === "main" ? "var(--tx)" : c[1], border: role === "background" ? "1px dashed var(--tx2)" : "1px solid transparent", whiteSpace: "nowrap", lineHeight: "16px" };
+}
+
+export function formatIdle(ms) {
+  if (!Number.isFinite(ms)) return "idle";
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  return seconds < 60 ? `idle ${seconds} s` : `idle ${Math.floor(seconds / 60)} m`;
+}
+// Round shares to whole percents that add up to 100 (largest remainder).
+export function roundShares(shares) {
+  const total = shares.reduce((a, x) => a + x, 0);
+  if (!(total > 0)) return shares.map(() => 0);
+  const exact = shares.map((x) => (x / total) * 100);
+  const out = exact.map(Math.floor);
+  let left = 100 - out.reduce((a, x) => a + x, 0);
+  exact.map((x, i) => [x - Math.floor(x), i]).sort((a, b) => b[0] - a[0]).forEach(([, i]) => { if (left > 0) { out[i] += 1; left -= 1; } });
+  return out;
+}
+
+export function formatTps(value) { return Number.isFinite(value) ? `${Math.round(value)} t/s` : ""; }
+export function formatP50(value) { return Number.isFinite(value) ? `p50 ${fs(value / 1000)}` : ""; }
+export function stateChip(state, lastActivityMs, now = Date.now(), inFlight = 1, idleSeconds) {
+  const key = ["streaming", "thinking", "idle"].includes(state) ? state : "idle";
+  const label = key === "idle" ? formatIdle(Number.isFinite(lastActivityMs) ? now - lastActivityMs : Number.isFinite(idleSeconds) ? idleSeconds * 1000 : NaN) : key;
+  const multi = key !== "idle" && inFlight > 1 ? `${label} · ${inFlight}` : label;
+  const color = key === "streaming" ? "var(--green)" : key === "thinking" ? "var(--amber)" : "var(--tx2)";
+  const bg = key === "streaming" ? "var(--greenbg)" : key === "thinking" ? "var(--amberbg)" : "var(--seg)";
+  return { label: multi, aria: `${key === "idle" ? "idle" : key}${key !== "idle" && inFlight > 1 ? ` · ${inFlight}` : ""}`, color, bg, dot: key !== "idle" };
 }
 
 const call = (fn, ...args) => () => fn?.(...args);
+const modelIdOf = (m) => typeof m === "string" ? m : m?.fullModel || m?.routedModel || m?.id || m?.model || "";
+export function clientCategory(client = "") {
+  return /claude/i.test(client) ? "Claude Code" : /codex/i.test(client) ? "Codex" : /opencode/i.test(client) ? "OpenCode" : /t3/i.test(client) ? "T3 Code" : "Other";
+}
+export function sessionMatchesFilters(session, { query = "", client = "", role = "" } = {}) {
+  const q = query.replace(/^s·?/, "").trim().toLowerCase();
+  return (!q || String(session.session || "").toLowerCase().includes(q)) && (!client || clientCategory(session.client) === client) && (!role || (session.roles || []).some((r) => r.role === role || (r.models || []).some((m) => m.model === role)));
+}
+export function sessionFilterCount(filtered, total, hasFilter) { return hasFilter ? `${filtered} of ${total}` : `${total} in range`; }
+export function istDayStart(ts) {
+  const shifted = new Date(ts + 330 * 60 * 1000);
+  return Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate()) - 330 * 60 * 1000;
+}
+function versionFromUA(ua) { return String(ua || "").match(/(?:claude[- ](?:cli|code)|codex|open[- ]?code|t3)[/ \-]?v?(\d+(?:\.\d+){1,3})/i)?.[1] || null; }
+// "cc/claude-opus-5-5" and "claude-opus-5-5" name the same model.
+export const baseMatch = (a, b) => !!a && !!b && (a === b || a.endsWith("/" + b) || b.endsWith("/" + a));
+const NON_CHAT_ID = /tts|voice|flux|black-forest|assemblyai|embed|whisper|dall-e|stable-diffusion/i;
+export const isChatEntry = (m) => {
+  const k = m?.kind || m?.type;
+  if (k && k !== "llm" && k !== "imageToText") return false;
+  return !NON_CHAT_ID.test(modelIdOf(m));
+};
 
 function statusOf(q) {
   const s = String(q.status ?? "ok");
@@ -57,7 +107,7 @@ function statusOf(q) {
   return [s, "var(--red)", "var(--redbg)"];
 }
 
-export function buildView({ live, sessions, totalSessions, detail, analytics, tools, range, ui, act = {}, vw = 1440, now = Date.now(), combos = [], models = [], overrides = [], overridesBySession = {}, revisions = {}, draft = {}, cf = false, toast = null, setDraft = () => {}, setCf = () => {}, setToast = () => {}, applyOverrides = async () => {}, reloadOverrides = async () => {} }) {
+export function buildView({ live, sessions, totalSessions, detail, detailsBySession = {}, detailLoad = {}, analytics, tools, range, ui, act = {}, vw = 1440, now = Date.now(), combos = [], models = [], overrides = [], overridesBySession = {}, revisions = {}, draft = {}, cf = false, toast = null, moreCursor = null, setDraft = () => {}, setCf = () => {}, setToast = () => {}, applyOverrides = async () => {}, reloadOverrides = async () => {} }) {
   const tab = ui.tab || "live";
   const mode = ui.mode || "loading"; // loading | ready | empty | error | stale
   const ok = mode === "ready" || mode === "stale";
@@ -70,24 +120,28 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
   const topLevel = liveSessions.filter((s) => !s.parent);
   const kidOf = (id) => liveSessions.filter((s) => s.parent && (s.parent.session === id || s.parent === id));
   const allReq5 = liveSessions.reduce((a, s) => a + (s.reqPerMin || 0) * 5, 0);
-  const tpsVals = liveSessions.map((s) => s.tpsRecent).filter((v) => v != null && Number.isFinite(v));
-  const p50Vals = liveSessions.map((s) => s.p50TotalMs).filter((v) => v != null && Number.isFinite(v)).map((v) => v / 1000);
+  const liveRoles = liveSessions.flatMap((s) => (s.roles || []).map((r) => ({ ...r, tps: r.tps ?? s.tpsRecent, p50Ms: r.p50Ms ?? s.p50TotalMs })));
+  const tpsVals = liveRoles.map((r) => r.tps).filter((v) => v != null && Number.isFinite(v));
+  const p50Vals = liveRoles.map((r) => r.p50Ms).filter((v) => v != null && Number.isFinite(v));
+  const inFlightKnown = Number.isFinite(live?.inFlight);
+  const stateCounts = liveRoles.reduce((counts, r) => { if (r.state === "streaming" || r.state === "thinking") counts[r.state]++; return counts; }, { streaming: 0, thinking: 0 });
   const succW = liveSessions.reduce((a, s) => a + (s.reqPerMin || 0), 0);
   const succAvg = succW ? liveSessions.reduce((a, s) => a + (s.successRate ?? 100) * (s.reqPerMin || 0), 0) / succW : 100;
   const fails5 = Math.round(allReq5 * (1 - succAvg / 100));
   const liveKids = kidOfAll(liveSessions);
   const kpis = [
     ["ACTIVE SESSIONS", String(topLevel.length), liveKids ? liveKids + " delegated children" : "child links need parent IDs", "Sessions with a request in the last 5 minutes." + (liveKids ? " T3 delegated children count under their parent." : " The live feed carries no parent links yet, so children cannot be nested here."), "var(--acc)", "var(--tx)"],
-    ["IN FLIGHT", "—", "not tracked yet", "The in-flight registry (P2) is not built yet, so running requests cannot be counted.", "var(--green)", "var(--tx3)"],
+    ["IN FLIGHT", inFlightKnown ? String(live.inFlight) : "Not tracked yet", inFlightKnown ? `${stateCounts.streaming} streaming · ${stateCounts.thinking} thinking` : "In-flight requests are not available from this server.", "Current requests tracked by the live feed.", "var(--green)", inFlightKnown ? "var(--tx)" : "var(--tx3)"],
     ["REQUESTS / MIN", (allReq5 / 5).toFixed(1), Math.round(allReq5) + " requests in 5 min", "All agents, background jobs included, over the last 5 minutes.", "var(--blue)", "var(--tx)"],
-    ["TOKENS / S", tpsVals.length ? String(Math.round(med(tpsVals))) : "—", "median output speed", "Median output tokens per second across live sessions, counted after the first token.", "var(--violet)", tpsVals.length ? "var(--tx)" : "var(--tx3)"],
-    ["LATENCY P50", p50Vals.length ? fs(med(p50Vals)) : "—", "start to last token", "Median request latency over live sessions. P95 needs per-request samples (P2).", "var(--tx3)", "var(--tx)"],
+    ["TOKENS / S", tpsVals.length ? String(Math.round(med(tpsVals))) : "No samples", "median output speed", "Output speed has no samples in the live feed.", "var(--violet)", tpsVals.length ? "var(--tx)" : "var(--tx3)"],
+    ["LATENCY P50", p50Vals.length ? fs(med(p50Vals) / 1000) : "No samples", "start to last token", "Latency has no samples in the live feed.", "var(--tx3)", "var(--tx)"],
     ["SUCCESS RATE", succAvg.toFixed(1) + "%", fails5 + " failed of " + Math.round(allReq5), "Requests in the last 5 minutes that returned a complete response.", succAvg < 95 ? "var(--red)" : "var(--green)", succAvg < 95 ? "var(--red)" : "var(--tx)"],
   ].map(([label, value, sub, tip, dot, c]) => ({ label, value, sub, tip, dot, c }));
 
   const card = (s, isChild, more) => {
     const lastMs = Date.parse(s.lastTs);
-    const routeOverrides = overridesBySession[s.session] || [];
+    const activityMs = Number.isFinite(s.lastActivityMs) ? s.lastActivityMs : lastMs;
+    const routeOverrides = overridesBySession[s.session]?.overrides || [];
     const rows = (s.roles || []).map((r) => {
       const isBg = r.role === "background";
       const entry = routeOverrides.find((e) => e.combo === r.role);
@@ -95,10 +149,12 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
       const pending = entry?.status === "pending";
       return {
         role: r.role, chip: chip(r.role), model: currentModel, prov: prov(currentModel), mc: mc(currentModel),
-        op: isBg ? 0.72 : 1, st: "waiting", stC: "var(--tx2)",
-        dot: { width: 8, height: 8, borderRadius: "50%", flex: "none", background: "var(--tx3)" },
-        rpm: r.requests != null ? (r.requests / 5).toFixed(1) : "—", tps: "—", p50: "—",
-        succ: s.successRate == null ? "—" : (s.successRate === 100 ? "100" : s.successRate.toFixed(1)) + "%",
+        op: isBg ? 0.72 : 1, state: stateChip(r.state, r.lastActivityMs ?? s.lastActivityMs, now, r.inFlight ?? 1, r.idleSeconds),
+        st: r.state === "streaming" || r.state === "thinking" ? r.state : stateChip(r.state, r.lastActivityMs ?? s.lastActivityMs, now, r.inFlight ?? 1, r.idleSeconds).label,
+        stC: r.state === "streaming" ? "var(--green)" : r.state === "thinking" ? "var(--amber)" : "var(--tx2)",
+        dot: { width: 6, height: 6, borderRadius: "50%", flex: "none", background: r.state === "streaming" ? "var(--green)" : r.state === "thinking" ? "var(--amber)" : "var(--tx3)", animation: r.state === "streaming" ? "r9pulse 1.6s infinite" : "none" },
+        rpm: r.requests != null ? (r.requests / 5).toFixed(1) : "—", tps: formatTps(r.tps), p50: formatP50(r.p50Ms),
+        succ: s.successRate == null ? "" : (s.successRate === 100 ? "100" : s.successRate.toFixed(1)) + "%",
         succC: s.successRate == null ? "var(--tx3)" : s.successRate < 95 ? "var(--red)" : "var(--tx)",
         spark: "", sparkTip: "Per-minute history needs the in-flight registry (P2).",
         tag: pending ? "pending → " + short(entry.model) : entry?.mode === "override" ? "override" : entry?.mode === "member" ? "Routing changed" : "",
@@ -109,13 +165,14 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
     const flags = rows.map((r) => r._override).filter(Boolean);
     return {
       id: "s·" + s.session, client: s.client || "Unknown", started: Number.isFinite(lastMs) ? hm(lastMs) : "—",
+      inFlight: s.inFlight, activityDot: { background: (s.roles || []).some((r) => r.state === "streaming") ? "var(--green)" : Number.isFinite(activityMs) && now - activityMs < 60000 ? "var(--green)" : "var(--tx3)", animation: (s.roles || []).some((r) => r.state === "streaming") ? "r9pulse 1.6s infinite" : "none" },
       rows, isChild, more,
       wrap: { position: "relative", marginLeft: isChild ? (vw < 900 ? 28 : 40) : 0 },
       parentId: s.parent ? "s·" + (s.parent.session || s.parent) : "",
       infTip: "T3 sends no parent id. Linked by key and timing, so the link is inferred.",
       hasOverride: flags.some((e) => e.mode === "override" && e.status === "active"), hasChanged: flags.some((e) => e.mode === "member" && e.status === "active"), hasPending: flags.some((e) => e.status === "pending"),
       bgNote: (s.roles || []).some((r) => r.role === "background"),
-      route: call(act.openDrawer, s.session),
+      route: call(act.openRouting, s.session), details: call(act.openDetails, s.session),
       timeline: call(act.openTimeline, s.session),
     };
   };
@@ -127,12 +184,13 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
   const byId = new Map(sessList.map((s) => [s.session, s]));
   const kidsOf = (id) => sessList.filter((s) => s.parent && (s.parent.session || s.parent) === id);
   const qq = (ui.q || "").replace(/^s·?/, "").toLowerCase().trim();
-  const matches = (s) => (!qq || s.session.toLowerCase().includes(qq)) && (!ui.fClient || s.client === ui.fClient) && (!ui.fRole || (s.roles || []).some((r) => r.role === ui.fRole));
+  const matches = (s) => sessionMatchesFilters(s, { query: ui.q || "", client: ui.fClient || "", role: ui.fRole || "" });
   const parentOf = (s) => { const p = s.parent && (s.parent.session || s.parent); return p && byId.get(p) ? p : null; };
   const topList = sessList.filter((s) => !parentOf(s)).filter((s) => matches(s) || kidsOf(s.session).some(matches)).sort((a, b) => Date.parse(b.lastTs) - Date.parse(a.lastTs));
-  const selId = (ui.sel && byId.get(ui.sel)) ? ui.sel : (topList[0] ? topList[0].session : null);
+  // The selection is only ever set by the user or the first-load effect in AgentsClient. Live refreshes never move it.
+  const selId = ui.sel || pickSelection(null, sessList.map((s) => s.session));
 
-  const rowStyle = (selected, focused) => ({ display: "grid", gridTemplateColumns: "minmax(0,1fr) 44px 54px 62px 30px", gap: 8, alignItems: "center", width: "100%", minHeight: 32, flexShrink: 0, padding: "5px 8px", border: 0, borderTop: "1px solid var(--line)", background: selected ? "var(--acc2)" : focused ? "var(--seg)" : "transparent", color: "var(--tx)", font: "inherit", fontSize: 12, textAlign: "left", cursor: "pointer", fontVariantNumeric: "tabular-nums", boxSizing: "border-box" });
+  const rowStyle = (selected, focused) => ({ display: "grid", gridTemplateColumns: "16px minmax(0,1fr) 8px auto", gap: 8, alignItems: "center", width: "100%", minHeight: 36, flexShrink: 0, padding: "6px 12px", border: 0, borderTop: "1px solid var(--line)", background: selected ? "var(--acc2)" : focused ? "var(--seg)" : "transparent", color: "var(--tx)", font: "inherit", fontSize: 12.5, textAlign: "left", cursor: "pointer", fontVariantNumeric: "tabular-nums", boxSizing: "border-box" });
   const metric = (req, tok, val, err, bold) => ({ req: req.toLocaleString("en-US"), tok: cnt(tok), val: usd(val), fw: bold ? 600 : 400, err: String(err), errC: err ? "var(--red)" : "var(--tx3)" });
   const sumAll = (s) => ({ req: s.requests || 0, tok: s.tokens || 0, val: s.value || 0, err: s.errors || 0 });
   const treeRows = [];
@@ -143,12 +201,12 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
     const rootId = parentOf(s) || s.session;
     const firstMs = Date.parse(s.firstTs), lastMs = Date.parse(s.lastTs);
     treeRows.push({
-      isSess: true, isRole: false, isModel: false, isKid, label: "s·" + s.session,
+      isSess: true, isRole: false, isModel: false, isKid, sid: s.session, label: "s·" + s.session,
       sub: (s.client || "Unknown") + " · " + (Number.isFinite(firstMs) ? dayLabel(firstMs) + " " + hm(firstMs) : ""),
-      live: Number.isFinite(lastMs) && now - lastMs < 5 * 60 * 1000, inferred: isKid,
+      live: Number.isFinite(lastMs) && now - lastMs < 5 * 60 * 1000, inferred: !!s.parent?.parentGuessed, hasChildren: kidsOf(s.session).length > 0,
       chev: open ? "expand_more" : "chevron_right", exp: open, pad: depth * 16 + "px",
       style: rowStyle(selId === s.session, false), ...metric(m.req, m.tok, m.val, m.err, true),
-      on: () => act.select?.(rootId, s.session),
+      on: () => act.select?.(rootId, s.session), toggle: () => act.toggleExpand?.(s.session), details: () => act.openDetails?.(s.session), route: () => act.openRouting?.(s.session),
     });
     if (!open) return;
     (s.roles || []).forEach((r) => {
@@ -168,34 +226,47 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
     });
   };
   topList.forEach((s) => { pushSess(s, 0, false); kidsOf(s.session).filter((k) => matches(k) || matches(s)).forEach((k) => pushSess(k, 1, true)); });
-  const clientSet = [...new Set(sessList.map((s) => s.client).filter(Boolean))].sort();
-  const roleSet = [...new Set(sessList.flatMap((s) => (s.roles || []).map((r) => r.role)))].sort();
+  const clientSet = ["All", "Claude Code", "Codex", "OpenCode", "T3 Code", "Other"];
+  const roleSet = [...new Set(sessList.flatMap((s) => (s.roles || []).flatMap((r) => [r.role, ...(r.models || []).map((m) => m.model)])))].sort();
+  const roleNames = ["implementer", "scout", "reviewer", "thinker", "background"];
+  const directNames = roleSet.filter((r) => !roleNames.includes(r));
   const tree = {
-    rows: treeRows, none: treeRows.length === 0, count: (totalSessions ?? sessList.length) + " in range",
+    rows: treeRows, none: treeRows.length === 0,
+    noneText: (qq || ui.fClient || ui.fRole) ? "No sessions match these filters." : "No sessions in this range.", filtered: !!(qq || ui.fClient || ui.fRole),
+    count: sessionFilterCount(treeRows.filter((r) => r.isSess).length, totalSessions ?? sessList.length, !!(qq || ui.fClient || ui.fRole)),
+    canMore: !!moreCursor, onMore: call(act.loadMore),
     q: ui.q || "", fClient: ui.fClient || "", fRole: ui.fRole || "",
-    clientOpts: [{ v: "", label: "All clients" }, ...clientSet.map((c) => ({ v: c, label: c }))],
-    roleOpts: [{ v: "", label: "All roles" }, ...roleSet.map((r) => ({ v: r, label: r }))],
+    clientOpts: clientSet.map((c) => ({ v: c === "All" ? "" : c, label: c })),
+    roleGroups: [{ label: "Roles", opts: roleNames.filter((r) => roleSet.includes(r)).map((r) => ({ v: r, label: r })) }, { label: "Direct models", opts: directNames.map((r) => ({ v: r, label: r })) }],
+    loaded: sessList.length, total: totalSessions ?? sessList.length,
+    clear: () => { act.setQ?.(""); act.setClient?.(""); act.setRole?.(""); },
     onQ: (e) => act.setQ?.(e.target.value), onClient: (e) => act.setClient?.(e.target.value), onRole: (e) => act.setRole?.(e.target.value),
   };
 
   // ---------- gantt ----------
   let g = null, sm = null;
-  const det = detail && detail.session ? detail : null;
+  // A detail shows only when its session is still in the filtered list (A16).
+  const visibleSids = new Set(treeRows.filter((r) => r.isSess).map((r) => r.sid));
+  const selShown = !!selId && visibleSids.has(selId);
+  const det = detail && detail.session && detail.session === selId && selShown ? detail : null;
   if (det && (det.agents || []).length) {
     const kidDetails = [];
     const laneList = (det.agents || []).map((a) => ({ s: det, l: a, kid: false }));
-    const allReq = laneList.flatMap((o) => (o.l.requests || []).map((q) => ({ ...q, s: Date.parse(q.ts) }))).filter((q) => Number.isFinite(q.s)).sort((a, b) => a.s - b.s);
+    const allReq = laneList.flatMap((o) => (o.l.requests || []).map((q) => ({ ...q, role: o.l.role, s: Date.parse(q.ts) }))).filter((q) => Number.isFinite(q.s)).sort((a, b) => a.s - b.s);
     const T0 = allReq.length ? allReq[0].s : Date.parse(det.firstTs);
     const T1 = Math.max(allReq.length ? allReq[allReq.length - 1].s + ((allReq[allReq.length - 1].totalMs) || 0) : 0, Date.parse(det.lastTs) || 0, T0);
     const spanS = Math.max(1, T1 - T0);
     const Z = { "15m": 900e3, "1h": 3600e3, "6h": 21600e3, Day: 86400e3 };
     const auto = spanS <= 840e3 ? "15m" : spanS <= 3420e3 ? "1h" : spanS <= 19800e3 ? "6h" : "Day";
     const zoom = ui.zoom || auto, len = Z[zoom];
-    let w0, canPan = false;
-    if (zoom === "Day" || len >= spanS) w0 = Math.max(0, T0 - (len - spanS) / 2);
-    else { canPan = true; w0 = Math.max(T0 - 30e3, T1 + 30e3 - len - (ui.gOff || 0) * len / 2); }
-    const w1 = w0 + len;
-    const L = (x) => ((x - w0) / len * 100);
+    const panEnd = Math.min(now, now - (ui.gOff || 0) * (zoom === "Day" ? len : len / 2));
+    let w0, w1;
+    if (zoom === "Day") { w0 = istDayStart(panEnd); w1 = Math.min(now, w0 + len); }
+    else { w1 = panEnd; w0 = w1 - len; }
+    const canPan = T0 < w0;
+    const windowSpan = Math.max(1, w1 - w0);
+    const rl = (x) => (zoom === "Day" ? dayLabel(x) + " " : "") + hm(x);
+    const L = (x) => ((x - w0) / windowSpan * 100);
     const step = { "15m": 180e3, "1h": 600e3, "6h": 3600e3, Day: 10800e3 }[zoom];
     const ticks = [];
     for (let x = Math.ceil(w0 / step) * step; x < w1; x += step) ticks.push({ l: L(x).toFixed(2) + "%", label: hm(x) });
@@ -206,7 +277,11 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
     const FAIL = "repeating-linear-gradient(135deg,var(--red) 0 2.5px,transparent 2.5px 5px) var(--redbg)";
     const isFoc = (o) => !fo || (fo.sid ? o.s.session === fo.sid && (!fo.role || o.l.role === fo.role) : true);
     const stStyle = (x) => ({ fontSize: 10.5, fontWeight: 600, padding: "1px 6px", borderRadius: 4, background: x[2], color: x[1], whiteSpace: "nowrap" });
-    const pos = (li, q) => { const left = Math.max(0, (q.s - w0) / len * 100); return { top: ((li + 1) * 39 + 2) + "px", left: "min(" + left.toFixed(2) + "%, calc(100% - 300px))" }; };
+    const pos = (li, q) => {
+      const left = Math.max(0, (q.s - w0) / windowSpan * 100), below = (li + 1) * 39 + 2;
+      const top = below + 200 > 18 + laneList.length * 39 ? Math.max(0, li * 39 - 180) : below;
+      return { top: top + "px", left: "min(" + left.toFixed(2) + "%, calc(100% - 296px))" };
+    };
     const lanes = laneList.map((o, li) => {
       const fl = isFoc(o);
       const byModel = {};
@@ -221,10 +296,10 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
         const picked = ui.pick && ui.pick.li === li && ui.pick.ri === ri;
         const okQ = String(q.status ?? "ok") === "ok";
         bars.push({
-          style: { position: "absolute", top: 9, height: 20, left: L(qs).toFixed(3) + "%", width: Math.max(0, L(qs + d) - L(qs)).toFixed(3) + "%", minWidth: 3, padding: 0, borderRadius: 3, boxSizing: "border-box", cursor: "pointer", opacity: dim,
+          style: { position: "absolute", top: 9, height: 20, left: L(qs).toFixed(3) + "%", width: Math.max(0, L(qs + d) - L(qs)).toFixed(3) + "%", minWidth: 8, padding: 0, borderRadius: 3, boxSizing: "border-box", cursor: "pointer", opacity: dim,
             border: okQ ? 0 : "1px solid var(--red)", background: !okQ ? FAIL : mc(q.model),
             outline: picked ? "2px solid var(--tx)" : "none", outlineOffset: 1, zIndex: picked ? 2 : 1 },
-          aria: o.l.role + ", " + q.model + ", " + hms(q.ts) + ", " + (okQ ? fs((q.totalMs || 0) / 1000) : "failed"),
+          aria: o.l.role + " · " + q.model + " · " + hms(q.ts) + " · " + (okQ ? fs((q.totalMs || 0) / 1000) + " · OK" : "failed"),
           hover: () => act.hover?.({ li, ri }), pick: () => act.pick?.({ li, ri }),
         });
       });
@@ -234,7 +309,8 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
     const hovQ = at(ui.hov), pkQ = at(ui.pick);
     const hovO = ui.hov && laneList[ui.hov.li] ? laneList[ui.hov.li] : null;
     const pkO = ui.pick && laneList[ui.pick.li] ? laneList[ui.pick.li] : null;
-    const reqFacts = (q) => [["Start", hms(q.ts) + " IST"], ["TTFT", q.ttftMs == null ? "—" : fs(q.ttftMs / 1000)], ["Total", q.totalMs == null ? "—" : fs(q.totalMs / 1000)], ["Tokens in / out", cnt(q.promptTokens || 0) + " / " + cnt(q.completionTokens || 0)], ["Value", usd(q.value || 0), "var(--violet)"]];
+    const missingLatency = "Not logged before Nov 9";
+    const reqFacts = (q) => [["Start", hms(q.ts) + " IST"], ["TTFT", q.ttftMs == null ? missingLatency : fs(q.ttftMs / 1000)], ["Total", q.totalMs == null ? missingLatency : fs(q.totalMs / 1000)], ["Tokens in / out", cnt(q.promptTokens || 0) + " / " + cnt(q.completionTokens || 0)], ["Value", usd(q.value || 0), "var(--violet)"]];
     const legend = [...new Set(allReq.map((q) => q.model))].map((m) => ({ m, c: mc(m) }));
     const S2 = allReq.reduce((a, q) => ({ req: a.req + 1, v: a.v + (q.value || 0) }), { req: 0, v: 0 });
     const tok2 = allReq.reduce((a, q) => a + (q.promptTokens || 0) + (q.completionTokens || 0), 0);
@@ -242,23 +318,24 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
     const liveDet = Number.isFinite(Date.parse(det.lastTs)) && now - Date.parse(det.lastTs) < 5 * 60 * 1000;
     g = {
       lanes, ticks, gaps: gapsV, legend,
-      window: hm(w0) + " – " + hm(w1) + " IST · " + zoom + " view",
+      window: (zoom === "Day" ? dayLabel(w0) + " " + hm(w0) + " – " + (dayLabel(w1) === dayLabel(w0) ? "" : dayLabel(w1) + " ") + hm(w1) : hm(w0) + " – " + hm(w1)) + " IST · " + zoom + " view",
+      requests: allReq.slice().reverse().map((q) => ({ time: hms(q.ts), role: q.role || "", model: q.model || "Unknown", ttft: q.ttftMs == null ? "Not recorded" : fs(q.ttftMs / 1000), total: q.totalMs == null ? "Not recorded" : fs(q.totalMs / 1000), tokens: cnt((q.promptTokens || 0) + (q.completionTokens || 0)), value: usd(q.value || 0), status: statusOf(q)[0], statusStyle: stStyle(statusOf(q)) })),
       now: liveDet && now >= w0 && now <= w1, nowL: L(now).toFixed(2) + "%",
       zooms: ["15m", "1h", "6h", "Day"].map((k) => ({ label: k, on2: zoom === k, style: seg(zoom === k), on: () => act.zoom?.(k) })),
-      noPrev: !canPan, noNext: !canPan || !(ui.gOff > 0),
+      noPrev: !canPan, noNext: w1 >= now,
       prev: () => act.pan?.(1), next: () => act.pan?.(-1),
       prevStyle: { width: 28, height: 28, border: "1px solid var(--line2)", borderRadius: 7, background: "var(--card)", color: "var(--tx2)", cursor: "pointer", fontFamily: "'Material Symbols Outlined'", fontSize: 18, opacity: !canPan ? 0.4 : 1 },
       nextStyle: { width: 28, height: 28, border: "1px solid var(--line2)", borderRadius: 7, background: "var(--card)", color: "var(--tx2)", cursor: "pointer", fontFamily: "'Material Symbols Outlined'", fontSize: 18, opacity: !canPan || !(ui.gOff > 0) ? 0.4 : 1 },
       hov: hovQ ? { ...pos(ui.hov.li, { ...hovQ, s: Date.parse(hovQ.ts) }), model: hovQ.model, prov: prov(hovQ.model) + " · " + hovO.l.role, status: statusOf(hovQ)[0], stStyle: stStyle(statusOf(hovQ)), facts: reqFacts(hovQ).map((f) => ({ l: f[0], v: f[1], c: f[2] || "var(--tx)" })) } : null,
       pick: pkQ ? { ...pos(ui.pick.li, { ...pkQ, s: Date.parse(pkQ.ts) }), model: pkQ.model, status: statusOf(pkQ)[0], stStyle: stStyle(statusOf(pkQ)), rid: "r·" + pkO.s.session + "·" + String(ui.pick.ri + 1).padStart(4, "0"),
-        facts: [["Provider", prov(pkQ.model)], ["Role", pkO.l.role + (pkQ.combo ? " · " + pkQ.combo : "")], ["Session", "s·" + pkO.s.session, 0, "mono"], ["Started", hms(pkQ.ts) + " IST"], ["TTFT", pkQ.ttftMs == null ? "—" : fs(pkQ.ttftMs / 1000)], ["Total", pkQ.totalMs == null ? "—" : fs(pkQ.totalMs / 1000)], ["Tokens in", cnt(pkQ.promptTokens || 0)], ["Tokens out", cnt(pkQ.completionTokens || 0)], ["Value", usd(pkQ.value || 0), "var(--violet)"], ["Real spend", "—", "var(--tx3)"]]
+        facts: [["Provider", prov(pkQ.model)], ["Role", pkO.l.role + (pkQ.combo ? " · " + pkQ.combo : "")], ["Session", "s·" + pkO.s.session, 0, "mono"], ["Started", hms(pkQ.ts) + " IST"], ["TTFT", pkQ.ttftMs == null ? missingLatency : fs(pkQ.ttftMs / 1000)], ["Total", pkQ.totalMs == null ? missingLatency : fs(pkQ.totalMs / 1000)], ["Tokens in", cnt(pkQ.promptTokens || 0)], ["Tokens out", cnt(pkQ.completionTokens || 0)], ["Value", usd(pkQ.value || 0), "var(--violet)"], ["Real spend", "Not recorded", "var(--tx3)"]]
           .map((f) => ({ l: f[0], v: f[1], c: f[2] || "var(--tx)", ff: f[3] === "mono" ? "var(--mono)" : "inherit" })) } : null,
-      note: "Bars coloured by model. Hover for timing, click for request metadata. Latency shows — for rows logged before Nov 9.",
+      note: "Bars coloured by model. Hover for timing, click for request metadata. No latency samples were logged before Nov 9.",
     };
     sm = {
       id: "s·" + det.session, client: det.client || "Unknown", live: liveDet,
       when: (Number.isFinite(Date.parse(det.firstTs)) ? dayLabel(det.firstTs) + ", " + hm(det.firstTs) : "") + " – " + (liveDet ? "now" : (Number.isFinite(Date.parse(det.lastTs)) ? hm(det.lastTs) : "")) + " IST",
-      route: call(act.openDrawer, det.session),
+      route: call(act.openRouting, det.session), details: call(act.openDetails, det.session),
       stats: [["Duration", durF(spanS), liveDet ? "still running" : "ended"], ["Agents", String(laneList.length), laneList.length > 1 ? (laneList.length - 1) + " subagents" : "main only"], ["Requests", S2.req.toLocaleString("en-US"), err2 + " failed"], ["Tokens", cnt(tok2), "in + out"], ["Value", usd(S2.v), "list price", "var(--violet)"], ["Success", (S2.req ? (100 - err2 / S2.req * 100) : 100).toFixed(1) + "%", "of finished requests", err2 / Math.max(1, S2.req) > 0.05 ? "var(--red)" : "var(--tx)"]]
         .map((x) => ({ l: x[0], v: x[1], s: x[2], c: x[3] || "var(--tx)" })), models: legend,
     };
@@ -268,16 +345,29 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
   const byRole = analytics?.byRole || [];
   const modelByRole = analytics?.modelByRole || [];
   const orderRoles = [...ROLE_ORDER.filter((r) => byRole.some((x) => x.role === r)), ...byRole.map((x) => x.role).filter((r) => !ROLE_ORDER.includes(r))];
-  const TR = byRole.reduce((a, x) => a + (x.requests || 0), 0) || 1;
+  const totalRequests = analytics?.totalRequests ?? byRole.reduce((a, x) => a + (x.requests || 0), 0);
+  const sessionRequests = analytics?.sessionRequests ?? totalRequests;
+  const TR = totalRequests || 1;
   const TT = byRole.reduce((a, x) => a + (x.tokens || 0), 0) || 1;
   const TV = byRole.reduce((a, x) => a + (x.value || 0), 0) || 1;
   const p1 = (x) => (x * 100 < 1 && x > 0 ? "<1" : (x * 100).toFixed(0)) + "%";
   const BAR = { main: "var(--tx2)", implementer: "var(--violet)", scout: "var(--blue)", reviewer: "var(--green)", thinker: "var(--amber)", background: "var(--mbar)" };
   const barC = (r) => BAR[r] || "var(--mbar)";
-  const share = [["Requests", "requests", TR, cnt(TR), "var(--tx)"], ["Tokens", "tokens", TT, cnt(TT), "var(--tx)"], ["Value", "value", TV, usd(TV), "var(--violet)"]].map(([label, k, tot, total, c]) => ({ label, total, c,
-    aria: label + " by role: " + orderRoles.map((r) => { const x = byRole.find((y) => y.role === r); return r + " " + p1((x?.[k] || 0) / tot); }).join(", "),
-    segs: orderRoles.map((r) => { const x = byRole.find((y) => y.role === r); return { f: (((x?.[k] || 0) / tot) * 1000).toFixed(0), c: barC(r), t: r + " · " + p1((x?.[k] || 0) / tot) }; }).filter((s) => +s.f > 0) }));
-  const legendR = orderRoles.map((r) => { const x = byRole.find((y) => y.role === r) || {}; return { role: r, chip: chip(r), c: barC(r), req: p1((x.requests || 0) / TR), tok: p1((x.tokens || 0) / TT), val: p1((x.value || 0) / TV) }; });
+  const directRows = modelByRole.filter((m) => m.role === "direct").sort((a, b) => (b.requests || 0) - (a.requests || 0));
+  const roleShares = (key) => byRole.filter((x) => x.role !== "direct").map((x) => ({ name: x.role, amount: x[key] || 0, color: barC(x.role), role: x.role }));
+  const directShares = (key) => directRows.map((x) => ({ name: x.model || "Unknown", amount: x[key] || 0, color: mc(x.model), model: x.model || "Unknown" }));
+  const share = [["Requests", "requests", TR, cnt(TR), "var(--tx)"], ["Tokens", "tokens", TT, cnt(TT), "var(--tx)"], ["Value", "value", TV, usd(TV), "var(--violet)"]].map(([label, k, tot, total, c]) => {
+    const directKey = k === "requests" ? "requests" : k;
+    const items = [...roleShares(k), ...directShares(directKey)];
+    const aria = [...orderRoles.filter((r) => r !== "direct").map((r) => { const x = byRole.find((y) => y.role === r); return r + " " + p1((x?.[k] || 0) / tot); }), ...directRows.map((x) => `${x.model || "Unknown"} ${p1((x[directKey] || 0) / tot)}`)];
+    const raw = items.map((x) => ({ ...x, share: (x.amount || 0) / tot }));
+    const visible = raw.filter((x) => x.share >= 0.01);
+    const other = raw.filter((x) => x.share < 0.01).reduce((a, x) => a + x.share, 0);
+    if (other > 0) visible.push({ name: "Other", share: other, color: "var(--line2)" });
+    return { label, total, c, aria: label + " by role and direct model: " + aria.join(", "), segs: (() => { const pct = roundShares(visible.map((x) => x.share)); return visible.map((x, i) => ({ f: (x.share * 1000).toFixed(2), c: x.color, t: x.name + " · " + (pct[i] === 0 && x.share > 0 ? "<1" : pct[i]) + "%" })); })() };
+  });
+  const legendR = orderRoles.filter((r) => r !== "direct").map((r) => { const x = byRole.find((y) => y.role === r) || {}; return { role: r, chip: chip(r), c: barC(r), req: p1((x.requests || 0) / TR), tok: p1((x.tokens || 0) / TT), val: p1((x.value || 0) / TV) }; });
+  const legendDirect = directRows.map((x) => ({ model: x.model || "Unknown", c: mc(x.model), req: p1((x.requests || 0) / TR), tok: p1((x.tokens || 0) / TT), val: p1((x.value || 0) / TV) }));
   const deleg = analytics ? analytics.delegationRate : null;
   const cps = analytics ? analytics.childrenPerSession : null;
   const bgReq = (byRole.find((x) => x.role === "background")?.requests || 0) / TR;
@@ -298,7 +388,7 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
     rows.forEach((m) => {
       const sc = (m.successRate ?? 1) * 100;
       const sC = sc >= 98 ? "var(--green)" : sc >= 95 ? "var(--amber)" : "var(--red)";
-      roRows.push({ head: false, row: true, model: m.model || "unknown", mc: mc(m.model), prov: prov(m.model), req: cnt(m.requests || 0),
+      roRows.push({ head: false, row: true, model: m.model || "unknown", mc: mc(m.model), prov: prov(m.model), req: cnt(m.requests || 0), noSamples: !(m.samples > 0), configError: m.model === "invalid",
         tps: m.tpsP50 != null ? String(Math.round(m.tpsP50)) : "—", tpsW: ((m.tpsP50 || 0) / maxTps * 100).toFixed(0) + "%",
         ttft: m.ttftP50 != null ? (m.ttftP50 / 1000).toFixed(1) + " s" : "—",
         lat: (m.totalP50 != null ? (m.totalP50 / 1000).toFixed(1) : "—") + " / " + (m.totalP95 != null ? (m.totalP95 / 1000).toFixed(1) : "—") + " s",
@@ -307,7 +397,7 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
         samples: cnt(m.samples || 0), fast: fast && m.model === fast.model, rel: rel && m.model === rel.model });
     });
   });
-  const ro = { share, legend: legendR, cards: roCards, rows: roRows,
+  const ro = { share, totalRequests: cnt(totalRequests), sessionRequests: cnt(sessionRequests), legend: legendR, legendDirect, cards: roCards, rows: roRows,
     fastChip: { display: "inline-flex", alignItems: "center", gap: 2, fontSize: 10.5, fontWeight: 600, padding: "0 6px", height: 18, borderRadius: 4, background: "var(--bluebg)", color: "var(--chipscout)", whiteSpace: "nowrap", flex: "none" },
     relChip: { display: "inline-flex", alignItems: "center", gap: 2, fontSize: 10.5, fontWeight: 600, padding: "0 6px", height: 18, borderRadius: 4, background: "var(--greenbg)", color: "var(--chiprev)", whiteSpace: "nowrap", flex: "none" },
     note: "TPS = output tokens per second after the first token. Value per request at API list price (estimate). Samples = requests with latency logged; rows logged before Nov 9 show —. thinker is fusion: every member answers each call." };
@@ -315,19 +405,21 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
   // ---------- tools ----------
   const toolRole = ui.toolRole || "";
   const toolData = tools?.tools || [];
-  const toolRoles = [...new Set(toolData.flatMap((t) => (t.byRole || []).map((r) => r.role)))].sort((a, b) => {
+  const toolRoles = [...new Set(toolData.flatMap((t) => (t.byRole || []).map((r) => r.role)).filter((r) => r !== "direct"))].sort((a, b) => {
     const ai = ROLE_ORDER.indexOf(a), bi = ROLE_ORDER.indexOf(b);
     return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi) || a.localeCompare(b);
   });
+  const toolModels = [...new Set(toolData.flatMap((t) => (t.byRole || []).filter((r) => r.role === "direct").map((r) => r.model).filter(Boolean)))].sort();
   const toolRows = toolData.map((t) => {
-    const roles = (t.byRole || []).filter((r) => !toolRole || r.role === toolRole);
+    const roles = (t.byRole || []).filter((r) => !toolRole || r.role === toolRole || (r.role === "direct" && r.model === toolRole));
     const calls = toolRole ? roles.reduce((n, r) => n + r.calls, 0) : t.calls;
     const errors = toolRole ? roles.reduce((n, r) => n + r.errors, 0) : t.errors;
     return { name: t.name, calls, errors, pct: (calls ? errors / calls * 100 : 0).toFixed(1) + "%",
-      topModel: t.topModel?.model || "—", split: roles.map((r) => ({ role: r.role, calls: r.calls, c: barC(r.role), f: calls ? r.calls / calls * 100 : 0 })) };
+      topModel: t.topModel?.model || "—", split: roles.map((r) => ({ role: r.role, model: r.model, label: r.role === "direct" ? r.model || "Direct model" : r.role, calls: r.calls, c: r.role === "direct" ? mc(r.model || t.topModel?.model) : barC(r.role), f: calls ? r.calls / calls * 100 : 0 })) };
   }).filter((t) => t.calls > 0).sort((a, b) => b.calls - a.calls);
   const tl = { rows: toolRows, none: toolRows.length === 0, hasData: toolData.length > 0, emptyTitle: "Tool tracking started Nov 9, 2026",
-    roleBtns: ["", ...toolRoles].map((role) => ({ label: role || "All", on2: role === toolRole, style: seg(role === toolRole), on: call(act.setToolRole, role) })),
+    roleBtns: ["", ...toolRoles].map((role) => ({ label: role || "All", on2: role === toolRole, style: seg(role === toolRole), on: call(act.setToolRole, role) })), directModelBtns: toolModels.map((model) => ({ label: model, on2: model === toolRole, style: seg(model === toolRole), on: call(act.setToolRole, model) })),
+    legend: toolRoles.map((role) => ({ role, c: barC(role) })), directLegend: toolModels.map((model) => ({ model, c: mc(model) })),
     perRole: (tools?.topToolsByRole || []).map((r) => ({ role: r.role, chip: chip(r.role), c: barC(r.role), items: (r.tools || []).map((t) => ({ ...t, w: ((t.calls / (r.tools[0]?.calls || 1)) * 100).toFixed(0) + "%" })) })),
     sampleNote: tools?.sampled ? `Sampled ${cnt(tools.sampled.rows)} rows (limit ${cnt(tools.sampled.cap)}).${tools.truncated ? " Results are truncated." : ""}` : tools?.truncated ? "Results are truncated." : "",
     note: "Calls counted per tool use. Errors are tool results marked as errors." };
@@ -340,7 +432,7 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
   v.staleText = tab === "live" ? "Live data may be out of date. Retrying every 2 s." : "Data may be out of date. Requests after the last refresh are not included yet.";
   if (ok) {
     if (tab === "live") v.live = mode === "stale" || liveCards.length > 0;
-    else if (tab === "sessions") v.sess = sessList.length > 0;
+    else if (tab === "sessions") v.sess = true;
     else if (tab === "roles") v.roles = byRole.length > 0;
     else if (tab === "tools") v.tools = false;
   }
@@ -371,40 +463,86 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
   let dr = null;
   const dId = ui.drawer;
   const dLive = dId && liveSessions.find((s) => s.session === dId);
-  const dDet = dId && det && det.session === dId ? det : null;
+  const dDet = dId ? (detailsBySession[dId] || (detail?.session === dId ? detail : det && det.session === dId ? det : null)) : null;
+  const drawerSession = dId && sessList.find((s) => s.session === dId);
   const dRoles = dLive ? (dLive.roles || []) : dDet ? (dDet.agents || []).map((a) => ({ role: a.role, model: latestModel(a) })) : [];
-  if (dId && dRoles.length) {
+  const drawerDetail = dDet;
+  let dd = null;
+  if (dId && ui.drawerMode === "details") {
+    const reqs = (drawerDetail?.agents || []).flatMap((a) => (a.requests || []).map((q) => ({ ...q, role: a.role })));
+    const roleTokenTotal = reqs.reduce((n, q) => n + (q.promptTokens || 0) + (q.completionTokens || 0), 0);
+    const tokens = drawerSession?.tokens;
+    const value = drawerSession?.value;
+    const errors = drawerSession?.errors || 0;
+    const requestCount = drawerSession?.requests;
+    const sampled = !!drawerDetail?.truncated;
+    const byRole = drawerDetail ? (drawerDetail.agents || []).flatMap((a) => {
+      const models = new Map();
+      (a.requests || []).forEach((q) => {
+        const model = q.model || "Unknown"; if (!models.has(model)) models.set(model, []); models.get(model).push(q);
+      });
+        return [...models].map(([model, qs]) => {
+        const tok = qs.reduce((n, q) => n + (q.promptTokens || 0) + (q.completionTokens || 0), 0), val = qs.reduce((n, q) => n + (q.value || 0), 0);
+        return { role: a.role, chip: chip(a.role), model, requests: qs.length, tokens: cnt(tok), value: usd(val), share: roleTokenTotal ? tok / roleTokenTotal * 100 : 0, color: barC(a.role) };
+      });
+    }) : (drawerSession?.roles || []).flatMap((a) => (a.models || []).map((m) => ({ role: a.role, chip: chip(a.role), model: m.model || "Unknown", requests: m.requests || 0, tokens: cnt(m.tokens || 0), value: usd(m.value || 0), share: tokens ? (m.tokens || 0) / tokens * 100 : 0, color: barC(a.role) })));
+    const firstTs = drawerDetail?.firstTs || drawerSession?.firstTs, lastTs = drawerDetail?.lastTs || drawerSession?.lastTs;
+    const first = Date.parse(firstTs), last = Date.parse(lastTs);
+    const success = Number.isFinite(requestCount) && requestCount ? ((requestCount - errors) / requestCount * 100).toFixed(1) + "%" : "Not recorded";
+    dd = { sid: "s·" + dId, title: "s·" + dId, client: drawerDetail?.client || drawerSession?.client || dLive?.client || "Unknown", firstTs, lastTs,
+      facts: [["Thread title", "Not recorded"], ["Project", "Not recorded"], ["Directory", "Not recorded"], ["Device", "Not recorded"], ["Client", drawerDetail?.client || drawerSession?.client || dLive?.client || "Not recorded"], ["Client version", drawerDetail?.clientVersion || versionFromUA(drawerDetail?.ua || drawerDetail?.userAgent) || "Not recorded"], ["Started", Number.isFinite(first) ? dayLabel(first) + ", " + hm(first) + " IST" : "Not recorded"], ["Duration", Number.isFinite(first) && Number.isFinite(last) ? durF(last - first) : "Not recorded"], ["Parent", drawerSession?.parent ? "s·" + (drawerSession.parent.session || drawerSession.parent) + (drawerSession.parent.parentGuessed ? " · likely" : "") : "None"]],
+      stats: [["Requests", Number.isFinite(requestCount) ? requestCount.toLocaleString("en-US") : "Not recorded", errors ? errors + " failed" : ""], ["Tokens", Number.isFinite(tokens) ? cnt(tokens) : "Not recorded", "in + out"], ["Value", Number.isFinite(value) ? usd(value) : "Not recorded", "estimate"], ["Real spend", "Not recorded", ""], ["Success", success, "of finished requests"]],
+      roles: byRole, roleSampled: sampled, tools: drawerDetail?.toolCalls || drawerDetail?.tools || [], hasData: !!drawerDetail || (detailLoad.sid === dId && detailLoad.status === "error"), parentSession: drawerSession?.parent?.session || drawerSession?.parent || null, parentGuessed: !!drawerSession?.parent?.parentGuessed,
+      openParent: () => drawerSession?.parent && act.openDetails?.(drawerSession.parent.session || drawerSession.parent), route: () => act.openRouting?.(dId), close: () => act.openDrawer?.(null), copy: () => act.copySession?.(dId),
+      w: vw <= 600 ? "100vw" : "480px" };
+  }
+  if (dId && (dRoles.length || ui.drawerMode === "details")) {
     const sessionOverrides = overrides || [];
     const isCodex = (dLive?.client || dDet?.client) === "Codex";
-    const modelId = (m) => typeof m === "string" ? m : m?.fullModel || m?.routedModel || m?.id || m?.model || "";
-    const available = models.map(modelId).filter(Boolean).filter((m) => !isCodex || /^(openai\/|gpt-|codex)/i.test(m));
+    const modelId = modelIdOf;
+    const available = models.filter(isChatEntry).map(modelId).filter(Boolean).filter((m) => !isCodex || /^(openai\/|gpt-|codex)/i.test(m));
     const changed = [];
     dr = {
-      sid: "s·" + dId, client: (dLive?.client || dDet?.client) || "Unknown", started: dLive && Number.isFinite(Date.parse(dLive.lastTs)) ? hm(dLive.lastTs) : (dDet ? dayLabel(dDet.firstTs) + " " + hm(dDet.firstTs) : "—"),
-      aria: "Change routing for s·" + dId, w: vw < 900 ? "100vw" : "520px",
+      sid: "s·" + dId, client: (dLive?.client || dDet?.client || drawerSession?.client) || "Unknown", started: dLive && Number.isFinite(Date.parse(dLive.firstTs || dLive.lastTs)) ? hm(dLive.firstTs || dLive.lastTs) : (dDet ? dayLabel(dDet.firstTs) + " " + hm(dDet.firstTs) : drawerSession ? dayLabel(drawerSession.firstTs) + " " + hm(drawerSession.firstTs) : "Not recorded"),
+      isCodex, aria: "Change routing for s·" + dId, w: vw <= 600 ? "100vw" : "480px", conflict: ui.conflict || null, reload: async () => { await act.reloadRouting?.(dId); await act.reloadSession?.(dId); },
       rows: dRoles.map((r) => {
-        const role = r.role, current = r.model || "unknown", entry = sessionOverrides.find((e) => e.combo === role), locked = role === "thinker" || role === "background";
+        const role = r.role, entry = sessionOverrides.find((e) => e.combo === role), current = entry?.status === "active" ? entry.model : r.model || "unknown", locked = role === "thinker" || role === "background";
         const edit = draft[role] || {};
         const members = combos.find((c) => c.name === role)?.models || [current];
         const memberIds = members.map(modelId).filter(Boolean);
         const otherKey = "__other__";
-        const selected = edit.sel ?? (memberIds.includes(entry?.model) ? entry.model : entry ? otherKey : memberIds.includes(current) ? current : otherKey);
-        const target = selected === otherKey ? edit.other || entry?.model || available[0] || "" : selected;
+        // Start from the model the session really uses, matched by resolved ID. No default is preselected for "Other".
+        const currentMember = memberIds.find((m) => baseMatch(m, current));
+        const entryMember = entry?.model ? memberIds.find((m) => baseMatch(m, entry.model)) : undefined;
+        const selected = edit.sel ?? (entryMember ?? (entry ? otherKey : currentMember ?? otherKey));
+        const target = selected === otherKey ? edit.other || entry?.model || current : selected;
+        const differs = !!target && !baseMatch(target, current);
         const modeValue = edit.mode || (entry?.mode === "override" ? "override" : "member");
         const expiry = edit.expiry || (entry?.expiry === "1h" || entry?.expiry === "2h" ? entry.expiry : "Session end");
         const expiryValue = expiry === "Session end" ? "session" : expiry;
         const currentExpiry = entry?.expiry || "session";
-        const dirty = !locked && !!target && (target !== current || modeValue !== (entry?.mode || "member") || expiryValue !== currentExpiry);
-        if (dirty) changed.push({ role, from: current, to: target, mode: modeValue, expiry });
-        const options = [...new Set([...memberIds, ...(memberIds.includes(current) ? [] : [current]), otherKey])].map((id) => ({ v: id, label: id === otherKey ? "Other model…" : id === current ? id + "  (current)" : id }));
-        const otherOpts = [...new Set([...available, ...(entry?.model && !available.includes(entry.model) ? [entry.model] : [])])].map((id) => ({ v: id, label: id }));
+        const dirty = !locked && !!target && (differs || modeValue !== (entry?.mode || "member") || expiryValue !== currentExpiry);
+        if (dirty) changed.push({ role, from: current, expectedCurrent: current, to: target, mode: modeValue, expiry, warn: differs && /opus|fable/i.test(target) && !/opus|fable/i.test(current) });
+        const options = [...new Set([...memberIds, ...(currentMember ? [] : [current]), otherKey])].map((id) => ({ v: id, label: id === otherKey ? "Other model…" : baseMatch(id, current) ? id + "  (current)" : id }));
+        // "Other model…" list: chat models only, grouped by provider, filtered by the search text.
+        const q = (edit.q || "").trim().toLowerCase();
+        const pool = [...new Set([...memberIds, current, ...available, ...(entry?.model ? [entry.model] : [])])].filter((id) => !isCodex || /^(openai\/|gpt-|codex)/i.test(id)).filter((id) => !q || id.toLowerCase().includes(q));
+        const otherOpts = pool.map((id) => ({ v: id, label: id, current: baseMatch(id, current), expensive: /opus|fable/i.test(id) }));
+        const groupMap = new Map();
+        pool.filter((id) => !memberIds.some((m) => baseMatch(m, id))).forEach((id) => {
+          const provider = id.includes("/") ? id.split("/")[0] : /claude/i.test(id) ? "cc" : /^(gpt-|codex)/i.test(id) ? "cx" : /gemini/i.test(id) ? "ag" : "other";
+          const label = ({ cc: "Claude Code", cx: "OpenAI Codex", ag: "Antigravity", ocg: "OpenCode Go", muse: "Muse", openrouter: "OpenRouter", deepseek: "DeepSeek", ocf: "OpenCode Free", ollama: "Ollama", other: "Other" })[provider] || provider;
+          if (!groupMap.has(label)) groupMap.set(label, []); groupMap.get(label).push({ v: id, label: id, current: baseMatch(id, current), expensive: /opus|fable/i.test(id) });
+        });
+        const otherGroups = [{ label: "Combo members", opts: memberIds.filter((m) => !q || m.toLowerCase().includes(q)).map((id) => ({ v: id, label: id, current: baseMatch(id, current), expensive: /opus|fable/i.test(id) })) }, ...[...groupMap].map(([label, opts]) => ({ label, opts }))].filter((g) => g.opts.length);
         const status = entry ? entry.status === "pending" ? "Pending · next request" : "Active · until " + (entry.expiry === "1h" ? "1 hour" : entry.expiry === "2h" ? "2 hours" : "session end") : "";
         return { role, chip: chip(role), cur: entry?.status === "active" ? entry.model : current, locked,
         lockText: role === "thinker" ? "thinker is fusion and cannot be overridden." : "Not routed by a combo. Fixed to claude-haiku-5-5 by Claude Code.",
         editable: !locked, status, statusStyle: { fontSize: 10.5, fontWeight: 600, padding: "1px 7px", borderRadius: 5, background: entry?.status === "pending" ? "var(--amberbg)" : "var(--greenbg)", color: entry?.status === "pending" ? "var(--amber)" : "var(--green)" }, canRevert: !!entry, revert: () => act.revertOverride?.(dId, role, revisions[role] ?? revisions[entry?.combo] ?? entry?.revision, entry),
-        rowStyle: { display: "flex", flexDirection: "column", gap: 10, padding: "14px 0", borderTop: "1px solid var(--line)" },
-        sel: selected, opts: options, onSel: (e) => setDraft({ [role]: { ...edit, sel: e.target.value } }), isOther: selected === otherKey, other: edit.other || entry?.model || available[0] || "", otherOpts, onOther: (e) => setDraft({ [role]: { ...edit, other: e.target.value } }),
-        warn: /opus|fable/i.test(target) ? "This model can cost much more per request. Confirm before applying." : "",
+        rowStyle: { display: "flex", flexDirection: "column", gap: 8, padding: "12px 0", borderTop: "1px solid var(--line)" },
+        sel: selected, opts: options, onSel: (e) => setDraft({ [role]: { ...edit, sel: e.target.value } }), isOther: selected === otherKey, other: target, otherOpts, otherGroups, otherQ: edit.q || "", query: edit.q ?? target, popup: !!edit.open, onQ: (e) => setDraft({ [role]: { ...edit, q: e.target.value, open: true } }), onOpen: (open) => setDraft({ [role]: { ...edit, open } }), onChoose: (id) => setDraft({ [role]: { ...edit, sel: id, other: id, q: "", open: false } }),
+        dirty, from: current, to: target,
+        warn: dirty && differs && /opus|fable/i.test(target) && !/opus|fable/i.test(current) ? target + " can cost much more per request than " + current + "." : "",
         modeAria: "Mode for " + role, modes: ["member", "override"].map((m) => ({ label: m === "member" ? "Combo member" : "Override", on2: modeValue === m, tip: m === "member" ? "Use this model as the combo member for this session." : "Route this role directly to this model.", style: seg(modeValue === m), on: () => setDraft({ [role]: { ...edit, mode: m } }) })), strict: modeValue === "override", expiry, onExp: (e) => setDraft({ [role]: { ...edit, expiry: e.target.value } }) };
       }),
       audit: [], noAudit: true,
@@ -419,12 +557,12 @@ export function buildView({ live, sessions, totalSessions, detail, analytics, to
     status, tabs, fresh, paused: !!ui.paused, togglePause: () => act.pause?.(),
     isLiveTab: tab === "live", notLiveTab: tab !== "live", isSessTab: tab === "sessions", isTableTab: tab === "roles" || tab === "tools",
     preset, customLabel: range?.label || "", rangeTitle,
-    v, live: { kpis, cards: liveCards }, tree, g, sm, ro, dl: null,
+    v, live: { kpis, cards: liveCards }, tree, g, sm, noSelText: selId && !selShown ? "The selected session is hidden by the filters." : selShown ? "Loading session…" : "Select a session to see its timeline.", ro, dl: null,
     dlNote: "Per-day delegation history is not available from /api/agents/analytics yet.",
     tl, liveWide: vw >= 900, liveNarrow: vw < 900,
-    lay: vw >= 1180 ? { tf: "0 0 calc(44% - 8px)", tmax: "calc(44% - 8px)", rf: "1 1 0" } : { tf: "1 1 100%", tmax: "100%", rf: "1 1 100%" },
+    lay: vw >= 1180 ? { tf: "380px", tmax: "380px", rf: "1fr" } : vw >= 900 ? { tf: "320px", tmax: "320px", rf: "1fr" } : { tf: "1fr", tmax: "100%", rf: "1fr" },
     unhover: () => act.hover?.(null), closePick: () => act.pick?.(null),
-    dr, closeDrawer: () => act.openDrawer?.(null), cm: cf && dr ? { title: "Apply routing changes to " + dr.sid + "?", lines: dr.changes.map((c) => ({ ...c, chip: chip(c.role), from: short(c.from), to: short(c.to), exp: c.expiry, mode: c.mode })) } : null, cancelCf: () => setCf(false), doCf: () => { setCf(false); act.applyOverrides?.(dId, dr?.changes || []); },
+    dr, dd, closeDrawer: () => act.openDrawer?.(null), cm: cf && dr ? { title: "Apply routing changes to " + dr.sid + "?", lines: dr.changes.map((c) => ({ ...c, chip: chip(c.role), from: short(c.from), to: short(c.to), exp: c.expiry, mode: c.mode })) } : null, cancelCf: () => setCf(false), doCf: () => { setCf(false); act.applyOverrides?.(dId, dr?.changes || []); },
     toast, closeToast: () => setToast(null),
     retry: () => act.retry?.(),
     skel2: [{}, {}], skel4: sk([180, 220, 160, 200]), skel6: sk([140, 120, 160, 130, 150, 110]), skel8: sk([120, 70, 90, 80, 130, 70, 100, 90], [0, 22, 40, 40, 0, 22, 0, 0]),

@@ -26,7 +26,8 @@ export function sessionMatchSql(has) {
 }
 
 export function statusSql() {
-  return "COALESCE(NULLIF(json_extract(meta,'$.status'),''), NULLIF(status,''), 'ok')";
+  return `CASE WHEN COALESCE(NULLIF(json_extract(meta,'$.status'),''), NULLIF(status,''), 'ok') IN ('ok','success')
+    THEN 'ok' ELSE COALESCE(NULLIF(json_extract(meta,'$.status'),''), NULLIF(status,''), 'ok') END`;
 }
 
 export function roleSql() {

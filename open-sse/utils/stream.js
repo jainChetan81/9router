@@ -62,7 +62,9 @@ function hasResponsesToken(parsed, eventName) {
 }
 
 function hasGeminiToken(parsed) {
-  return (parsed?.candidates || []).some((candidate) =>
+  // Antigravity and Gemini CLI wrap each chunk as { response: { candidates } }.
+  const body = parsed?.response && !parsed?.candidates ? parsed.response : parsed;
+  return (body?.candidates || []).some((candidate) =>
     (candidate?.content?.parts || []).some((part) =>
       hasNonEmptyText(part?.text) ||
       hasNonEmptyText(part?.functionCall?.name) ||

@@ -3,11 +3,13 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import RangeBar from "./RangeBar";
+import PageHeader from "./PageHeader";
 import QuotaRunway from "./QuotaRunway";
 import BreakdownDrill from "./BreakdownDrill";
 import RoutingMap from "./RoutingMap";
 import { buildView } from "./view";
 import "./spend.css";
+import "./shared-page.css";
 
 async function getJson(url, opts) {
   const res = await fetch(url, { cache: "no-store", ...opts });
@@ -89,6 +91,7 @@ export default function SpendClient() {
 
   const saveFees = useCallback(async () => {
     const draft = ui.draft || {};
+    if (!feesValid(draft)) return;
     try {
       const { fees } = await getJson("/api/spend", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ fees: draft }) });
       setData((d) => ({ ...d, fees }));
@@ -120,13 +123,15 @@ export default function SpendClient() {
     <div data-r9={theme} style={{ display: "flex", flexDirection: "column", minHeight: minH, backgroundColor: "var(--bg)", backgroundImage: "linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px)", backgroundSize: "44px 44px", color: "var(--tx)", fontFamily: "system-ui,-apple-system,'Segoe UI',sans-serif", fontSize: "13px", lineHeight: "1.4" }}>
       <div style={{ display: "flex", alignItems: "stretch", flex: "1" }}>
       <main style={{ flex: "1", minWidth: "0", display: "flex", flexDirection: "column" }}>
+        <PageHeader title="Spend" subtitle="Track real spend, subscription value, and usage." icon="payments" />
         {(s.range) && (<>
-          <div style={{ position: "sticky", top: "0", zIndex: "30", display: "flex", justifyContent: "space-between", alignItems: "center", gap: "12px", flexWrap: "wrap", padding: "10px 32px", background: "var(--bg)", borderBottom: "1px solid var(--line)" }}>
+          <div className="r9-spend-range" style={{ position: "sticky", top: "0", zIndex: "30", display: "flex", justifyContent: "space-between", alignItems: "center", gap: "12px", flexWrap: "wrap", padding: "8px 24px", background: "var(--bg)", borderBottom: "1px solid var(--line)" }}>
             <div style={{ display: "flex", alignItems: "baseline", gap: "8px" }}><span style={{ fontWeight: "600" }}>{rangeTitle}</span><span style={{ color: "var(--tx3)", fontSize: "12px" }}>{rangeSub}</span></div>
             <RangeBar preset={preset} customLabel={customLabel} onChange={onRange} today={todayKey} />
+            <span style={{ fontSize: 11, color: "var(--tx2)", display: "flex", alignItems: "center", gap: 4 }}><span className="material-symbols-outlined" style={{ fontSize: 14 }}>schedule</span>Times in IST (UTC+5:30) · Real spend logging began Nov 9</span>
           </div>
         </>)}
-        <div style={{ display: "flex", flexDirection: "column", gap: "16px", padding: "16px 32px 48px" }}>
+        <div className="r9-spend-content" style={{ display: "flex", flexDirection: "column", gap: "16px", padding: "16px 32px 48px" }}>
 
           {(isLoading) && (<>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(240px,1fr))", gap: "16px" }}>
@@ -258,14 +263,14 @@ export default function SpendClient() {
             {(s.subvalue) && (<>
               <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: "12px", boxShadow: "var(--shadow)", padding: "16px 18px", display: "flex", flexDirection: "column", gap: "4px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", paddingBottom: "8px" }}><span style={{ fontSize: "11.5px", fontWeight: "600", letterSpacing: ".05em", color: "var(--tx2)", display: "flex", gap: "8px", alignItems: "center" }}>SUBSCRIPTION VALUE<span style={{ fontSize: "10px", fontWeight: "600", padding: "1px 6px", borderRadius: "4px", background: "var(--violetbg)", color: "var(--violet)" }}>ESTIMATE</span></span>
-                  {(notEditing) && (<><button onClick={startEdit} style={{ height: "28px", padding: "0 10px", borderRadius: "7px", border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: "12px", cursor: "pointer", display: "flex", alignItems: "center", gap: "5px" }}><span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: "15px" }}>edit</span>Edit fees</button></>)}
+                  {(notEditing) && (<><button onClick={startEdit} style={{ height: "28px", padding: "0 10px", borderRadius: "7px", border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: "12px", cursor: "pointer", display: "flex", alignItems: "center", gap: "5px", whiteSpace: "nowrap" }}><span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: "15px" }}>edit</span>Edit fees</button></>)}
                 </div>
-                <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr .8fr", gap: "10px", fontSize: "11px", fontWeight: "600", color: "var(--tx3)", letterSpacing: ".04em", padding: "4px 0" }}><span>SUBSCRIPTION</span><span style={{ textAlign: "right" }}>FEE / MONTH</span><span style={{ textAlign: "right" }}>VALUE IN RANGE</span><span style={{ textAlign: "right" }}>RATIO</span></div>
+                <div className="r9-spend-sub-head" style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr .8fr", gap: "10px", fontSize: "11px", fontWeight: "600", color: "var(--tx3)", letterSpacing: ".04em", padding: "4px 0" }}><span>SUBSCRIPTION</span><span style={{ textAlign: "right" }}><span className="r9-desktop-label">FEE / MONTH</span><span className="r9-phone-label">Fee/mo</span></span><span style={{ textAlign: "right" }}><span className="r9-desktop-label">VALUE IN RANGE</span><span className="r9-phone-label">Value</span></span><span style={{ textAlign: "right" }}><span className="r9-desktop-label">RATIO</span><span className="r9-phone-label">Per USD</span></span></div>
                 {(subs).map((r, _i) => (<Fragment key={_i}>
                   <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr .8fr", gap: "10px", alignItems: "center", padding: "8px 0", borderTop: "1px solid var(--line)", fontVariantNumeric: "tabular-nums" }}>
                     <div style={{ display: "flex", flexDirection: "column", gap: "1px" }}><span style={{ fontWeight: "600" }}>{r.name}</span><span style={{ fontSize: "11.5px", color: "var(--tx3)" }}>{r.plan}</span></div>
                     <div style={{ textAlign: "right" }}>
-                      {(r.inputReady) && (<><input type="number" placeholder="Not set" ref={r.ref} value={r.draft} onChange={r.onFee} style={{ width: "80px", height: "28px", boxSizing: "border-box", border: "1px solid var(--line2)", borderRadius: "7px", padding: "0 8px", background: "var(--bg)", color: "var(--tx)", font: "inherit", textAlign: "right" }} /></>)}
+                      {(r.inputReady) && (<><input type="number" min="0" step="any" inputMode="decimal" placeholder="Not set" aria-label={"Fee per month for " + r.name} aria-invalid={!!r.feeErr} ref={r.ref} value={r.draft} onChange={r.onFee} style={{ width: "80px", height: "28px", boxSizing: "border-box", border: "1px solid " + (r.feeErr ? "var(--red)" : "var(--line2)"), borderRadius: "7px", padding: "0 8px", background: "var(--bg)", color: "var(--tx)", font: "inherit", textAlign: "right" }} />{r.feeErr && <span role="alert" style={{ display: "block", fontSize: "11px", color: "var(--red)", marginTop: "2px", textAlign: "right" }}>{r.feeErr}</span>}</>)}
                       {(r.showFee) && (<><span>{r.fee}</span></>)}{(r.showSet) && (<><button onClick={r.setFee} style={{ border: "0", background: "transparent", padding: "0", font: "inherit", color: "var(--tx3)", textDecoration: "underline dotted", textUnderlineOffset: "3px", cursor: "pointer" }} className="r9-hacc">Not set</button></>)}
                     </div>
                     <div style={{ textAlign: "right", color: "var(--violet)", fontWeight: "600" }}>{r.value}</div>
@@ -273,7 +278,7 @@ export default function SpendClient() {
                   </div>
                 </Fragment>))}
                 {(editing) && (<>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px", paddingTop: "10px", borderTop: "1px solid var(--line)" }}><span style={{ fontSize: "11.5px", color: "var(--tx3)" }}>Saved to 9Router settings.</span><div style={{ display: "flex", gap: "6px" }}><button onClick={cancelEdit} style={{ height: "28px", padding: "0 10px", borderRadius: "7px", border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: "12px", cursor: "pointer" }}>Cancel</button><button onClick={saveEdit} style={{ height: "28px", padding: "0 12px", borderRadius: "7px", border: "0", background: "var(--acc)", color: "#fff", font: "inherit", fontSize: "12px", fontWeight: "600", cursor: "pointer" }}>Save fees</button></div></div>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px", paddingTop: "10px", borderTop: "1px solid var(--line)" }}><span style={{ fontSize: "11.5px", color: "var(--tx3)" }}>Saved to 9Router settings.</span><div style={{ display: "flex", gap: "6px" }}><button onClick={cancelEdit} style={{ height: "28px", padding: "0 10px", borderRadius: "7px", border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: "12px", cursor: "pointer" }}>Cancel</button><button onClick={saveEdit} disabled={!v.feesOk} style={{ height: "28px", padding: "0 12px", borderRadius: "7px", border: "0", background: "var(--acc)", color: "#fff", font: "inherit", fontSize: "12px", fontWeight: "600", cursor: v.feesOk ? "pointer" : "not-allowed", opacity: v.feesOk ? 1 : 0.5, whiteSpace: "nowrap" }}>Save fees</button></div></div>
                 </>)}
                 {(notEditing) && (<>
                   <div style={{ display: "flex", justifyContent: "space-between", paddingTop: "10px", borderTop: "1px solid var(--line)", fontVariantNumeric: "tabular-nums", fontWeight: "600" }}><span>Total <span style={{ fontWeight: "400", color: "var(--tx3)" }}>· fees prorated to {dayCount} days</span></span><span>{k.feesPro} → <span style={{ color: "var(--violet)" }}>{k.value}</span> · <span style={{ color: "var(--green)" }}>{k.ratio}</span></span></div>
