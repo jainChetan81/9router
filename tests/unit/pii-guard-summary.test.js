@@ -82,6 +82,23 @@ describe("summarize trend", () => {
   });
 });
 
+describe("summary routing context", () => {
+  it("groups carry the latest provider and combo, and OCR rows keep them", () => {
+    const now = Date.parse("2026-01-02T00:00:00.000Z");
+    const hit = (hash) => ({ hash, rule: "email", source: "user/text", action: "redact" });
+    const events = [
+      { ts: "2026-01-01T22:00:00.000Z", provider: "old-provider", combo: "", hits: [hit("aaaaaaaaaaaa")] },
+      { ts: "2026-01-01T23:00:00.000Z", provider: "new-provider", combo: "daily-combo", hits: [hit("aaaaaaaaaaaa")] },
+      { ts: "2026-01-01T23:10:00.000Z", type: "ocr", requestId: "ocr1", status: "scanned", cache: "miss", ocrMs: 5, provider: "ocr-provider", combo: "ocr-combo", hits: [] },
+    ];
+    const r = summarize(events, { now });
+    expect(r.groups[0]).toMatchObject({ provider: "new-provider", combo: "daily-combo" });
+    expect(r.ocr.recent[0]).toMatchObject({ requestId: "ocr1", provider: "ocr-provider", combo: "ocr-combo" });
+    // An empty combo string never lands in the group.
+    expect(events.some((e) => e.combo === "" && r.groups.some((g) => g.combo === ""))).toBe(false);
+  });
+});
+
 describe("summary OCR recent list", () => {
   it("keeps only the newest 20 OCR records, even across the batch trim", () => {
     const base = Date.now() - 3600e3;

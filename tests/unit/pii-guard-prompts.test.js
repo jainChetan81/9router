@@ -9,8 +9,8 @@ const detector = library.createDetector({ known: [{ name: "pin", value: "zx81" }
 const pan = ["ABCPE", "1234", "F"].join(""), mail = ["priya.sharma", "corpmail.in"].join("@");
 let dir;
 const tick = () => new Promise((r) => setImmediate(r));
-async function run(body, sessionId = "s1", requestId = "r1") {
-  P.capture({ nodes: P.collect(body), requestId, sessionId, model: "m", client: "Claude Code" }, library, detector);
+async function run(body, sessionId = "s1", requestId = "r1", routing = {}) {
+  P.capture({ nodes: P.collect(body), requestId, sessionId, model: "m", client: "Claude Code", ...routing }, library, detector);
   await tick(); P.flush();
 }
 beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "pii-prompts-")); process.env.PII_GUARD_PROMPTS = join(dir, "c", "prompts.db"); P._reset(); });
@@ -55,8 +55,46 @@ describe("prompt store", () => {
     expect(P.search({}).rows.map((r) => P.message(r.id).text)).toEqual(["new turn"]);
   });
   it("collects tool calls and results, skips thinking", () => {
-    const nodes = P.collect({ messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "secret plan", signature: "s" }, { type: "tool_use", name: "Bash", input: { cmd: "ls" } }] }, { role: "user", content: [{ type: "tool_result", content: "files" }] }] });
-    expect(nodes.map((n) => [n.kind, n.text])).toEqual([["tool_use", 'Bash {"cmd":"ls"}'], ["tool_result", "files"]]);
+    const nodes = P.collect({ messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "secret plan", signature: "s" }, { type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } }] }, { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "files" }] }] });
+    expect(nodes.map((n) => [n.kind, n.text, n.tool])).toEqual([["tool_use", 'Bash {"cmd":"ls"}', "Bash"], ["tool_result", "files", "Bash"]]);
+  });
+  it("names tool_calls and paired function_call outputs by tool name", () => {
+    const nodes = P.collect({ input: [
+      { type: "function_call", call_id: "c1", name: "weather", arguments: "{}" },
+      { type: "function_call_output", call_id: "c1", output: "sunny" },
+      { role: "assistant", tool_calls: [{ function: { name: "calc", arguments: "1" } }] },
+    ] });
+    expect(nodes.map((n) => [n.kind, n.tool])).toEqual([["tool_use", "weather"], ["tool_result", "weather"], ["tool_use", "calc"]]);
+  });
+  it("stores tool names and routing fields, and migrates a schema without them", async () => {
+    await run({ messages: [{ role: "assistant", content: [{ type: "tool_use", name: "Bash", input: { cmd: "ls" } }] }] }, "s1", "r1", { provider: "anthropic", combo: "daily", account: "acc-1" });
+    const row = P.search({ requestId: "r1" }).rows[0];
+    expect(P.message(row.id)).toMatchObject({ tool: "Bash", provider: "anthropic", combo: "daily", account: "acc-1" });
+    // Migration: drop the new columns from a copy and reopen; old rows keep working, new ones store again.
+    // Reset first so WAL is checkpointed and the copy holds all rows.
+    P._reset();
+    const file = process.env.PII_GUARD_PROMPTS;
+    const old = file.replace(".db", "-old.db");
+    await writeFile(old, await readFile(file));
+    process.env.PII_GUARD_PROMPTS = old;
+    P._reset();
+    const check = await import("node:sqlite");
+    const before = new check.DatabaseSync(old);
+    // Rebuild without the new columns: create plain (id loses its PK → re-added by copying
+    // rows around so later inserts still get rowids).
+    before.exec("CREATE TABLE plain (ts INTEGER NOT NULL, request_id TEXT NOT NULL, session_id TEXT, model TEXT, client TEXT, role TEXT, kind TEXT, path TEXT, text TEXT NOT NULL, cut INTEGER NOT NULL, hashes TEXT NOT NULL, digest TEXT); INSERT INTO plain SELECT ts, request_id, session_id, model, client, role, kind, path, text, cut, hashes, digest FROM messages; DROP TABLE messages; CREATE TABLE messages (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, request_id TEXT NOT NULL, session_id TEXT, model TEXT, client TEXT, role TEXT, kind TEXT, path TEXT, text TEXT NOT NULL, cut INTEGER NOT NULL, hashes TEXT NOT NULL, digest TEXT); INSERT INTO messages (ts, request_id, session_id, model, client, role, kind, path, text, cut, hashes, digest) SELECT ts, request_id, session_id, model, client, role, kind, path, text, cut, hashes, digest FROM plain; DROP TABLE plain;");
+    before.close();
+    await run({ messages: [{ role: "user", content: "new after migration" }] }, "s1", "r2", { provider: "p2" });
+    const old2 = P.search({ requestId: "r1" }).rows[0];
+    // Old rows stay NULL for the new columns; text and hashes still read.
+    expect(P.message(old2.id)).toMatchObject({ text: 'Bash {"cmd":"ls"}', provider: null, tool: null });
+    expect(P.message(P.search({ requestId: "r2" }).rows[0].id)).toMatchObject({ text: "new after migration", tool: null, provider: "p2" });
+  });
+  it("wraps the account label: an email never stored", async () => {
+    await run({ messages: [{ role: "user", content: "clean this" }] }, "s1", "r9", { account: mail });
+    const m = P.message(P.search({ requestId: "r9" }).rows[0].id);
+    expect(m.account === null || m.account === undefined).toBe(true);
+    expect(m.text).toBe("clean this");
   });
   it("caps tool output and pages results", async () => {
     await run({ messages: [{ role: "tool", content: "x ".repeat(P.TOOL_CAP) }] });

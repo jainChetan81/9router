@@ -71,7 +71,8 @@ export async function handleSearch(request) {
   }
 
   if (process.env.PII_GUARD_MODULE) {
-    const guard = await observeRequest(body, { endpoint: url.pathname, userAgent: request.headers.get("user-agent"), model: providerInput }, settings.piiGuard);
+    const routing = {};
+    const guard = await observeRequest(body, { endpoint: url.pathname, userAgent: request.headers.get("user-agent"), model: providerInput, routing }, settings.piiGuard);
     if (guard?.blocked) return errorResponse(HTTP_STATUS.BAD_REQUEST, blockMessage(guard.blocked, false));
     providerInput = body.provider || body.model; // redaction may have rewritten it
     query = body.query;
@@ -85,6 +86,7 @@ export async function handleSearch(request) {
   // restricted key needs the provider id (or the combo) on its list.
   const keyAccessDenied = await enforceKeyAccessProvider(await getKeyAccessContext(request), providerInput, comboModels);
   if (keyAccessDenied) return keyAccessDenied;
+  if (routing) { if (comboModels) routing.combo = providerInput; else routing.provider = providerInput; }
   if (comboModels) {
     const comboStrategies = settings.comboStrategies || {};
     const comboStrategy = comboStrategies[providerInput]?.fallbackStrategy || settings.comboStrategy || "fallback";

@@ -31,7 +31,7 @@ export function summarize(events, { since, until, now = Date.now(), ignore = [],
     if (event.type === "ocr") {
       totalOcrEvents++;
       if (event.reason) reasons[event.reason] = (reasons[event.reason] || 0) + 1;
-      recentOcr.push({ ts: event.ts, requestId: event.requestId, model: event.model, endpoint: event.endpoint, imageIndex: event.imageIndex, status: event.status, ...(event.reason && { reason: event.reason }), cache: event.cache, ocrMs: event.ocrMs, mode: event.mode, rules: [...new Set((Array.isArray(event.hits) ? event.hits : []).filter(hit => hit && hit.action !== "ignored").map(hit => hit.name || hit.rule).filter(Boolean))] });
+      recentOcr.push({ ts: event.ts, requestId: event.requestId, model: event.model, endpoint: event.endpoint, imageIndex: event.imageIndex, status: event.status, ...(event.reason && { reason: event.reason }), cache: event.cache, ocrMs: event.ocrMs, mode: event.mode, ...(typeof event.provider === "string" && event.provider && { provider: event.provider }), ...(typeof event.combo === "string" && event.combo && { combo: event.combo }), rules: [...new Set((Array.isArray(event.hits) ? event.hits : []).filter(hit => hit && hit.action !== "ignored").map(hit => hit.name || hit.rule).filter(Boolean))] });
       // Keep only the newest 20; trim in batches so a long range never holds every OCR event.
       if (recentOcr.length > 200) { recentOcr.sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts)); recentOcr.length = 20; }
       if (Object.hasOwn(ocrStatus, event.status)) {
@@ -80,7 +80,7 @@ export function summarize(events, { since, until, now = Date.now(), ignore = [],
         group = { hash: hit.hash, rule: hit.rule, name: hit.name, kind: hit.kind, sources: [], actions: [], action, actionTs: ts, leakedWhere: [], firstSeen: event.ts, lastSeen: event.ts, turns: new Set(), ignored: false };
         groups.set(key, group);
       }
-      if (ts >= Date.parse(group.lastSeen)) { if (typeof event.ua === "string") group.ua = event.ua.slice(0, 80); if (typeof event.model === "string") group.model = event.model.slice(0, 80); }
+      if (ts >= Date.parse(group.lastSeen)) { if (typeof event.ua === "string") group.ua = event.ua.slice(0, 80); if (typeof event.model === "string") group.model = event.model.slice(0, 80); if (typeof event.provider === "string" && event.provider) group.provider = event.provider.slice(0, 80); if (typeof event.combo === "string" && event.combo) group.combo = event.combo.slice(0, 80); }
       if (!group.name && hit.name) group.name = hit.name;
       if (!group.kind && hit.kind) group.kind = hit.kind;
       if (!group.sources.includes(source)) group.sources.push(source);

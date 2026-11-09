@@ -166,17 +166,18 @@ export async function GET(request) {
     if (vr === "bad") return NextResponse.json({ error: "Invalid range" }, { status: 400 });
     const range = vr || { from: Date.now() - DAY, to: Date.now() };
     // Filters, same meaning in both Findings views. action "allowed" means the hash is on the allow (ignore) list now.
-    const f = Object.fromEntries(["model", "client", "source", "action", "group", "q"].map((k) => [k, (url.searchParams.get(k) || "").slice(0, 200)]));
+    const f = Object.fromEntries(["model", "client", "source", "action", "group", "provider", "combo", "q"].map((k) => [k, (url.searchParams.get(k) || "").slice(0, 200)]));
     const tests = url.searchParams.get("tests") === "1";
     const q = f.q.toLowerCase();
     const allowed = new Set(f.action === "allowed" || q ? ((await getSettings()).piiGuard?.ignore || []) : []);
     const ruleList = f.group || q ? rules() : [];
     const groupOf = Object.fromEntries(ruleList.map((r) => [r.id, r.group]));
     const labelOf = Object.fromEntries(ruleList.map((r) => [r.id, r.label || r.id]));
-    const keep = (e) => (tests || !(e.type === "test" || e.test === true)) && (!f.model || e.model === f.model) && (!f.client || clientOf(e.ua || "") === f.client);
+    const keep = (e) => (tests || !(e.type === "test" || e.test === true)) && (!f.model || e.model === f.model) && (!f.client || clientOf(e.ua || "") === f.client)
+      && (!f.provider || e.provider === f.provider) && (!f.combo || e.combo === f.combo);
     // Allowed = allowed now, or allowed when it was logged; the row badge uses the logged action.
     const actionOk = (h) => f.action === "allowed" ? h.action === "ignored" || allowed.has(h.hash) : (h.action || "observe") === f.action;
-    const text = (e, h) => [h.rule, h.name, labelOf[h.rule], h.hash, h.preview, h.source, e.model, clientOf(e.ua || "")].join(" ").toLowerCase();
+    const text = (e, h) => [h.rule, h.name, labelOf[h.rule], h.hash, h.preview, h.source, e.model, e.provider, e.combo, clientOf(e.ua || "")].join(" ").toLowerCase();
     const hitOk = (e, h) => (!f.action || actionOk(h)) && (!f.source || (f.source === "ocr") === String(h.source || "").endsWith("/ocr"))
       && (!f.group || groupOf[h.rule] === f.group) && (!q || text(e, h).includes(q));
     const filtered = f.action || f.source || f.group || q;

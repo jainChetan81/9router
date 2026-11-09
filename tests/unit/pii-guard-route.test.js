@@ -90,8 +90,22 @@ describe("route range", () => {
     const page = await (await GET(new Request("http://localhost/api/pii-guard?events=1&group=gov_id"))).json();
     expect(page.events[0].client).toBe("Claude Code");
   });
-  it("image route rejects bad ids and reports expired images", async () => {
-    const { GET: IMG } = await import("../../src/app/api/pii-guard/image/route.js");
+  it("events filter by provider and combo, mirroring model and client", async () => {
+    const ts = new Date(Date.now() - 5000).toISOString();
+    const lines = [
+      { ts, provider: "anthropic", combo: "daily", hits: [{ hash: "h1", rule: "r", action: "redact" }] },
+      { ts, provider: "anthropic", hits: [{ hash: "h2", rule: "r", action: "redact" }] },
+      { ts, provider: "google", combo: "daily", hits: [{ hash: "h3", rule: "r", action: "redact" }] },
+      { ts, combo: "night", hits: [{ hash: "h4", rule: "r", action: "redact" }] },
+    ];
+    await writeFile("/tmp/ev.jsonl", lines.map(l => JSON.stringify(l)).join("\n") + "\n");
+    const hashes = async (q) => (await (await GET(new Request(`http://localhost/api/pii-guard?events=1&${q}`))).json()).events.flatMap(e => e.hits.map(h => h.hash));
+    expect(await hashes("provider=anthropic")).toEqual(["h2", "h1"]);
+    expect(await hashes("provider=anthropic&combo=daily")).toEqual(["h1"]);
+    expect(await hashes("combo=daily")).toEqual(["h3", "h1"]);
+    expect(await hashes("combo=night")).toEqual(["h4"]);
+  });
+  it("image route rejects bad ids and reports expired images", async () => {    const { GET: IMG } = await import("../../src/app/api/pii-guard/image/route.js");
     expect((await IMG(new Request("http://localhost/api/pii-guard/image?id=../../etc"))).status).toBe(400);
     const gone = await IMG(new Request("http://localhost/api/pii-guard/image?id=0123456789ab"));
     expect(gone.status).toBe(404);

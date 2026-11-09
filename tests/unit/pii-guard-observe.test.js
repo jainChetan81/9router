@@ -296,6 +296,40 @@ describe("PII guard test preview", () => {
   });
 });
 
+describe("PII guard routing context", () => {
+  it("records provider, combo, account and resolvedModel from the routing object", async () => {
+    const routing = { provider: "anthropic" };
+    const meta = { endpoint: "/v1/messages", userAgent: "test/1", model: "test", routing };
+    await observeRequest(body(value), meta);
+    let event = JSON.parse((await lines(1)).trim());
+    expect(event.provider).toBe("anthropic");
+    // Fields filled after the scan still land in the same event.
+    Object.assign(routing, { combo: "daily", account: "acc-1", resolvedModel: "claude-opus/opus-5-5" });
+    await observeRequest(body(value), meta);
+    event = JSON.parse((await lines(2)).trim().split("\n")[1]);
+    expect(event).toMatchObject({ provider: "anthropic", combo: "daily", account: "acc-1", resolvedModel: "claude-opus/opus-5-5" });
+  });
+  it("skips an account label that holds an email and trims empty routing", async () => {
+    const meta = { endpoint: "/v1/messages", userAgent: "test/1", model: "test", routing: { provider: "p", account: "user@corpmail.in" } };
+    await observeRequest(body(value), meta);
+    const event = JSON.parse((await lines(1)).trim());
+    expect(event.account).toBeUndefined();
+    expect(event.provider).toBe("p");
+    const plain = { endpoint: "/v1/messages", userAgent: "test/1", model: "test" };
+    await observeRequest(body(value), plain);
+    const second = JSON.parse((await lines(2)).trim().split("\n")[1]);
+    expect(second.provider).toBeUndefined();
+    expect(second.combo).toBeUndefined();
+    expect(second.account).toBeUndefined();
+  });
+  it("writes old events without routing fields and stays backward compatible", async () => {
+    await observeRequest(body(value), { endpoint: "/v1/messages", userAgent: "test/1", model: "test" });
+    const event = JSON.parse((await lines(1)).trim());
+    expect(event.ts).toBeTruthy();
+    expect("provider" in event).toBe(false);
+  });
+});
+
 describe("PII guard rules() metadata", () => {
   let dir, fakeModule;
   beforeEach(async () => {

@@ -36,13 +36,18 @@ function open(file = promptsFile()) {
     db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA secure_delete=ON; PRAGMA busy_timeout=0;");
     if (db.prepare("PRAGMA auto_vacuum").get().auto_vacuum !== 2) { db.exec("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;"); }
     db.exec(`CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, request_id TEXT NOT NULL, session_id TEXT,
-        model TEXT, client TEXT, role TEXT, kind TEXT, path TEXT, text TEXT NOT NULL, cut INTEGER NOT NULL DEFAULT 0, hashes TEXT NOT NULL DEFAULT '', digest TEXT);
+        model TEXT, provider TEXT, combo TEXT, account TEXT, client TEXT, role TEXT, kind TEXT, path TEXT, text TEXT NOT NULL, cut INTEGER NOT NULL DEFAULT 0, hashes TEXT NOT NULL DEFAULT '', digest TEXT, tool TEXT);
       CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);
       CREATE INDEX IF NOT EXISTS messages_request ON messages(request_id);
       CREATE INDEX IF NOT EXISTS messages_session ON messages(session_id, ts);
       CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(text, content='messages', content_rowid='id', tokenize='unicode61');
       CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text); END;
       CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.id, old.text); END;`);
+    // Migration for rows a schema without the routing columns created: add them, old rows stay NULL.
+    try {
+      const cols = db.prepare("PRAGMA table_info(messages)").all().map(c => c.name);
+      for (const col of ["provider", "combo", "account", "tool"]) if (!cols.includes(col)) { db.exec(`ALTER TABLE messages ADD COLUMN ${col} TEXT`); chmodSync(file, 0o600); }
+    } catch {}
     for (const f of [file, `${file}-wal`, `${file}-shm`]) try { chmodSync(f, 0o600); } catch {}
     // Retention runs on a timer too, so it never depends on traffic.
     if (!sweepTimer) { sweepTimer = setInterval(() => sweep(), 36e5); sweepTimer.unref(); }
@@ -62,17 +67,20 @@ const str = (v) => (typeof v === "string" ? v : "");
 // Roles come from the client; only known names are stored, so a role can never carry a value.
 const ROLES = new Set(["system", "developer", "user", "assistant", "tool", "function", "model"]);
 const json = (v) => { try { return v && typeof v === "object" ? JSON.stringify(v).slice(0, TOOL_CAP + 1) : str(v); } catch { return ""; } };
-function parts(content, role, path, out, kind = "text") {
-  if (typeof content === "string") return void out.push({ text: content, role, kind, path });
+function parts(content, role, path, out, kind = "text", toolById, toolId = null) {
+  if (typeof content === "string") return void out.push({ text: content, role, kind, path, ...(toolId && toolById?.get(toolId) && { tool: toolById.get(toolId) }) });
   if (!Array.isArray(content)) return;
   content.forEach((b, j) => {
     const at = `${path}[${j}]`;
     if (typeof b === "string") return void out.push({ text: b, role, kind, path: at });
     if (!b || typeof b !== "object") return;
     // Thinking, images and files are skipped: signed, binary, or scanned elsewhere.
-    if (b.type === "tool_result") return parts(b.content, role, `${at}.content`, out, "tool_result");
-    if (b.type === "tool_use") return void out.push({ text: `${str(b.name)} ${json(b.input)}`, role, kind: "tool_use", path: at });
-    if (typeof b.text === "string" && b.type !== "thinking") out.push({ text: b.text, role, kind, path: `${at}.text` });
+    if (b.type === "tool_result") return parts(b.content, role, `${at}.content`, out, "tool_result", toolById, toolId || str(b.tool_use_id) || null);
+    if (b.type === "tool_use") return void out.push({ text: `${str(b.name)} ${json(b.input)}`, role, kind: "tool_use", path: at, ...(typeof b.name === "string" && b.name && { tool: str(b.name).slice(0, 100) }) });
+    if (typeof b.text === "string" && b.type !== "thinking") {
+      const tool = toolById?.get(String(b.tool_use_id || ""));
+      out.push({ text: b.text, role, kind, path: `${at}.text`, ...(tool && { tool }) });
+    }
   });
 }
 /** References to the request's text, taken before redaction rewrites the body. Strings are not copied. */
@@ -86,13 +94,25 @@ export function collect(body) {
   if (typeof body.input === "string") out.push({ text: body.input, role: "user", kind: "text", path: "input" });
   const list = Array.isArray(body.messages) ? ["messages", body.messages] : Array.isArray(body.input) ? ["input", body.input] : null;
   if (!list) return out;
+  // Pair tool results with their tool name: Response-API `function_call` rows, Claude `tool_use` blocks,
+  // and `function_call_output.call_id`/`tool_call_id`. The name is an identifier, never a value.
+  const toolById = new Map();
+  for (const m of list[1]) {
+    if (m?.type === "function_call" && str(m.call_id)) toolById.set(str(m.call_id), str(m.name).slice(0, 100));
+    let content = m?.content;
+    if (typeof content === "string" || !Array.isArray(content)) continue;
+    for (const b of content) if (b?.type === "tool_use" && str(b.name)) toolById.set(str(b.id), str(b.name).slice(0, 100));
+  }
   list[1].forEach((m, i) => {
     if (!m || typeof m !== "object") return;
     const at = `${list[0]}[${i}]`, role = ROLES.has(m.role) ? m.role : m.role === undefined ? "tool" : "other";
-    if (m.type === "function_call") return out.push({ text: `${str(m.name)} ${str(m.arguments)}`, role: "assistant", kind: "tool_use", path: at });
-    if (m.type === "function_call_output") return out.push({ text: json(m.output), role: "tool", kind: "tool_result", path: at });
-    parts(m.content, role, `${at}.content`, out, role === "tool" ? "tool_result" : "text");
-    if (Array.isArray(m.tool_calls)) m.tool_calls.forEach((c, k) => out.push({ text: `${str(c?.function?.name)} ${str(c?.function?.arguments)}`, role, kind: "tool_use", path: `${at}.tool_calls[${k}]` }));
+    if (m.type === "function_call") return out.push({ text: `${str(m.name)} ${str(m.arguments)}`, role: "assistant", kind: "tool_use", path: at, ...(str(m.name) && { tool: str(m.name).slice(0, 100) }) });
+    if (m.type === "function_call_output") {
+      const tool = toolById?.get(str(m.call_id ?? m.tool_call_id));
+      return out.push({ text: json(m.output), role: "tool", kind: "tool_result", path: at, ...(tool && { tool }) });
+    }
+    parts(m.content, role, `${at}.content`, out, role === "tool" ? "tool_result" : "text", toolById);
+    if (Array.isArray(m.tool_calls)) m.tool_calls.forEach((c, k) => out.push({ text: `${str(c?.function?.name)} ${str(c?.function?.arguments)}`, role, kind: "tool_use", path: `${at}.tool_calls[${k}]`, ...(str(c?.function?.name) && { tool: str(c?.function?.name).slice(0, 100) }) }));
   });
   return out;
 }
@@ -138,7 +158,9 @@ export function capture(meta, library, detector) {
   const file = promptsFile(); // resolved now; the write runs later
   setImmediate(() => { try { store({ ...meta, file }, library, detector); } catch { stats.errors++; } });
 }
-function store({ nodes, bodyFindings = [], requestId, sessionId, model, client, file }, library, detector) {
+function store({ nodes, bodyFindings = [], requestId, sessionId, model, provider, combo, account: rawAccount, client, file }, library, detector) {
+  // An account label is a display name; an email (or any credential) never lands in the store.
+  const account = rawAccount && !String(rawAccount).includes("@") ? String(rawAccount).slice(0, 80) : null;
   for (const n of nodes) {
     // The request scan used context (sibling keys like "phone"); a rescan of the bare string may miss those.
     // Same path: reuse its spans. Inside the node but unmatched by hash: unsafe, so the node is not stored.
@@ -160,7 +182,7 @@ function store({ nodes, bodyFindings = [], requestId, sessionId, model, client, 
       const [text, cut] = cap(library.maskText(n.text, n.findings), n.kind);
       // Fail closed: anything still detected after masking means a span was missed.
       if (detector.scan(text).length) { stats.unsafe++; continue; }
-      masked = { file, ts, requestId, sessionId: sessionId || null, model: model || null, client: client || null, role: n.role, kind: n.kind, path: n.path, digest: n.digest, text, cut, hashes: [...new Set(n.findings.map((f) => f.hash))].join(" ") };
+      masked = { file, ts, requestId, sessionId: sessionId || null, model: model || null, provider: provider || null, combo: combo || null, account: account || null, client: client || null, role: n.role, kind: n.kind, path: n.path, digest: n.digest, tool: n.tool || null, text, cut, hashes: [...new Set(n.findings.map((f) => f.hash))].join(" ") };
     } catch { stats.errors++; continue; }
     if (queue.length >= QUEUE_MAX || queued + masked.text.length > QUEUE_BYTES) { stats.dropped++; continue; }
     queue.push(masked); queued += masked.text.length;
@@ -177,9 +199,9 @@ function write(file, rows) {
   const d = open(file);
   if (!d) { stats.dropped += rows.length; releasePending(rows); return; }
   try {
-    const ins = d.prepare("INSERT INTO messages (ts, request_id, session_id, model, client, role, kind, path, text, cut, hashes, digest) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
+    const ins = d.prepare("INSERT INTO messages (ts, request_id, session_id, model, provider, combo, account, client, role, kind, path, text, cut, hashes, digest, tool) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
     d.exec("BEGIN");
-    for (const r of rows) ins.run(r.ts, r.requestId, r.sessionId, r.model, r.client, r.role, r.kind, r.path, r.text, r.cut, r.hashes, r.digest);
+    for (const r of rows) ins.run(r.ts, r.requestId, r.sessionId, r.model, r.provider, r.combo, r.account, r.client, r.role, r.kind, r.path, r.text, r.cut, r.hashes, r.digest, r.tool);
     d.exec("COMMIT");
     stats.stored += rows.length;
     releasePending(rows);
@@ -216,7 +238,7 @@ function ftsQuery(q) {
   const words = q.normalize("NFKC").match(/[\p{L}\p{N}_]+/gu) || [];
   return words.slice(0, 12).map((w, i, a) => `"${w}"${i === a.length - 1 ? "*" : ""}`).join(" ");
 }
-const COLS = "m.id, m.ts, m.request_id AS requestId, m.session_id AS sessionId, m.model, m.client, m.role, m.kind, m.path, m.cut, m.hashes";
+const COLS = "m.id, m.ts, m.request_id AS requestId, m.session_id AS sessionId, m.model, m.provider, m.combo, m.account, m.client, m.role, m.kind, m.path, m.cut, m.hashes, m.tool";
 /** Search, newest first, 50 per page. Snippets only; full text comes from `message(id)`. */
 export function search({ q = "", sessionId = "", requestId = "", hash = "", from = 0, to = Date.now(), before = Infinity, limit = 50 } = {}) {
   const d = open();

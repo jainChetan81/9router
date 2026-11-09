@@ -350,6 +350,7 @@ function handleOcrResult(result, requestId, imageIndex, meta, body, config, mode
       mode: ocrMode(config),
       requestId,
       imageIndex,
+      ...routingOf(meta),
       endpoint: meta?.endpoint,
       model: model || (body?.model ?? meta?.model),
       ua,
@@ -370,6 +371,21 @@ function handleOcrResult(result, requestId, imageIndex, meta, body, config, mode
   } catch {
     failure("ocr");
   }
+}
+
+// Routing context the request handlers fill in around the scan: provider id, combo name and
+// account label when upstream resolution completes. Identifiers only; handlers must never put a
+// key, token, or email here — an account value containing "@" is dropped here as a fallback.
+function routingOf(meta) {
+  const r = meta.routing && typeof meta.routing === "object" ? meta.routing : meta;
+  const label = r.account || "";
+  const account = typeof label === "string" && label && !label.includes("@") ? label.slice(0, 80) : null;
+  return {
+    ...(typeof r.provider === "string" && r.provider ? { provider: r.provider.slice(0, 80) } : {}),
+    ...(typeof r.combo === "string" && r.combo ? { combo: r.combo.slice(0, 80) } : {}),
+    ...(typeof r.resolvedModel === "string" && r.resolvedModel ? { resolvedModel: r.resolvedModel.slice(0, 120) } : {}),
+    ...(account && { account }),
+  };
 }
 
 export async function observeRequest(body, meta = {}, config = {}) {
@@ -433,7 +449,7 @@ export async function observeRequest(body, meta = {}, config = {}) {
     for (const f of findings) if (f.readonly) { const at = thinkingBlock(body, f); if (at) { delete f.readonly; drop.set(f, at); } }
     // meta.model is a pre-scan copy; log the body value, which redaction may have rewritten, and drop it if it held a finding.
     model = findings.some(f => /^\.?model$/.test(f.path)) ? "[redacted]" : body?.model ?? meta.model;
-    capturePrompts({ nodes: promptNodes, bodyFindings: findings.map(f => ({ path: f.path, start: f.start, end: f.end, hash: f.hash, rule: f.rule, kind: f.kind })), requestId, sessionId: sessionKey, model, client: clientOf(ua0) }, library, detector);
+    capturePrompts({ nodes: promptNodes, bodyFindings: findings.map(f => ({ path: f.path, start: f.start, end: f.end, hash: f.hash, rule: f.rule, kind: f.kind })), requestId, sessionId: sessionKey, model, ...routingOf(meta), client: clientOf(ua0) }, library, detector);
     for (const f of findings) foundActions.set(f, decide(f));
     const strip = new Map();
     for (const [f, at] of drop) if (foundActions.get(f) === "redact") { strip.set(`${at.i}:${at.j}`, at); redacted[label(f)] = (redacted[label(f)] || 0) + 1; }
@@ -460,7 +476,7 @@ export async function observeRequest(body, meta = {}, config = {}) {
     }
     const blocked = [...preliminaryBlocked], hits = [...hitRows.values()].sort((a, b) => RANK[a.action] - RANK[b.action]).slice(0, 200);
     withFindings++; totalWithFindings++;
-    const event = { ts: new Date().toISOString(), requestId, ...(sessionKey && { sessionId: sessionKey }), endpoint: meta.endpoint, model: model, ua, chars: result.chars, images: result.images, imageBytes: result.imageBytes, unscanned: result.unscanned, scanMs, counts, new: fresh, hits, ...(hitRows.size > hits.length && { hitsDropped: hitRows.size - hits.length }), ...(blocked.length && { blocked }), ...(Object.keys(redacted).length && { redacted }), ...(Object.keys(leaked).length && { leaked }), ignored: findings.filter(f => foundActions.get(f) === "ignored").length };
+    const event = { ts: new Date().toISOString(), requestId, ...(sessionKey && { sessionId: sessionKey }), ...routingOf(meta), endpoint: meta.endpoint, model: model, ua, chars: result.chars, images: result.images, imageBytes: result.imageBytes, unscanned: result.unscanned, scanMs, counts, new: fresh, hits, ...(hitRows.size > hits.length && { hitsDropped: hitRows.size - hits.length }), ...(blocked.length && { blocked }), ...(Object.keys(redacted).length && { redacted }), ...(Object.keys(leaked).length && { leaked }), ignored: findings.filter(f => foundActions.get(f) === "ignored").length };
     markSeen(newHashes);
     void append(event).catch(() => failure("write"));
     const summary = Object.entries(counts).map(([k, n]) => `${k}=${n}`).join(", ");

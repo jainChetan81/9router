@@ -78,7 +78,8 @@ export async function handleEmbeddings(request) {
   }
 
   if (process.env.PII_GUARD_MODULE) {
-    const guard = await observeRequest(body, { endpoint: url.pathname, userAgent: request.headers.get("user-agent"), model: body?.model }, settings.piiGuard);
+    const routing = {};
+    const guard = await observeRequest(body, { endpoint: url.pathname, userAgent: request.headers.get("user-agent"), model: body?.model, routing }, settings.piiGuard);
     if (guard?.blocked) return errorResponse(HTTP_STATUS.BAD_REQUEST, blockMessage(guard.blocked, false));
     modelStr = body.model; // redaction may have rewritten it
   }
@@ -90,6 +91,7 @@ export async function handleEmbeddings(request) {
   }
 
   const { provider, model } = modelInfo;
+  if (routing) { routing.provider = provider; if (modelStr !== `${provider}/${model}`) routing.resolvedModel = `${provider}/${model}`; }
 
   // Per-key access control: checked before any credential lookup.
   const keyAccessDenied = await enforceKeyAccessResolved(await getKeyAccessContext(request), modelStr, provider, model);

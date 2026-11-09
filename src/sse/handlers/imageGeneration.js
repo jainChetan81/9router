@@ -70,8 +70,10 @@ export async function handleImageGeneration(request) {
   if (!modelStr) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing model");
   if (!body.prompt) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing required field: prompt");
 
+  let routing = null;
   if (process.env.PII_GUARD_MODULE) {
-    const guard = await observeRequest(body, { endpoint: url.pathname, userAgent: request.headers.get("user-agent"), model: body?.model }, settings.piiGuard);
+    routing = {};
+    const guard = await observeRequest(body, { endpoint: url.pathname, userAgent: request.headers.get("user-agent"), model: body?.model, routing }, settings.piiGuard);
     if (guard?.blocked) return errorResponse(HTTP_STATUS.BAD_REQUEST, blockMessage(guard.blocked, false));
     modelStr = body.model; // redaction may have rewritten it
   }
@@ -82,6 +84,8 @@ export async function handleImageGeneration(request) {
 
   // Combo expansion: model may be a combo name → run fallback/round-robin across models
   const comboModels = await getComboModels(modelStr);
+  if (comboModels) routing.combo = modelStr;
+  else { const { provider, model } = await getModelInfo(modelStr); if (routing) { routing.provider = provider; if (modelStr !== `${provider}/${model}`) routing.resolvedModel = `${provider}/${model}`; } }
   if (comboModels) {
     const comboStrategies = settings.comboStrategies || {};
     const comboStrategy = comboStrategies[modelStr]?.fallbackStrategy || settings.comboStrategy || "fallback";
