@@ -18,7 +18,6 @@ export function quotaUsageRows({ usage, connection, now, normalize }) {
   const quotas = usage?.quotas;
   if (!quotas || Object.keys(quotas).length === 0) throw new Error(usage?.message || "Provider returned no quota data");
   return Object.entries(quotas || {}).map(([key, quota]) => ({
-    ...normalize({ provider: connection.provider, name: connection.name || connection.provider, quota: { ...quota, name: key }, now }),
-    window: quota.displayName ? `${key} (${quota.displayName})` : key,
+    ...normalize({ provider: connection.provider, name: connection.name || connection.provider, quota: { ...quota, name: quota.displayName ? `${key} (${quota.displayName})` : key }, now }),
   }));
 }

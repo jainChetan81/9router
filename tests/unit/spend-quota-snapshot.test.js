@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { createRefreshDeduper, quotaUsageRows } from "../../src/lib/spend/quotaSnapshot.js";
+import { normalizeQuotaRow } from "../../src/lib/spend/quotaRunway.js";
 import { createSpendDrilldown } from "../../src/lib/spend/drilldown.js";
 
 describe("quota snapshot helpers", () => {
@@ -30,6 +31,16 @@ describe("quota snapshot helpers", () => {
       await Promise.resolve();
       expect(refresh).toHaveBeenCalledTimes(2);
     } finally { vi.useRealTimers(); }
+  });
+
+  it("reads the window length from the display name as well as the key", () => {
+    const now = Date.UTC(2026, 10, 9, 12);
+    const rows = quotaUsageRows({
+      usage: { quotas: { gemini_session: { displayName: "Gemini (5h)", used: 10, total: 100, resetAt: now + 3600e3 } } },
+      connection: { provider: "antigravity", name: "acct" }, now, normalize: normalizeQuotaRow,
+    });
+    expect(rows[0].window).toBe("gemini_session (Gemini (5h))");
+    expect(rows[0].windowMs).toBe(5 * 3600e3);
   });
 
   it("turns empty quotas without a message into a failure", () => {
