@@ -16,18 +16,23 @@ export default function QuotaRunway() {
   const [ref, w] = useWidth();
   const narrow = w < 640;
 
-  const load = useCallback(async () => {
-    setRes((r) => ({ ...r, state: "loading" }));
+  const load = useCallback(async ({ quiet = false } = {}) => {
+    if (!quiet) setRes((r) => ({ ...r, state: "loading" }));
     try {
       const r = await fetch("/api/spend/quota", { cache: "no-store" });
       const body = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(body.error || r.statusText);
       const rows = Array.isArray(body.rows) ? body.rows : [];
       setRes({ state: rows.length ? "live" : "empty", rows, at: Date.now() });
-    } catch { setRes({ state: "error", rows: [], at: null }); }
+    } catch { setRes((r) => (quiet && r.state === "live" ? r : { state: "error", rows: [], at: null })); }
   }, []);
   useEffect(() => { const t = setTimeout(load, 0); return () => clearTimeout(t); }, [load]);
   useEffect(() => { const iv = setInterval(() => setNow(Date.now()), 30000); return () => clearInterval(iv); }, []);
+  // Live data: refetch every 2 minutes while the tab is visible (the API caches for 60 s).
+  useEffect(() => {
+    const iv = setInterval(() => { if (document.visibilityState === "visible") load({ quiet: true }); }, 120000);
+    return () => clearInterval(iv);
+  }, [load]);
 
   const sorted = useMemo(() => sortQuotaRunway(mapQuotaRows(res.rows)), [res.rows]);
   const total = quotaTotal(sorted);
@@ -36,18 +41,18 @@ export default function QuotaRunway() {
   const qRow = (r, child) => {
     if (r.risk === "error") return { id: r.id, prov: r.prov, win: r.win, isErr: true, err: r.err, indent: "0px", bg: "transparent" };
     const c = RC[r.risk];
-    const proj = r.known && r.proj != null ? r.proj : null;
+    const proj = r.known && r.proj != null ? r.proj : null, projR = proj == null ? null : Math.round(proj);
     const pr = proj != null ? Math.min(proj, 100) : 0;
     const pct = r.pct || 0;
     let fText, fSub, fColor = c;
     if (r.usageOnly) { fText = "No limit reported"; fSub = "Usage only, no remaining amount"; fColor = "var(--tx3)"; }
     else if (!r.known || proj == null) { fText = "No forecast"; fSub = r.known ? "Too early in the window" : "Window length unknown"; fColor = "var(--tx3)"; }
-    else if (proj > 100 && r.runOut) { fText = "Runs out in " + dur(r.runOut - now, 2); fSub = (sameDayIST(r.runOut, now) ? fTime(r.runOut) : fDT(r.runOut)) + " IST · " + dur(r.reset - r.runOut, 2) + " before reset"; }
-    else { fText = "Safe until reset"; fSub = "~" + proj + "% at reset"; }
+    else if (r.runOut && r.runOut < r.reset) { fText = "Runs out in " + dur(r.runOut - now, 2); fSub = (sameDayIST(r.runOut, now) ? fTime(r.runOut) : fDT(r.runOut)) + " IST · " + dur(r.reset - r.runOut, 2) + " before reset"; }
+    else { fText = "Safe until reset"; fSub = "~" + projR + "% at reset"; }
     return {
       id: r.id, prov: child ? "" : r.prov, win: r.win, usageOnly: !!r.usageOnly, usage: r.usage,
       usedW: pct + "%", projW: proj != null && pr > pct ? pr - pct + "%" : "0%", markL: "calc(" + pr + "% - 1px)", markD: proj != null ? "block" : "none", color: c,
-      usedLabel: r.used || (r.pct == null ? "—" : Math.round(r.pct) + "%"), projLabel: proj != null ? " → " + proj + "%" : "", fText, fSub, fColor,
+      usedLabel: r.used || (r.pct == null ? "—" : Math.round(r.pct) + "%"), projLabel: proj != null ? " → " + projR + "%" : "", fText, fSub, fColor,
       cd: r.usageOnly || !r.reset ? "—" : "in " + dur(r.reset - now), resetAbs: r.usageOnly || !r.reset ? "Not reported" : (sameDayIST(r.reset, now) ? "today " + fTime(r.reset) : fDT(r.reset)) + " IST",
       hasMore: !!r.more?.length && !all, moreLabel: agOpen ? "Hide models" : "+" + (r.more?.length || 0) + " models", moreIcon: agOpen ? "expand_less" : "expand_more",
       indent: child ? "18px" : "0px", bg: child ? "var(--bg)" : "transparent",
@@ -92,7 +97,7 @@ export default function QuotaRunway() {
               {r.isErr ? (
                 <div style={{ flex: "4 1 420px", minWidth: "0", display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px", background: "var(--redbg)", color: "var(--red)", borderRadius: "7px", padding: "6px 10px", fontSize: "12px" }}>
                   <span style={{ display: "flex", alignItems: "center", gap: "6px" }}><span style={{ ...MS, fontSize: "16px" }}>error</span>{r.err}</span>
-                  <button onClick={load} style={{ border: "0", background: "transparent", color: "var(--red)", fontWeight: "600", fontSize: "12px", cursor: "pointer", padding: "0" }}>Retry</button>
+                  <button onClick={() => load()} style={{ border: "0", background: "transparent", color: "var(--red)", fontWeight: "600", fontSize: "12px", cursor: "pointer", padding: "0" }}>Retry</button>
                 </div>
               ) : (
                 <>
@@ -155,7 +160,7 @@ export default function QuotaRunway() {
           <span style={{ ...MS, fontSize: "24px", color: "var(--red)" }}>error</span>
           <div style={{ fontWeight: "600" }}>Couldn&apos;t load quota windows</div>
           <div style={{ fontSize: "11.5px", color: "var(--tx3)" }}>The quota service did not answer.</div>
-          <button onClick={load} style={BTN}>Retry</button>
+          <button onClick={() => load()} style={BTN}>Retry</button>
         </div>
       )}
     </section>

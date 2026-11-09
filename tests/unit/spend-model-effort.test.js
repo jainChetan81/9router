@@ -13,4 +13,13 @@ describe("Spend model + effort grouping", () => {
     expect(high.v).toBeCloseTo(0.3);
     expect(unknown).toMatchObject({ k: "gpt-6-luna · Unknown", model: "gpt-6-luna", effort: "Unknown", v: 0.3, real: 0, req: 1, tok: 300 });
   });
+
+  it("tracks the estimated part of real spend", () => {
+    const groups = new Map();
+    addModelEffortUsage(groups, { model: "a/b", effort: "high", cost: 1, real: 1, realEst: 1, tokens: 10 });
+    addModelEffortUsage(groups, { model: "a/b", effort: "high", cost: 2, real: 1.5, tokens: 10 });
+    const [g] = [...groups.values()];
+    expect(g.real).toBeCloseTo(2.5);
+    expect(g.realEst).toBeCloseTo(1);
+  });
 });
