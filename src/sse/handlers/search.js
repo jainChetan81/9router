@@ -70,8 +70,10 @@ export async function handleSearch(request) {
     return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing required field: query");
   }
 
+  let guard;
   if (process.env.PII_GUARD_MODULE) {
-    const guard = await observeRequest(body, { endpoint: url.pathname, userAgent: request.headers.get("user-agent"), model: providerInput }, settings.piiGuard);
+    const combo = settings.piiGuard?.mode !== "off" && getComboModelsFromData(providerInput, await getCombos()) ? providerInput : undefined;
+    guard = await observeRequest(body, { endpoint: url.pathname, userAgent: request.headers.get("user-agent"), model: providerInput, combo }, settings.piiGuard);
     if (guard?.blocked) return errorResponse(HTTP_STATUS.BAD_REQUEST, blockMessage(guard.blocked, false));
     providerInput = body.provider || body.model; // redaction may have rewritten it
     query = body.query;
@@ -93,7 +95,7 @@ export async function handleSearch(request) {
     return handleComboChat({
       body,
       models: comboModels,
-      handleSingleModel: (b, m) => handleSingleProviderSearch(b, m, request, apiKey, settings),
+      handleSingleModel: (b, m) => handleSingleProviderSearch(b, m, request, apiKey, settings, guard, providerInput),
       log,
       comboName: providerInput,
       comboStrategy,
@@ -101,10 +103,10 @@ export async function handleSearch(request) {
     });
   }
 
-  return handleSingleProviderSearch(body, providerInput, request, apiKey, settings);
+  return handleSingleProviderSearch(body, providerInput, request, apiKey, settings, guard);
 }
 
-async function handleSingleProviderSearch(body, providerInput, request, apiKey, settings) {
+async function handleSingleProviderSearch(body, providerInput, request, apiKey, settings, guard, combo) {
   const query = body.query;
   const providerId = resolveProviderId(providerInput);
   const resolvedProvider = AI_PROVIDERS[providerId];
@@ -153,6 +155,7 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
       credentials: null,
       log
     });
+    await guard?.recordRouting?.({ provider: providerId, resolvedModel: providerId, account: null, ...(combo && { combo }) });
     if (result.success) return result.response;
     return result.response;
   }
@@ -191,6 +194,7 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
     }
 
     if (!credentials || credentials.allRateLimited) {
+      if (excludeConnectionIds.size === 0) await guard?.recordRouting?.({ provider: providerId, resolvedModel: providerId, account: null, ...(combo && { combo }) });
       if (credentials?.allRateLimited) {
         const errorMsg = lastError || credentials.lastError || "Unavailable";
         const status = lastStatus || Number(credentials.lastErrorCode) || HTTP_STATUS.SERVICE_UNAVAILABLE;
@@ -228,6 +232,7 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
       }
     });
 
+    await guard?.recordRouting?.({ provider: providerId, resolvedModel: providerId, account: credentials.connectionName, ...(combo && { combo }) });
     if (result.success) return result.response;
 
     const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, credentialProviderId, searchLockKey);

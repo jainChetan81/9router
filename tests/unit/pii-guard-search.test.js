@@ -4,7 +4,7 @@ const mocks = vi.hoisted(() => ({ observeRequest: vi.fn(), searchCore: vi.fn() }
 vi.mock("@/lib/piiGuard/observe.js", () => ({ observeRequest: mocks.observeRequest, blockMessage: (names, chat = true) => `pii-guard blocked a new value: ${names.join(", ")}.${chat ? " /rewind" : ""}` }));
 vi.mock("@/lib/localDb", () => ({ getSettings: async () => ({ requireApiKey: false, piiGuard: { mode: "redact" } }), getCombos: async () => [] }));
 vi.mock("../../src/sse/services/auth.js", () => ({ getProviderCredentials: vi.fn(), markAccountUnavailable: vi.fn(), clearAccountError: vi.fn(), extractApiKey: () => null, isValidApiKey: vi.fn() }));
-vi.mock("@/shared/constants/providers.js", () => ({ AI_PROVIDERS: { searxng: { noAuth: true, searchConfig: {} } }, resolveProviderId: id => id }));
+vi.mock("@/shared/constants/providers.js", () => ({ AI_PROVIDERS: { searxng: { noAuth: true, searchConfig: {} } }, resolveProviderId: id => id === "alias" ? "searxng" : id }));
 vi.mock("open-sse/handlers/search/index.js", () => ({ handleSearchCore: mocks.searchCore }));
 vi.mock("open-sse/utils/error.js", () => ({ errorResponse: (status, message) => Response.json({ error: message }, { status }), unavailableResponse: (status, message) => Response.json({ error: message }, { status }) }));
 vi.mock("open-sse/services/combo.js", () => ({ handleComboChat: vi.fn(), getComboModelsFromData: () => null }));
@@ -31,4 +31,17 @@ describe("PII guard search hook", () => {
     await handleSearch(req({ provider: "searxng", query: "mail a@b.co" }));
     expect(mocks.searchCore.mock.calls[0][0].body?.query ?? JSON.stringify(mocks.searchCore.mock.calls[0])).toContain("{{pii:email#abc123}}");
   });
+});
+
+
+it("records the resolved search provider after the no-auth attempt completes", async () => {
+  process.env.PII_GUARD_MODULE = "/scanner.js";
+  const recordRouting = vi.fn();
+  mocks.observeRequest.mockResolvedValue({ recordRouting });
+  mocks.searchCore.mockImplementation(async () => {
+    expect(recordRouting).not.toHaveBeenCalled();
+    return { success: true, response: Response.json({ ok: true }) };
+  });
+  expect((await handleSearch(req({ provider: "alias", query: "ordinary query" }))).status).toBe(200);
+  expect(recordRouting).toHaveBeenCalledWith({ provider: "searxng", resolvedModel: "searxng", account: null });
 });

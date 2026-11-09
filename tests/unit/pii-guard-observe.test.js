@@ -94,7 +94,7 @@ describe("PII guard modes", () => {
   it("redacts all scanned strings, including system and assistant history", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     const req = { system: pii, messages: [{ role: "user", content: pii }, { role: "assistant", content: pii }] };
-    expect(await observeRequest(req, meta, { mode: "redact" })).toBeUndefined();
+    expect((await observeRequest(req, meta, { mode: "redact" }))?.recordRouting).toEqual(expect.any(Function));
     expect(req.messages[0].content).toMatch(/^call me on mobile \{\{pii:in_phone#[0-9a-f]{6}\}\}$/);
     expect(req.messages[1].content).toMatch(/^call me on mobile \{\{pii:in_phone#[0-9a-f]{6}\}\}$/);
     expect(req.system).toMatch(/^call me on mobile \{\{pii:in_phone#[0-9a-f]{6}\}\}$/);
@@ -108,13 +108,13 @@ describe("PII guard modes", () => {
   });
   it("blocks by rule override and logs an error", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    expect(await observeRequest(body(pii), meta, { mode: "observe", rules: { in_phone: "block" } })).toEqual({ blocked: ["in_phone"] });
+    expect(await observeRequest(body(pii), meta, { mode: "observe", rules: { in_phone: "block" } })).toEqual({ blocked: ["in_phone"], recordRouting: expect.any(Function) });
     expect(error.mock.calls[0][0]).toContain("BLOCKED: in_phone");
     expect(error.mock.calls[0][0]).not.toContain("9876543210");
   });
   it("lets a rule override turn one rule off", async () => {
     const req = body(pii);
-    expect(await observeRequest(req, meta, { mode: "block", rules: { in_phone: "off" } })).toBeUndefined();
+    expect((await observeRequest(req, meta, { mode: "block", rules: { in_phone: "off" } }))?.blocked).toBeUndefined();
     expect(req.messages[0].content[0].content).toBe(pii);
   });
 });
@@ -122,7 +122,7 @@ describe("PII guard block scope", () => {
   it("blocks a match in the system prompt too", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     const req = { system: "mobile 9876543210", messages: [{ role: "user", content: "hi" }] };
-    expect(await observeRequest(req, meta, { mode: "block" })).toEqual({ blocked: ["in_phone"] });
+    expect(await observeRequest(req, meta, { mode: "block" })).toEqual({ blocked: ["in_phone"], recordRouting: expect.any(Function) });
   });
 });
 describe("PII guard full-body coverage", () => {
@@ -153,10 +153,10 @@ describe("PII guard full-body coverage", () => {
   it("blocks unseen values once, then redacts same history", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     const first = body(value);
-    expect(await observeRequest(first, meta, { mode: "block" })).toEqual({ blocked: ["own-test"] });
+    expect(await observeRequest(first, meta, { mode: "block" })).toEqual({ blocked: ["own-test"], recordRouting: expect.any(Function) });
     expect(await lines(1)).toBeTruthy();
     const second = body(value);
-    expect(await observeRequest(second, meta, { mode: "block" })).toBeUndefined();
+    expect((await observeRequest(second, meta, { mode: "block" }))?.blocked).toBeUndefined();
     expect(JSON.stringify(second)).not.toContain(value);
   });
   it("reports health and readonly findings", async () => {
@@ -184,13 +184,13 @@ describe("PII guard full-body coverage", () => {
     vi.resetModules();
     ({ observeRequest } = await import("../../src/lib/piiGuard/observe.js"));
     const first = body(value);
-    expect(await observeRequest(first, meta, { mode: "block" })).toEqual({ blocked: ["own-test"] });
+    expect(await observeRequest(first, meta, { mode: "block" })).toEqual({ blocked: ["own-test"], recordRouting: expect.any(Function) });
     await lines(2);
     await new Promise(resolve => setTimeout(resolve, 5100));
     vi.resetModules();
     ({ observeRequest } = await import("../../src/lib/piiGuard/observe.js"));
     const retry = body(value);
-    expect(await observeRequest(retry, meta, { mode: "block" })).toBeUndefined();
+    expect((await observeRequest(retry, meta, { mode: "block" }))?.blocked).toBeUndefined();
     expect(JSON.stringify(retry)).not.toContain(value);
   }, 10_000);
   it("counts invalid known-list errors", async () => {
@@ -251,7 +251,7 @@ describe("PII guard test preview", () => {
     expect(first).toMatchObject({ blocked: ["own-test"] });
     expect(first.stuck).toBeUndefined();
     const b = thinking(false);
-    expect(await observeRequest(b, meta, { mode: "block" })).toBeUndefined();
+    expect((await observeRequest(b, meta, { mode: "block" }))?.blocked).toBeUndefined();
     expect(b.messages[1].content.map(c => c.type)).toEqual(["tool_use"]);
     expect(JSON.stringify(b)).not.toContain(value);
   });
@@ -293,6 +293,86 @@ describe("PII guard test preview", () => {
     const event = JSON.parse((await lines(1)).trim());
     expect(event.leaked).toBeTruthy();
     expect(event.hits.some(h => h.action === "leaked")).toBe(true);
+  });
+});
+
+describe("PII guard routing records", () => {
+  it("writes the scan before returning, including blocked requests", async () => {
+    const guard = await observeRequest(body(value), { ...meta, combo: "daily" }, { mode: "block" });
+    const scan = JSON.parse((await readFile(events, "utf8")).trim());
+    expect(scan).toMatchObject({ model: "test", combo: "daily", blocked: ["own-test"] });
+    expect(guard.blocked).toEqual(["own-test"]);
+    expect(scan.kind).toBeUndefined();
+    expect(scan.provider).toBeUndefined();
+  });
+
+  it("appends complete attempt records without changing the original event", async () => {
+    const guard = await observeRequest(body(value), { ...meta, combo: "daily" });
+    const original = await readFile(events, "utf8");
+    await guard.recordRouting({ provider: "first", account: "acc-one", resolvedModel: "first/m" });
+    await guard.recordRouting({ provider: "second", account: "acc-two", resolvedModel: "second/m" });
+    const text = await readFile(events, "utf8");
+    expect(text.startsWith(original)).toBe(true);
+    const [scan, first, last] = text.trim().split("\n").map(JSON.parse);
+    expect(first).toMatchObject({ kind: "routing", requestId: scan.requestId, provider: "first", combo: "daily" });
+    expect(last).toMatchObject({ kind: "routing", requestId: scan.requestId, provider: "second", account: "acc-two", resolvedModel: "second/m", combo: "daily" });
+    expect(text).not.toContain(value);
+  });
+
+  it("does not write events or routing for requests without hits or prompts", async () => {
+    const guard = await observeRequest(body("ordinary words"), meta);
+    await guard?.recordRouting?.({ provider: "unused" });
+    await expect(stat(events)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("validates every routing identifier and drops detector hits", async () => {
+    const guard = await observeRequest(body(value), meta);
+    await guard.recordRouting({ provider: "bad id!", combo: "a".repeat(65), account: value, resolvedModel: "x/1+fast" });
+    const [, route] = (await readFile(events, "utf8")).trim().split("\n").map(JSON.parse);
+    expect(route.provider).toBeUndefined();
+    expect(route.combo).toBeUndefined();
+    expect(route.account).toBeUndefined();
+    expect(route.resolvedModel).toBe("x/1+fast");
+  });
+
+  it("drops routing values when the detector throws", async () => {
+    const fake = join(dir, "throwing.mjs");
+    await writeFile(fake, `
+      export function createDetector() { return { scan(s) { if (s === 'bad-id') throw Error('scan failed'); return []; } }; }
+      export function scanBody() { return { findings: [{ hash: 'abcdef012345', rule: 'known', kind: 'known', source: 'user/text', path: 'messages[0].content' }], unscanned: {} }; }
+    `);
+    process.env.PII_GUARD_MODULE = fake;
+    const guard = await observeRequest(body("hello"), { ...meta, provider: "bad-id" });
+    await guard.recordRouting({ provider: "bad-id", combo: "bad-id", account: "bad-id", resolvedModel: "bad-id" });
+    const rows = (await readFile(events, "utf8")).trim().split("\n").map(JSON.parse);
+    for (const row of rows) for (const key of ["provider", "combo", "account", "resolvedModel"]) expect(row[key]).toBeUndefined();
+  });
+
+  it("updates masked prompts when routing arrives before or after their write", async () => {
+    process.env.PII_GUARD_PROMPTS = join(dir, "prompts.db");
+    const P = await import("../../src/lib/piiGuard/prompts.js");
+    try {
+      const guard = await observeRequest(body("ordinary prompt words"), { ...meta, combo: "daily" });
+      const scan = JSON.parse((await readFile(events, "utf8")).trim());
+      await guard.recordRouting({ provider: "first", account: "acc-one", resolvedModel: "first/m" });
+      P.flush();
+      expect(P.search({ requestId: scan.requestId }).rows[0]).toMatchObject({ provider: "first", combo: "daily", account: "acc-one" });
+      await guard.recordRouting({ provider: "second", account: "acc-two", resolvedModel: "second/m" });
+      expect(P.search({ requestId: scan.requestId }).rows[0]).toMatchObject({ provider: "second", combo: "daily", account: "acc-two" });
+    } finally { P._reset(); }
+  });
+
+  it("skips routing when a repeated prompt adds no stored rows", async () => {
+    process.env.PII_GUARD_PROMPTS = join(dir, "prompts.db");
+    const P = await import("../../src/lib/piiGuard/prompts.js");
+    try {
+      const context = { ...meta, sessionId: "repeat-session" };
+      await observeRequest(body("ordinary repeated prompt"), context);
+      const original = await readFile(events, "utf8");
+      const guard = await observeRequest(body("ordinary repeated prompt"), context);
+      await guard?.recordRouting?.({ provider: "unused" });
+      expect(await readFile(events, "utf8")).toBe(original);
+    } finally { P._reset(); }
   });
 });
 

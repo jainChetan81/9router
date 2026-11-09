@@ -82,6 +82,32 @@ describe("summarize trend", () => {
   });
 });
 
+describe("summary routing context", () => {
+  it("groups carry the latest provider and combo, and OCR rows keep them", () => {
+    const now = Date.parse("2026-01-02T00:00:00.000Z");
+    const hit = (hash) => ({ hash, rule: "email", source: "user/text", action: "redact" });
+    const events = [
+      { ts: "2026-01-01T22:00:00.000Z", provider: "old-provider", combo: "", hits: [hit("aaaaaaaaaaaa")] },
+      { ts: "2026-01-01T23:00:00.000Z", provider: "new-provider", combo: "daily-combo", hits: [hit("aaaaaaaaaaaa")] },
+      { ts: "2026-01-01T23:10:00.000Z", type: "ocr", requestId: "ocr1", status: "scanned", cache: "miss", ocrMs: 5, provider: "ocr-provider", combo: "ocr-combo", hits: [] },
+    ];
+    const r = summarize(events, { now });
+    expect(r.groups[0]).toMatchObject({ provider: "new-provider", combo: "daily-combo" });
+    expect(r.ocr.recent[0]).toMatchObject({ requestId: "ocr1", provider: "ocr-provider", combo: "ocr-combo" });
+    // An empty combo string never lands in the group.
+    expect(events.some((e) => e.combo === "" && r.groups.some((g) => g.combo === ""))).toBe(false);
+  });
+  it("the latest event clears stale provider and combo when it carries none", () => {
+    const now = Date.parse("2026-01-02T00:00:00.000Z");
+    const hit = { hash: "aaaaaaaaaaaa", rule: "email", source: "user/text", action: "redact" };
+    const r = summarize([
+      { ts: "2026-01-01T22:00:00.000Z", provider: "old-provider", combo: "old-combo", hits: [hit] },
+      { ts: "2026-01-01T23:00:00.000Z", hits: [hit], model: "solo-model" },
+    ], { now });
+    expect(r.groups[0]).toMatchObject({ provider: null, combo: null, model: "solo-model" });
+  });
+});
+
 describe("summary OCR recent list", () => {
   it("keeps only the newest 20 OCR records, even across the batch trim", () => {
     const base = Date.now() - 3600e3;
@@ -109,5 +135,22 @@ describe("summary byAction", () => {
     expect(Object.values(all).reduce((a, b) => a + b, 0)).toBe(result.unique24h);
     expect(result.byAction.all.requests).toEqual({ redact: 3, block: 1, observe: 1 });
     expect(result.blocked24h).toBe(1);
+  });
+});
+
+
+describe("summary routing records", () => {
+  it("uses the last appended attempt without counting routing as a request or changing event time", () => {
+    const now = Date.now(), ts = new Date(now - 5000).toISOString();
+    const hit = { hash: "aaaaaaaaaaaa", rule: "email", action: "observe" };
+    const events = [
+      { ts, requestId: "r1", combo: "daily", hits: [hit] },
+      { ts, kind: "routing", requestId: "r1", provider: "failed", account: "first" },
+      { ts: new Date(now + 1000).toISOString(), kind: "routing", requestId: "r1", provider: "served", combo: "daily", account: "last" },
+    ];
+    const result = summarize(events, { now });
+    expect(result.requests).toBe(1);
+    expect(result.groups[0]).toMatchObject({ provider: "served", combo: "daily", lastSeen: ts, turns: 1 });
+    expect(result.byRule.email.hits).toBe(1);
   });
 });
