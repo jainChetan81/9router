@@ -113,9 +113,10 @@ export function createSSEStream(options = {}) {
     body = null,
     onStreamComplete = null,
     apiKey = null,
-    credentials = null
+    credentials = null,
+    eventFormat = null
   } = options;
-  const semanticFormat = targetFormat || (
+  const semanticFormat = targetFormat || eventFormat || (
     ["antigravity", "gemini", "gemini-cli", "vertex"].includes(provider) ? FORMATS.GEMINI : FORMATS.OPENAI
   );
 
@@ -671,9 +672,12 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
   });
 }
 
-export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, toolNameMap = null) {
+export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, toolNameMap = null, eventFormat = null) {
   return createSSEStream({
     mode: STREAM_MODE.PASSTHROUGH,
+    // Passthrough streams carry events in the provider format; the first-token
+    // check must read them in that format (e.g. Claude content_block_delta).
+    eventFormat,
     provider,
     reqLogger,
     toolNameMap,
