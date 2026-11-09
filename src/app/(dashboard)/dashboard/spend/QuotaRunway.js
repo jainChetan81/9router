@@ -23,8 +23,8 @@ export default function QuotaRunway() {
       const body = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(body.error || r.statusText);
       const rows = Array.isArray(body.rows) ? body.rows : [];
-      setRes({ state: rows.length ? "live" : "empty", rows, at: Date.now() });
-    } catch { setRes((r) => (quiet && r.state === "live" ? r : { state: "error", rows: [], at: null })); }
+      setRes({ state: rows.length ? "live" : "empty", rows, at: Date.now(), stale: false });
+    } catch { setRes((r) => (quiet && r.state === "live" ? { ...r, stale: true } : { state: "error", rows: [], at: null })); }
   }, []);
   useEffect(() => { const t = setTimeout(load, 0); return () => clearTimeout(t); }, [load]);
   useEffect(() => { const iv = setInterval(() => setNow(Date.now()), 30000); return () => clearInterval(iv); }, []);
@@ -67,8 +67,9 @@ export default function QuotaRunway() {
         <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
           <span style={{ fontSize: "11.5px", fontWeight: "600", letterSpacing: ".05em", color: "var(--tx2)", textTransform: "uppercase" }}>Quota runway</span>
           <span style={{ display: "inline-flex", alignItems: "center", gap: "6px", fontSize: "11px", color: "var(--tx3)" }}>
-            <span style={{ width: "7px", height: "7px", borderRadius: "50%", background: res.state === "error" ? "var(--red)" : "var(--green)" }}></span>
-            Live, not affected by range{res.at ? " · updated " + fTime(res.at) + " IST" : ""}
+            <span style={{ width: "7px", height: "7px", borderRadius: "50%", background: res.state === "error" ? "var(--red)" : res.stale ? "var(--amber)" : "var(--green)" }}></span>
+            {res.stale ? "Refresh failed, showing data from " + fTime(res.at) + " IST" : "Live, not affected by range" + (res.at ? " · updated " + fTime(res.at) + " IST" : "")}
+            {res.stale && <button onClick={() => load()} style={{ border: "0", background: "transparent", color: "var(--acc)", fontSize: "11px", cursor: "pointer", padding: "0" }}>Retry</button>}
           </span>
         </div>
         <a href="/dashboard/quota" style={{ fontSize: "12px", display: "inline-flex", alignItems: "center", gap: "2px" }}>Details in Quota Tracker<span style={{ ...MS, fontSize: "15px" }}>arrow_forward</span></a>

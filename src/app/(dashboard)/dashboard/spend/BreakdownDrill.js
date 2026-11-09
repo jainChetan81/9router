@@ -5,6 +5,7 @@
 import { useState } from "react";
 import { fN, fP, fR, fT, fV, fVpr, sum } from "@/lib/spend/uiHelpers";
 import useWidth from "./useWidth";
+import { fmtFee } from "./view";
 
 const MS = { fontFamily: "'Material Symbols Outlined'", lineHeight: 1 };
 const SPC = ["var(--tx)", "var(--blue)", "var(--amber)", "var(--green)"], SPN = ["Uncached input", "Cache read", "Cache write", "Output"];
@@ -65,7 +66,7 @@ export default function BreakdownDrill({ data, state, group, onGroup, onRetry, o
     const G = data.groups;
     if (group === "provider") {
       const feeKey = Object.fromEntries((data.subsMeta || []).map((m) => [m.provider, m.k]));
-      const fee = (k) => { const f = data.fees?.[feeKey[k]]; return f !== null && f !== undefined && f !== "" ? " · $" + (+f).toFixed(0) + "/mo" : ""; };
+      const fee = (k) => { const f = data.fees?.[feeKey[k]]; return f !== null && f !== undefined && f !== "" ? " · " + fmtFee(f) + "/mo" : ""; };
       const tree = (G.providerTree || []).map((p) => node(p, PROV[p.k] || p.k, (DESC[p.k] || "Provider") + (feeKey[p.k] ? fee(p.k) : ""), {
         id: p.k, models: (p.models || []).map((m) => node(m, m.k, "", { efforts: (m.efforts || []).map((e) => node(e, e.k, "")) })),
       }));
