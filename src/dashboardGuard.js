@@ -52,6 +52,7 @@ const ALWAYS_PROTECTED = [
   "/api/pii-guard/image",
   // Masked prompts still hold values the rules miss.
   "/api/pii-guard/prompts",
+  "/api/agents",
 ];
 
 // Require auth, but allow through if requireLogin is disabled

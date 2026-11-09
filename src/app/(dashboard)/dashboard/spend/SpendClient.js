@@ -303,6 +303,7 @@ export default function SpendClient() {
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
                 <div style={{ display: "flex", flexDirection: "column", gap: "2px" }}><span style={{ fontSize: "11.5px", fontWeight: "600", letterSpacing: ".05em", color: "var(--tx2)" }}>AGENTS AND SESSIONS</span><span style={{ fontSize: "11.5px", color: "var(--tx3)" }}>{ag.sub}</span></div>
                 <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+                  <a href="/dashboard/agents" style={{ fontSize: "12px" }}>Open in Agents</a>
                   {(ag.filter) && (<><button onClick={ag.clearFilter} style={{ display: "flex", alignItems: "center", gap: "4px", height: "26px", padding: "0 6px 0 10px", borderRadius: "13px", border: "0", background: "var(--acc2)", color: "var(--acc)", font: "inherit", fontSize: "12px", fontWeight: "600", cursor: "pointer" }}>Session {ag.filter}<span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: "16px" }}>close</span></button></>)}
                   <div style={{ display: "flex", gap: "2px", padding: "3px", borderRadius: "9px", background: "var(--seg)" }}>{(ag.views).map((g, _i) => (<Fragment key={_i}><button onClick={g.on} style={g.style}>{g.label}</button></Fragment>))}</div>
                 </div>

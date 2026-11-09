@@ -1,0 +1,11 @@
+/* Agents page extras on top of the shared spend.css tokens. */
+@media (prefers-reduced-motion: reduce) {
+  [data-r9] * { animation: none !important; }
+}
+@keyframes r9pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+[data-r9] .r9-h1 { color: var(--tx); }
+[data-r9] select option { background: var(--card); color: var(--tx); }
+[data-r9] input::placeholder { color: var(--tx3); }
