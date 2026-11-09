@@ -215,6 +215,7 @@ function isMainRole(role) { return !SUBAGENT_ROLES.has(role); }
 const PARENT_WINDOW_MS = 60 * 60 * 1000;
 const PARENT_CANDIDATE_CAP = 200;
 const inferredParentCache = new Map();
+const INFERRED_PARENT_CACHE_CAP = 5000;
 export const SESSION_CAP = 2000;
 export const ANALYTICS_SAMPLE_CAP = 20_000;
 const GROUP_ROW_CAP = 20_000;
@@ -287,6 +288,9 @@ export function inferParents(sessions) {
     }
     if (best) {
       const assignment = { session: best.session, inferred: true, parentGuessed: true };
+      if (inferredParentCache.size >= INFERRED_PARENT_CACHE_CAP) {
+        inferredParentCache.delete(inferredParentCache.keys().next().value);
+      }
       inferredParentCache.set(cSess, assignment);
       map.set(cSess, assignment);
     }
@@ -692,11 +696,6 @@ async function getAnalyticsInline(db, fromIso, toIso) {
 
   const totalRequests = metricRows.reduce((sum, row) => sum + Number(row.requests || 0), 0);
   const totalReqs = totalRequests || 1;
-  const byRole = [...byRoleMap.values()].map((r) => ({
-    ...r,
-    value: num(r.value),
-    share: r.requests / totalReqs,
-  })).sort((a, b) => b.requests - a.requests);
   for (const row of metricRows) {
     const role = row.role || "direct";
     let roleEntry = byRoleMap.get(role);
@@ -829,7 +828,7 @@ function mergeLiveSnapshot(result, activeBySession, nowMs) {
         role.inFlight = roleRequests.length;
         role.model = current.model || role.model || "unknown";
         role.state = roleRequests.some((request) => request.firstTokenAt != null) ? "streaming" : "thinking";
-        role.lastActivityMs = Date.now();
+        role.lastActivityMs = nowMs;
         role.idleSeconds = 0;
         role.tps ??= null;
         role.p50Ms ??= null;
@@ -839,7 +838,7 @@ function mergeLiveSnapshot(result, activeBySession, nowMs) {
       const count = requests.length;
       session.roles = [...roles.values()];
       session.inFlight = (session.inFlight || 0) + count;
-      session.lastActivityMs = Date.now();
+      session.lastActivityMs = nowMs;
       session.pulsing = true;
       session.reqPerMin = ((session.reqPerMin || 0) * 5 + count) / 5;
       if (!session.lastTs || session.lastTs < nowIso) session.lastTs = nowIso;

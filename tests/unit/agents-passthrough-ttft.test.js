@@ -47,4 +47,19 @@ describe("translated Antigravity TTFT", () => {
     await drain;
     expect(Number.isFinite(ttftAt)).toBe(true);
   });
+  it("marks the first token when Antigravity wraps chunks in a response envelope", async () => {
+    let ttftAt;
+    const transform = createSSETransformStreamWithLogger(
+      "antigravity", "openai", "antigravity", null, null, "gemini-3.8-flash-high", null, {},
+      (_content, _usage, value) => { ttftAt = value; },
+    );
+    const writer = transform.writable.getWriter();
+    const reader = transform.readable.getReader();
+    const drain = (async () => { while (!(await reader.read()).done); })();
+    await writer.write(enc.encode(`data: ${JSON.stringify({ response: { candidates: [{ content: { parts: [{ text: "Hi" }] } }] } })}\n\n`));
+    await writer.write(enc.encode(`data: ${JSON.stringify({ response: { candidates: [{ finishReason: "STOP" }] } })}\n\n`));
+    await writer.close();
+    await drain;
+    expect(Number.isFinite(ttftAt)).toBe(true);
+  });
 });
