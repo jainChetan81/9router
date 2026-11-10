@@ -10,6 +10,8 @@ import { buildView } from "./view";
 import { feesValid } from "./helpers";
 import "./spend.css";
 import RefreshBar from "./RefreshBar";
+import SyncButton from "./SyncButton";
+import useAutoSync from "./useAutoSync";
 import { cacheGet, cacheSet, cacheInvalidate, isFresh, updatedAgo } from "@/lib/clientCache";
 import "./shared-page.css";
 
@@ -49,6 +51,10 @@ export default function SpendClient() {
   const [refreshing, setRefreshing] = useState(false);
   const [loadedAt, setLoadedAt] = useState(0);
   const [nowTick, setNowTick] = useState(() => Date.now());
+  // Sync: drop cached Spend data and read everything fresh (range data, quota, balances).
+  const [syncNonce, setSyncNonce] = useState(0);
+  const sync = useCallback(() => { cacheInvalidate("/api/spend"); setSyncNonce((n) => n + 1); }, []);
+  const autoSync = useAutoSync("spend", sync);
   useEffect(() => { const t = setInterval(() => setNowTick(Date.now()), 30_000); return () => clearInterval(t); }, []);
   const load = useCallback(async () => {
     const id = ++loadId.current; // ignore responses from superseded ranges
@@ -85,7 +91,7 @@ export default function SpendClient() {
   useEffect(() => {
     const t = setTimeout(load, 0);
     return () => clearTimeout(t);
-  }, [load]);
+  }, [load, syncNonce]);
 
   // Provider balances come from the Quota Tracker endpoints.
   useEffect(() => {
@@ -104,7 +110,7 @@ export default function SpendClient() {
       if (!off) setQuota(out);
     }).catch(() => {});
     return () => { off = true; };
-  }, []);
+  }, [syncNonce]);
 
   const checkFade = useCallback(() => {
     const f = (el) => !!el && el.scrollWidth - el.clientWidth - el.scrollLeft > 2;
@@ -167,6 +173,7 @@ export default function SpendClient() {
             <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
               <RangeBar preset={preset} customLabel={customLabel} onChange={onRange} today={todayKey} />
               {(loadedAt > 0) && (<span className="r9-spend-refreshing" title={new Date(loadedAt).toLocaleString()} style={{ fontSize: "11.5px", color: "var(--tx3)", whiteSpace: "nowrap" }}>{refreshing ? "Refreshing…" : updatedAgo(loadedAt, nowTick)}</span>)}
+              <SyncButton sync={autoSync} busy={refreshing} />
             </div>
             <span className="r9-spend-ist-note" style={{ fontSize: 11, color: "var(--tx2)", display: "flex", alignItems: "center", gap: 4 }}><span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: 14 }}>schedule</span>Times in IST (UTC+5:30) · Real spend logging began Nov 9</span>
           </div>
@@ -222,7 +229,7 @@ export default function SpendClient() {
             </div>
           </>)}
 
-          <QuotaRunway />
+          <QuotaRunway syncNonce={syncNonce} />
           {(s.real) && (<>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(300px,1fr))", gap: "16px" }}>
               <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: "12px", boxShadow: "var(--shadow)", padding: "16px 18px", display: "flex", flexDirection: "column", gap: "14px" }}>

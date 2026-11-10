@@ -8,6 +8,9 @@ import "../spend/spend.css";
 import "../spend/shared-page.css";
 import "./agents.css";
 import RefreshBar from "../spend/RefreshBar";
+import SyncButton from "../spend/SyncButton";
+import useAutoSync from "../spend/useAutoSync";
+import { cacheInvalidate } from "@/lib/clientCache";
 import { cacheGet, cacheSet, isFresh } from "@/lib/clientCache";
 
 const RANGE_TTL = 5 * 60_000;
@@ -198,22 +201,8 @@ export default function AgentsClient() {
   }, [set]);
   useEffect(() => { const t = setTimeout(loadLive, 0); return () => clearTimeout(t); }, [loadLive, tick]);
 
-  // Live poll: every 2 s, skipped while paused or when the tab is hidden.
-  useEffect(() => {
-    let t = null;
-    const paused = () => uiRef.current.paused;
-    const tick2 = () => { if (!document.hidden && !paused()) { setTick((x) => x + 1); } };
-    const vis = () => { if (!document.hidden && !paused()) setTick((x) => x + 1); };
-    tick2();
-    t = setInterval(tick2, 2000);
-    document.addEventListener("visibilitychange", vis);
-    return () => { clearInterval(t); document.removeEventListener("visibilitychange", vis); };
-  }, []);
-
-  useEffect(() => {
-    const t = setTimeout(() => set((u) => ({ ...u, ago: Math.min(999, (u.ago || 0) + 2) })), 2000);
-    return () => clearTimeout(t);
-  }, [tick, set]);
+  // No fixed polling: the page sync control (default every 10 s, saved on the
+  // server) bumps `tick`, which reloads live data; "Sync now" also reloads ranges.
 
 
   const rangeId = useRef(0);
@@ -267,12 +256,19 @@ export default function AgentsClient() {
     }
   }, [range]);
   useEffect(() => { const t = setTimeout(() => loadRange(), 0); return () => clearTimeout(t); }, [loadRange, rangeNonce]);
-  useEffect(() => {
-    const iv = setInterval(() => { if (!document.hidden && !uiRef.current.paused) loadRange({ background: true }); }, 30000);
-    const vis = () => { if (!document.hidden && !uiRef.current.paused) loadRange({ background: true }); };
-    document.addEventListener("visibilitychange", vis);
-    return () => { clearInterval(iv); document.removeEventListener("visibilitychange", vis); };
+  // Auto-sync tick: live feed every time; sessions and analytics every 3rd tick at most once a minute.
+  const lastRangeSync = useRef(0);
+  const syncAll = useCallback((force = false) => {
+    setTick((x) => x + 1);
+    const now = Date.now();
+    if (force || now - lastRangeSync.current >= 60_000) {
+      lastRangeSync.current = now;
+      if (force) cacheInvalidate("/api/agents");
+      loadRange({ background: !force });
+    }
   }, [loadRange]);
+  const autoSync = useAutoSync("agents", () => syncAll(false));
+  const manualSync = useCallback(() => syncAll(true), [syncAll]);
 
   useEffect(() => {
     let cancelled = false;
@@ -345,11 +341,12 @@ export default function AgentsClient() {
   }, [ui.tab, sel, loadDetail]);
   // A live session's detail refreshes every 10 s; ended sessions do not change (N5).
   const selLive = !!(sel && live?.sessions?.some((x) => x.session === sel));
+  // A live session's detail follows the page sync ticks; ended sessions do not change (N5).
   useEffect(() => {
-    if (ui.tab !== "sessions" || !sel || !selLive) return;
-    const iv = setInterval(() => { if (!document.hidden && !uiRef.current.paused) loadDetail(sel); }, 10000);
-    return () => clearInterval(iv);
-  }, [ui.tab, sel, selLive, loadDetail]);
+    if (ui.tab !== "sessions" || !sel || !selLive || !tick) return;
+    const t = setTimeout(() => loadDetail(sel), 0);
+    return () => clearTimeout(t);
+  }, [ui.tab, sel, selLive, loadDetail, tick]);
 
   const loadMore = useCallback(async () => {
     if (!moreCursor || moreBusy || rangeBusy) return;
@@ -481,11 +478,8 @@ export default function AgentsClient() {
             }}>
               {v.tabs.map((t) => <button key={t.label} onClick={t.on} style={t.style} role="tab" aria-selected={ui.tab === t.label.toLowerCase()} aria-label={t.count ? t.label + " " + t.count : t.label}>{t.dot && <span style={t.dot} />}{t.label}{t.count && <span style={{ fontSize: 11, color: "var(--tx2)", marginLeft: 8 }}>{t.count}</span>}</button>)}
             </div></div>
-            {ui.tab === "live" ? (
-              <button onClick={v.togglePause} aria-label={v.paused ? "Resume live feed" : "Pause live feed"} style={{ display: "flex", alignItems: "center", gap: 7, border: 0, background: "transparent", padding: 0, font: "inherit", fontSize: 12, color: v.fresh.c, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>
-                <span style={v.fresh.dot} />{v.fresh.text}<span className="r9-hacc" style={{ fontFamily: "'Material Symbols Outlined'", fontSize: 15 }}>{v.fresh.icon}</span>{v.fresh.btn}
-              </button>
-            ) : <div onClick={(e) => { if (rangeBusy) e.stopPropagation(); }}><RangeBar preset={v.preset} customLabel={v.customLabel} onChange={onRange} /></div>}
+            {ui.tab === "live" ? null : <div onClick={(e) => { if (rangeBusy) e.stopPropagation(); }}><RangeBar preset={v.preset} customLabel={v.customLabel} onChange={onRange} /></div>}
+            <SyncButton sync={{ ...autoSync, manual: manualSync }} busy={rangeBusy} />
           </div>
           <div style={{ fontSize: 11, color: "var(--tx2)", display: "flex", alignItems: "center", gap: 4 }}><span className="material-symbols-outlined" style={{ fontSize: 14 }}>schedule</span>Times in IST (UTC+5:30) · Agent telemetry logging began Nov 9</div>
         </div>

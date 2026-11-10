@@ -14,7 +14,7 @@ const RC = { high: "var(--red)", warn: "var(--amber)", ok: "var(--green)", unkno
 const STATE = { padding: "26px 12px", textAlign: "center", borderTop: "1px solid var(--line)", display: "flex", flexDirection: "column", alignItems: "center", gap: "6px" };
 const BTN = { border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", borderRadius: "7px", height: "28px", padding: "0 12px", fontSize: "12px", cursor: "pointer" };
 
-export default function QuotaRunway() {
+export default function QuotaRunway({ syncNonce = 0 }) {
   const [res, setRes] = useState({ state: "loading", rows: [], at: null });
   const [all, setAll] = useState(false), [agOpen, setAgOpen] = useState(false), [now, setNow] = useState(() => Date.now());
   const [ref, w] = useWidth();
@@ -39,11 +39,12 @@ export default function QuotaRunway() {
   }, []);
   useEffect(() => { const t = setTimeout(() => load({ quiet: !!cacheGet(QUOTA_URL), useCache: true }), 0); return () => clearTimeout(t); }, [load]);
   useEffect(() => { const iv = setInterval(() => setNow(Date.now()), 30000); return () => clearInterval(iv); }, []);
-  // Live data: refetch every 2 minutes while the tab is visible (the API caches for 60 s).
+  // No polling: the page Sync button bumps syncNonce for a fresh read.
   useEffect(() => {
-    const iv = setInterval(() => { if (document.visibilityState === "visible") load({ quiet: true }); }, 120000);
-    return () => clearInterval(iv);
-  }, [load]);
+    if (!syncNonce) return;
+    const t = setTimeout(() => load({ quiet: true }), 0);
+    return () => clearTimeout(t);
+  }, [syncNonce, load]);
 
   const sorted = useMemo(() => sortQuotaRunway(mapQuotaRows(res.rows)), [res.rows]);
   const total = quotaTotal(sorted);

@@ -3,6 +3,7 @@ import { getSettings, updateSettings } from "@/lib/localDb";
 import { applyOutboundProxyEnv } from "@/lib/network/outboundProxy";
 import { resetComboRotation } from "open-sse/services/combo.js";
 import bcrypt from "bcryptjs";
+import { sanitizeDashboardSync } from "@/lib/dashboardSync";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -45,6 +46,12 @@ export async function PATCH(request) {
 
     if (Object.prototype.hasOwnProperty.call(body, "piiGuard")) {
       return NextResponse.json({ error: "Use /api/pii-guard to update PII Guard settings" }, { status: 400 });
+    }
+
+    if (Object.prototype.hasOwnProperty.call(body, "dashboardSync")) {
+      const clean = sanitizeDashboardSync(body.dashboardSync);
+      if (!clean) return NextResponse.json({ error: "Invalid dashboardSync" }, { status: 400 });
+      body.dashboardSync = clean;
     }
 
     // Strip protected secrets before any internal handling sets them

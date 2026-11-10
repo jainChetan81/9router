@@ -8,6 +8,8 @@ import { applyIgnoreToSummary } from "@/lib/piiGuard/summary";
 import { buildView, isRefreshingState, place, PAGE, buildPromptFilterKey, buildPromptRequestKey, canLandOnPrompt, buildSessionFilterKey, buildSessionRequestKey, findingMarkers, groupMessages, toolFormat, collapseDefault, PROSE_LINES, ALABEL, stamp, age } from "./view";
 import "../spend/spend.css";
 import RefreshBar from "../spend/RefreshBar";
+import SyncButton from "../spend/SyncButton";
+import useAutoSync from "../spend/useAutoSync";
 import { cacheGet, cacheSet, cacheInvalidate } from "@/lib/clientCache";
 
 const summaryKey = (rk) => `/api/pii-guard?range=${rk}`;
@@ -223,17 +225,15 @@ export default function PiiGuardClient() {
       if (seq === loadSeqRef.current) setRefreshReason(null);
     }
   }, [range, rangeKey]);
-  // Poll every 30 s while the tab is visible. The next poll starts after the last one ends; a hidden tab
-  // stops polling and reloads when it is shown again.
+  // Load on open and on range change. No fixed polling: the page sync control
+  // (off by default, interval saved on the server) and "Sync now" reload it.
   useEffect(() => {
-    let t, gen = 0, off = false; // `gen`: only the newest tick schedules the next one, so chains never double up
-    const initialReason = loadedKeyRef.current === null ? "initial" : loadedKeyRef.current !== rangeKey ? "range" : "poll";
-    const tick = async (reason = "poll") => { clearTimeout(t); const g = ++gen; if (document.visibilityState !== "visible") return; await load(reason); if (!off && g === gen) t = setTimeout(() => tick("poll"), 30e3); };
-    const onVis = () => { if (document.visibilityState === "visible") tick("poll"); else clearTimeout(t); };
-    tick(initialReason);
-    document.addEventListener("visibilitychange", onVis);
-    return () => { off = true; clearTimeout(t); loadCtl.current?.abort(); document.removeEventListener("visibilitychange", onVis); };
+    const reason = loadedKeyRef.current === null ? "initial" : loadedKeyRef.current !== rangeKey ? "range" : "poll";
+    const t = setTimeout(() => load(reason), 0);
+    return () => { clearTimeout(t); loadCtl.current?.abort(); };
   }, [load, rangeKey]);
+  const autoSync = useAutoSync("piiGuard", () => load("poll"));
+  const manualSync = useCallback(() => load("manual"), [load]);
 
   // Event log: 50 events per page, newest first, flattened to one row per hit. The server applies the
   // client, model, source and action filters. The 30 s refresh reloads only the newest page.
@@ -517,6 +517,7 @@ export default function PiiGuardClient() {
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", minWidth: "0", maxWidth: "100%" }}>
           <RangeBar preset={preset} customLabel={customLabel} onChange={onRange} today={todayKey} />
+          <SyncButton sync={{ ...autoSync, manual: manualSync }} busy={isRefreshing} />
         </div>
       </div>
     </>)}

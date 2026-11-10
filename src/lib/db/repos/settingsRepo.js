@@ -127,6 +127,10 @@ export async function updateSettings(updates) {
       if (up.rules !== undefined || cur.rules) next.piiGuard.rules = up.rules !== undefined ? up.rules : cur.rules;
       if (cur.ocr || up.ocr) next.piiGuard.ocr = { ...(cur.ocr || {}), ...(up.ocr || {}) };
     }
+    // Per-page auto-sync intervals: each page writes only its own key.
+    if (updates.dashboardSync && current.dashboardSync && typeof current.dashboardSync === "object") {
+      next.dashboardSync = { ...current.dashboardSync, ...updates.dashboardSync };
+    }
     db.run(
       `INSERT INTO settings(id, data) VALUES(1, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data`,
       [stringifyJson(next)],
