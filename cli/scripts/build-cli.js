@@ -35,15 +35,51 @@ function shouldExclude(name) {
   });
 }
 
-function copyRecursive(src, dest) {
+let totalCopiedBytes = 0;
+
+function copyByteLimit() {
+  const raw = process.env.NINEROUTER_CLI_MAX_COPY_BYTES;
+  if (raw == null || raw === "") {
+    return 4 * 1024 * 1024 * 1024;
+  }
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 4 * 1024 * 1024 * 1024;
+}
+
+function accountCopiedBytes(bytes) {
+  totalCopiedBytes += bytes;
+  const limit = copyByteLimit();
+  if (totalCopiedBytes > limit) {
+    throw new Error(
+      `CLI copy exceeded NINEROUTER_CLI_MAX_COPY_BYTES (${limit} bytes); aborting to avoid disk fill.`
+    );
+  }
+}
+
+function isAncestorPath(ancestor, descendant) {
+  if (!ancestor || !descendant || ancestor === descendant) {
+    return false;
+  }
+  return descendant.startsWith(ancestor + path.sep);
+}
+
+function copyRecursive(src, dest, copiedDirs = new Set()) {
   if (!fs.existsSync(src)) {
     console.warn(`Warning: Source ${src} does not exist`);
     return;
   }
-  
+
   if (!fs.existsSync(dest)) {
     fs.mkdirSync(dest, { recursive: true });
   }
+
+  let srcReal;
+  try {
+    srcReal = fs.realpathSync(src);
+  } catch {
+    srcReal = path.resolve(src);
+  }
+  copiedDirs.add(srcReal);
 
   const entries = fs.readdirSync(src, { withFileTypes: true });
   for (const entry of entries) {
@@ -61,19 +97,78 @@ function copyRecursive(src, dest) {
       continue;
     }
 
-    if (entry.isDirectory()) {
-      copyRecursive(srcPath, destPath);
-    } else if (entry.isSymbolicLink()) {
-      // Resolve and copy target (avoid linking outside bundle)
+    const isSymlink = entry.isSymbolicLink();
+
+    // Skip symlinked node_modules that resolves into its own parent tree.
+    if (entry.name === "node_modules" && isSymlink) {
+      let real = null;
       try {
-        const real = fs.realpathSync(srcPath);
-        if (fs.statSync(real).isDirectory()) {
-          copyRecursive(real, destPath);
-        } else {
-          fs.copyFileSync(real, destPath);
+        real = fs.realpathSync(srcPath);
+      } catch {
+        real = null;
+      }
+      if (real && (real === srcReal || real.startsWith(srcReal + path.sep))) {
+        console.warn(`Warning: skipping symlinked node_modules that resolves into its parent: ${srcPath} -> ${real}`);
+        continue;
+      }
+    }
+
+    if (entry.isDirectory()) {
+      let real;
+      try {
+        real = fs.realpathSync(srcPath);
+      } catch {
+        real = path.resolve(srcPath);
+      }
+      if (copiedDirs.has(real)) {
+        console.warn(`Warning: skipping already-copied directory: ${srcPath} -> ${real}`);
+        continue;
+      }
+      if (isAncestorPath(real, srcReal)) {
+        console.warn(`Warning: skipping directory whose real path is an ancestor of the source: ${srcPath} -> ${real}`);
+        continue;
+      }
+      copiedDirs.add(real);
+      copyRecursive(srcPath, destPath, copiedDirs);
+    } else if (isSymlink) {
+      // Resolve and copy target (avoid linking outside bundle)
+      let real;
+      try {
+        real = fs.realpathSync(srcPath);
+      } catch {
+        continue;
+      }
+      let stat;
+      try {
+        stat = fs.statSync(real);
+      } catch {
+        continue;
+      }
+      if (stat.isDirectory()) {
+        if (copiedDirs.has(real)) {
+          console.warn(`Warning: skipping already-copied directory: ${srcPath} -> ${real}`);
+          continue;
         }
-      } catch {}
+        if (isAncestorPath(real, srcReal)) {
+          console.warn(`Warning: skipping directory whose real path is an ancestor of the source: ${srcPath} -> ${real}`);
+          continue;
+        }
+        copiedDirs.add(real);
+        copyRecursive(real, destPath, copiedDirs);
+      } else {
+        accountCopiedBytes(stat.size);
+        try {
+          fs.copyFileSync(real, destPath);
+        } catch {}
+      }
     } else {
+      let stat;
+      try {
+        stat = fs.statSync(srcPath);
+      } catch {
+        continue;
+      }
+      accountCopiedBytes(stat.size);
       try {
         fs.copyFileSync(srcPath, destPath);
       } catch {}
@@ -384,6 +479,7 @@ module.exports = {
   assertDeepSeekPowFiles,
   assertRequiredApiArtifacts,
   copyDeepSeekPowFiles,
+  copyRecursive,
   copyStandaloneBuild,
   mergeServerArtifacts,
 };
