@@ -589,11 +589,13 @@ export default function ProviderLimits() {
         filterQuotaStateByConnections(prev, visibleConnections),
       );
       setQuotaData((prev) => ({
-        ...cached,
         ...filterQuotaStateByConnections(prev, visibleConnections),
+        ...cached, // the stored copy is the newest known value
       }));
       const stale = visibleConnections.filter((c) => !fresh(c));
-      setLoading(buildLoadingState(stale));
+      const staleIds = new Set(stale.map((c) => c.id));
+      // Loading only for accounts being fetched; clear any flag left from a previous page.
+      setLoading(Object.fromEntries(visibleConnections.map((c) => [c.id, staleIds.has(c.id)])));
       const times = visibleConnections.map((c) => Date.parse(cache[c.id]?.cachedAt || "")).filter(Number.isFinite);
       if (!stale.length && times.length) { setLastUpdated(new Date(Math.min(...times))); return; }
 

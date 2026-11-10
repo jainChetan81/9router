@@ -210,7 +210,7 @@ export default function AgentsClient() {
   const [rangeNonce, setRangeNonce] = useState(0);
   // Sessions and analytics are heavy. Load them on range change, then every
   // 30 s; only the small /live feed follows the 2 s tick (N5).
-  const loadRange = useCallback(async ({ background = false } = {}) => {
+  const loadRange = useCallback(async ({ background = false, busy = false } = {}) => {
     const id = ++rangeId.current;
     const q = new URLSearchParams({ preset: range.preset });
     if (range.preset === "Custom") { q.set("from", range.from); q.set("to", range.to); }
@@ -230,7 +230,7 @@ export default function AgentsClient() {
         setMoreCursor(null); // the old range's cursor must not page the new range
       }
     }
-    if (!background) setRangeBusy(true); // the 30 s refresh stays silent
+    if (!background || busy) setRangeBusy(true); // auto-sync refreshes stay silent
     try {
       const [s, a] = await Promise.all([getJson(`/api/agents/sessions?${q}`), getJson(`/api/agents/analytics?${q}`)]);
       if (id !== rangeId.current) return;
@@ -264,7 +264,8 @@ export default function AgentsClient() {
     if (force || now - lastRangeSync.current >= 60_000) {
       lastRangeSync.current = now;
       if (force) cacheInvalidate("/api/agents");
-      loadRange({ background: !force });
+      // Background merge keeps pages loaded with "Load more"; the cache is skipped after invalidation.
+      loadRange({ background: true, busy: force });
     }
   }, [loadRange]);
   const autoSync = useAutoSync("agents", () => syncAll(false));
