@@ -1,5 +1,6 @@
-[data-r9]{--bg:#fdf9f5;--grid:rgba(229,106,74,.055);--side:#fffefd;--card:#fff;--line:#f1e8e2;--line2:#e6dbd3;--tx:#1d1a18;--tx2:#6b625c;--tx3:#a0958e;--acc:#e5603e;--acc2:#fcebe4;--seg:#f5efea;--segon:#fff;--green:#159447;--greenbg:#e5f5ea;--amber:#c27c06;--amberbg:#fcf1d8;--red:#d93a2e;--redbg:#fdeceb;--violet:#7273ee;--violetbg:#ececfd;--blue:#2f6fe0;--bluebg:#e8f0fd;--shadow:0 1px 2px rgba(60,30,10,.05);--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;--chipscout:#1c5fc6;--chipimpl:#534fc7;--chiprev:#0e7a36;--chipthink:#8a5c06}
+[data-r9]{--bg:#fdf9f5;--grid:rgba(229,106,74,.055);--side:#fffefd;--card:#fff;--line:#f1e8e2;--line2:#e6dbd3;--tx:#1d1a18;--tx2:#6b625c;--tx3:#776d67;--acc:#b94126;--acc2:#fcebe4;--seg:#f5efea;--segon:#fff;--green:#0f7a39;--greenbg:#e5f5ea;--amber:#c27c06;--amberbg:#fcf1d8;--red:#bf3226;--redbg:#fdeceb;--violet:#5556cf;--violetbg:#ececfd;--blue:#2f6fe0;--bluebg:#e8f0fd;--shadow:0 1px 2px rgba(60,30,10,.05);--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;--chipscout:#1c5fc6;--chipimpl:#534fc7;--chiprev:#0e7a36;--chipthink:#8a5c06}
 [data-r9]{--mbar:var(--tx3)}
+/* D10: light text tokens darkened to meet WCAG AA (4.5:1) on --card, --bg and --seg. */
 [data-r9="dark"]{--bg:#151311;--grid:rgba(255,255,255,.022);--side:#1a1816;--card:#1f1c1a;--line:#2e2a27;--line2:#3b3633;--tx:#f3eeea;--tx2:#b0a69f;--tx3:#a39a94;--acc:#f06c49;--acc2:#3a221a;--seg:#2a2623;--segon:#403a36;--green:#45c977;--greenbg:#173020;--amber:#f0aa30;--amberbg:#352a12;--red:#f45d50;--redbg:#3b1a17;--violet:#9394f8;--violetbg:#25254a;--blue:#6d9ef6;--bluebg:#1b2944;--shadow:none;--chipscout:#6d9ef6;--chipimpl:#9394f8;--chiprev:#45c977;--chipthink:#f0aa30}
 [data-r9] a{color:var(--acc);text-decoration:none}
 [data-r9] a:hover{text-decoration:underline}
@@ -14,3 +15,8 @@
 
 [data-r9] .r9-breakdown-model{overflow-wrap:anywhere!important;white-space:normal!important;color:var(--tx)!important}
 @media(max-width:600px){[data-r9] .r9-breakdown-model{font-size:12.5px!important}[data-r9] .r9-breakdown-provider{font-size:11px!important;color:var(--tx2)!important}}
+
+[data-r9] .r9-spinner{width:13px;height:13px;border:2px solid var(--line2);border-top-color:var(--acc);border-radius:50%;display:inline-block;animation:r9spin .7s linear infinite}
+@keyframes r9spin{to{transform:rotate(360deg)}}
+@media(max-width:600px){[data-r9] .r9-spend-range .r9-spend-refreshing{font-size:11px}[data-r9] .r9-spend-ist-note{display:none}}
+@media(prefers-reduced-motion:reduce){[data-r9] .r9-spinner{animation-duration:1.6s}}

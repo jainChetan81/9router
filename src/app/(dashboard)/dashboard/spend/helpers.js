@@ -9,6 +9,7 @@ export function feeError(value) {
   if (!/^\d*\.?\d+$|^\d+\.$/.test(s)) return "Enter a number, 0 or more.";
   const n = Number(s);
   if (!Number.isFinite(n)) return "Enter a number, 0 or more.";
+  if (n > 100000) return "Fees cannot exceed $100,000.";
   return "";
 }
 

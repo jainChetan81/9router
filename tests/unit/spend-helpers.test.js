@@ -16,6 +16,7 @@ describe("fee validation (S1)", () => {
   it("blocks Save when any draft value is invalid", () => {
     expect(feesValid({ a: "20", b: "" })).toBe(true);
     expect(feesValid({ a: "20", b: "-1" })).toBe(false);
+    expect(feesValid({ a: "20", b: "100000.01" })).toBe(false);
   });
 });
 

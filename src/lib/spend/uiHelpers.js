@@ -123,6 +123,36 @@ export function sankeyLayout({ l1, l2 }, val, W, opts = {}) {
   provs.sort((a, b) => (opts.paid?.(a) ? 1 : 0) - (opts.paid?.(b) ? 1 : 0) || pV[b] - pV[a]);
   const models = [];
   provs.forEach((p) => Object.keys(mV).filter((k) => k.startsWith(p + "|")).sort((a, b) => mV[b] - mV[a]).forEach((k) => models.push(k)));
+  // A provider with no model edges (subscription rows before session logging) keeps one
+  // synthetic model node so the in-flow has somewhere to land and the band stays visible.
+  const syntheticModels = new Set();
+  provs.forEach((p) => {
+    if (Object.keys(mV).some((k) => k.startsWith(p + "|"))) return;
+    const key = p + "||sessions-not-logged";
+    mV[key] = pIn[p] || 0;
+    models.push(key);
+    syntheticModels.add(key);
+  });
+  // "invalid" shows up as a model on every provider that saw a broken lookup. It is one
+  // config problem, not one per provider, so all its bands merge into a single node.
+  const invalidKeys = models.filter((k) => k.endsWith("|invalid"));
+  let invKey = null;
+  const invalidTotal = sum(invalidKeys, (k) => mV[k] || 0);
+  const invalidReq = sum(B.filter((l) => l.model === "invalid"), (l) => l.req);
+  const invalidEst = sum(B.filter((l) => l.model === "invalid"), (l) => l.est);
+  if (invalidKeys.length > 0 && invalidTotal > 0) {
+    const invKey0 = invalidKeys[0];
+    mV[invKey0] = invalidTotal;
+    if (invalidKeys.length > 1) {
+      for (let i = invalidKeys.length - 1; i > 0; i--) {
+        models.splice(models.indexOf(invalidKeys[i]), 1);
+        delete mV[invalidKeys[i]];
+      }
+    } else {
+      // Single-provider case: normalize the key suffix so the fallback lookup matches.
+      B.forEach((l) => { if (l.model === "invalid") l.mk = invKey0; });
+    }
+  }
   const total = Math.max(sum(Object.values(cV), (x) => x), sum(Object.values(pV), (x) => x), 1e-9);
   const COLS = [[combos, cV, 30, 10], [provs, pV, 18, 10], [models, mV, 16, 6]];
   const need = (kk) => Math.max(...COLS.map(([ids, V, mn, g]) => sum(ids, (i) => Math.max(V[i] * kk, mn)) + g * Math.max(0, ids.length - 1)));
@@ -137,6 +167,10 @@ export function sankeyLayout({ l1, l2 }, val, W, opts = {}) {
     return o;
   };
   const cP = place(COLS[0]), pP = place(COLS[1]), mP = place(COLS[2]);
+  // Bands merged out of the model column still need a node: alias each spliced key to the
+  // surviving one so `mP[a.mk]` resolves for both source keys.
+  const invKey1 = (invalidKeys.length > 1 && invalidTotal > 0) ? invalidKeys[0] : null;
+  if (invKey1) invalidKeys.forEach((k, i) => { if (i > 0) mP[k] = mP[invKey1]; });
   const x0 = 110, x1 = Math.round(W * 0.42), x2 = W - 220;
   const agg = (list, keyF, mk) => {
     const o = {};
@@ -150,6 +184,7 @@ export function sankeyLayout({ l1, l2 }, val, W, opts = {}) {
   provs.forEach((p) => { let y = pP[p].y; b1.filter((a) => a.prov === p).sort((a, b) => combos.indexOf(a.combo) - combos.indexOf(b.combo)).forEach((a) => { a.ty = y; y += a.m * k; }); });
   provs.forEach((p) => { let y = pP[p].y; b2.filter((a) => a.prov === p).sort((a, b) => models.indexOf(a.mk) - models.indexOf(b.mk)).forEach((a) => { a.sy = y; y += a.m * k; }); });
   b2.forEach((a) => { a.ty = mP[a.mk].y; });
+
   const bands = [
     ...b1.map((a) => ({ ...a, w: a.m * k, xa: x0 + nw, xb: x1 })),
     ...b2.map((a) => ({ ...a, w: a.m * k, xa: x1 + nw, xb: x2 })),
@@ -158,14 +193,16 @@ export function sankeyLayout({ l1, l2 }, val, W, opts = {}) {
   let lastY = -99;
   const modelNodes = models.map((mkey) => {
     const p = mP[mkey]; const pn = mkey.split("|")[0];
-    const ly = Math.max(p.y + p.h / 2 + 4, lastY + 13); lastY = ly;
-    return { key: mkey, prov: pn, name: mkey.slice(pn.length + 1), y: p.y, h: p.h, ly, v: mV[mkey] };
+    const mname = syntheticModels.has(mkey) ? "sessions not logged" : mkey.slice(pn.length + 1) || "unknown";
+    const ly = Math.max(p.y + p.h / 2 + 4, lastY + 16); lastY = ly;
+    return { key: mkey, prov: pn, name: mname, y: p.y, h: p.h, ly, v: mV[mkey] };
   });
   return {
     W, H: H + top * 2, nw, x0, x1, x2, bands,
     combos: combos.map((c) => ({ key: c, y: cP[c].y, h: cP[c].h, v: cV[c] })),
     provs: provs.map((p) => ({ key: p, y: pP[p].y, h: pP[p].h, v: pV[p] })),
     models: modelNodes,
+    configError: invalidReq > 0 ? { req: invalidReq, est: invalidEst, value: invalidTotal } : null,
   };
 }
 
