@@ -14,7 +14,7 @@ export const age = (v) => {
 };
 const istDate = (ms) => new Date(ms + IST);
 const dayLabel = (ms) => istDate(ms).toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
-const stamp = (v) => { const ms = Date.parse(v); return Number.isFinite(ms) ? `${dayLabel(ms)}, ${istDate(ms).toISOString().slice(11, 16)}` : "—"; };
+export const stamp = (v) => { const ms = Date.parse(v); return Number.isFinite(ms) ? `${dayLabel(ms)}, ${istDate(ms).toISOString().slice(11, 16)}` : "—"; };
 
 // "user/tool_result" -> "User · tool result"; "/ocr" suffix kept.
 export function place(src) {
@@ -24,9 +24,9 @@ export function place(src) {
   return (type ? `${role} · ${type}` : role) + (o === "ocr" ? " / ocr" : "");
 }
 
-const seg = (on, c) => ({ border: 0, height: 26, padding: "0 10px", borderRadius: 7, font: "inherit", fontSize: 12, cursor: "pointer", whiteSpace: "nowrap", background: on ? "var(--segon)" : "transparent", color: on ? c || "var(--tx)" : "var(--tx2)", fontWeight: on ? 600 : 400, boxShadow: on ? "0 1px 2px rgba(0,0,0,.08)" : "none" });
+const seg = (on, c, disabled = false) => ({ border: 0, height: 26, padding: "0 10px", borderRadius: 7, font: "inherit", fontSize: 12, cursor: disabled ? "not-allowed" : "pointer", opacity: disabled ? (on ? 0.85 : 0.55) : 1, whiteSpace: "nowrap", display: "inline-flex", alignItems: "center", gap: 5, background: on ? "var(--segon)" : "transparent", color: on ? c || "var(--tx)" : "var(--tx2)", fontWeight: on ? 600 : 400, boxShadow: on ? "0 1px 2px rgba(0,0,0,.08)" : "none" });
 const AC = { off: ["var(--seg)", "var(--tx2)"], observe: ["var(--bluebg)", "var(--blue)"], redact: ["var(--acc2)", "var(--acc)"], block: ["var(--violetbg)", "var(--violet)"], leaked: ["var(--redbg)", "var(--red)"], ignored: ["var(--seg)", "var(--tx3)"], allowed: ["var(--seg)", "var(--tx3)"] };
-const ALABEL = { observe: "Observed", redact: "Redacted", block: "Blocked", leaked: "Couldn't redact", ignored: "Marked safe", allowed: "Marked safe", off: "Off" };
+export const ALABEL = { observe: "Observed", redact: "Redacted", block: "Blocked", leaked: "Couldn't redact", ignored: "Marked safe", allowed: "Marked safe", off: "Off" };
 export const ACTIONS = ["redact", "observe", "block", "leaked", "allowed"];
 export const placeholder = (rule, hash) => (rule === "known" ? `{{vault:#${String(hash).slice(0, 6)}}}` : `{{pii:${rule}#${String(hash).slice(0, 6)}}}`);
 const WHY = { redact: "Replaced with a placeholder before the request left this server.", observe: "Logged only. The request was sent unchanged.", block: "The request was stopped with HTTP 400 and never reached the model. The message tells you to /rewind.", leaked: "The rule says Redact, but the value sits where it cannot be changed, so it was sent as is. See the reason above.", allowed: "You marked this value as safe. It is never redacted or blocked.", ignored: "You marked this value as safe. It is never redacted or blocked." };
@@ -88,17 +88,113 @@ export function sessionForOpenPrompt(promptId, promptSessionId, fallbackSessionI
   return promptId ? promptSessionId || null : fallbackSessionId || null;
 }
 
-export function buildView({ data, ui, set, act, range, fit, test, events, samples }) {
-  const { config = {}, health: h = {}, summary: sm = {} } = data;
+// ---- Session view helpers (pure, unit-tested) ----
+
+export function buildSessionFilterKey({ q, ssort, sdesc, sf = {}, range }) {
+  return JSON.stringify([q || "", ssort || "", !!sdesc, sf.client || "", sf.provider || "", sf.combo || "", sf.hash || "", sf.findings || "", range?.preset || "", range?.from || "", range?.to || ""]);
+}
+export function buildSessionRequestKey(filterKey, cursor) {
+  return JSON.stringify([filterKey, cursor ?? null]);
+}
+/** Sorts server rows client-side by the chosen sort; default is last-seen desc as served. */
+export function sortSessions(rows, ssort = "last", sdesc = true) {
+  const val = (r) => (ssort === "requests" ? r.requests || 0 : ssort === "values" ? r.values || 0 : ssort === "first" ? r.first || 0 : r.last || 0);
+  return [...rows].sort((a, b) => (val(a) - val(b)) * (sdesc ? -1 : 1));
+}
+/** Ordered finding markers across a conversation: (messageId, position key) list from the flat messages. */
+export function findingMarkers(messages) {
+  const out = [];
+  for (const m of messages) {
+    if (!m.values?.length) continue;
+    for (let i = 0; i < m.values.length; i++) out.push({ messageIndex: m._index, id: String(m.id), value: m.values[i], n: m.values.length, seq: out.length });
+  }
+  return out;
+}
+/** Groups conversation rows oldest-first into request groups by the first stored request per message. */
+export function groupMessages(rows) {
+  const seenReq = new Map();
+  const groups = [];
+  let index = 0;
+  for (const r of rows) {
+    const reqId = r.requestId || "";
+    if (!seenReq.has(reqId)) {
+      seenReq.set(reqId, true);
+      groups.push({ requestId: reqId, first: r.ts, messages: [] });
+    }
+    // One index across all groups: the findings filter and the markers share it.
+    r._index = index++;
+    groups[groups.length - 1].messages.push(r);
+  }
+  return groups.map((g, i) => ({ ...g, n: i + 1 }));
+}
+const PLACEHOLDER = /\{\{pii:[\w-]+#[0-9a-f]{6}\}\}|\{\{vault:#[0-9a-f]{6}\}\}/g;
+/** Formats the stored tool-call text "Name JSON" into named lines. Bash-style commands thaw into code. */
+export function toolFormat(name, text) {
+  const t = String(text || "");
+  let args = "", rest = "";
+  if (name && t.startsWith(`${name} `)) { args = t.slice(name.length + 1); } else if (name && t.includes(" ")) { args = t; }
+  let parsed;
+  try { parsed = args.trim().startsWith("{") ? JSON.parse(args.trim()) : undefined; } catch { parsed = undefined; }
+  if (name && /^(bash|sh|shell|command)$/i.test(name) && parsed && typeof parsed.command === "string") {
+    return { kind: "command", command: parsed.command };
+  }
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const fields = Object.entries(parsed).map(([k, v]) => ({ key: k, value: typeof v === "string" ? v : JSON.stringify(v) }));
+    // A single `command`-like field reads as plain code; never executed.
+    if (fields.length === 1 && fields[0].value.length > 60) return { kind: "text", text: fields[0].value };
+    return { kind: "fields", fields };
+  }
+  if (args.trim()) return { kind: "text", text: args };
+  return { kind: "text", text: t || "Cannot format arguments" };
+}
+export const PROSE_LINES = 6;
+/** Collapse decision per message: tools and system collapse by default; prose above six lines collapses. */
+export function collapseDefault(role, kind, text) {
+  if (kind === "tool_use" || kind === "tool_result") return true;
+  if (role === "system" || role === "developer") return true;
+  const t = String(text || "");
+  // Same test as the card's "Show more": many lines or one very long line.
+  return t.split("\n").length > PROSE_LINES || t.length > 800;
+}
+
+export function effectiveConfig(config = {}, pendingOps = {}) {
+  let mode = config.mode || "observe";
+  const rules = { ...(config.rules || {}) };
+  const ocr = { ...(config.ocr || {}) };
+  for (const op of Object.values(pendingOps || {})) {
+    const opt = op?.optimistic;
+    if (!opt) continue;
+    if (opt.mode !== undefined) mode = opt.mode;
+    if (opt.ocr) Object.assign(ocr, opt.ocr);
+    if (opt.rules) {
+      for (const [id, val] of Object.entries(opt.rules)) {
+        if (val === "default" || val === null) delete rules[id];
+        else rules[id] = val;
+      }
+    }
+  }
+  return { ...config, mode, rules, ocr };
+}
+
+export function isRefreshingState({ hasData, mode, refreshReason }) {
+  return Boolean(hasData) && mode !== "error" && (refreshReason === "range" || refreshReason === "save" || refreshReason === "manual");
+}
+
+export function buildView({ data, ui, set, act, range, fit, test, events, samples, pendingOps = {} }) {
+  const { config: savedConfig = {}, health: h = {}, summary: sm = {} } = data;
+  const config = effectiveConfig(savedConfig, pendingOps);
   const tab = ui.tab;
   const preset = range.preset;
   const rangeShort = preset === "Custom" ? range.label : RANGE_SHORT[preset];
   const mode = config.mode || "observe";
   const overrides = config.rules || {};
+  const savedMode = savedConfig.mode || "observe";
+  const savedOverrides = savedConfig.rules || {};
   const effOf = (id) => overrides[id] || mode;
   const ruleLabel = Object.fromEntries((data.rules || []).map((r) => [r.id, r.label]));
   const ruleGroup = Object.fromEntries((data.rules || []).map((r) => [r.id, r.group]));
   const groupLabel = Object.fromEntries((data.groups || []).map((g) => [g.id, g.label]));
+  const isRulePending = (id) => Boolean(pendingOps[`rule:${id}`] || pendingOps[`group:${ruleGroup[id]}`]);
   const all = sm.groups || [];
   const nameOf = (v) => v.name || ruleLabel[v.rule] || v.rule;
   const gLabelOf = (v) => groupLabel[ruleGroup[v.rule]] || "Other";
@@ -114,36 +210,66 @@ export function buildView({ data, ui, set, act, range, fit, test, events, sample
   const openN = leakVals.length;
   const leakPages = Math.max(1, Math.ceil(openN / LEAK_PAGE)), leakPage = Math.min(ui.leakPage, leakPages - 1);
   // Rule action buttons ask first; the pending change shows inline under the row. One rule, every value of it.
-  const ruleBtns = (rule, key) => ["observe", "redact", "block"].map((a) => ({ label: cap(a), style: seg(effOf(rule) === a, ACOL[cap(a)]),
-    on: () => effOf(rule) !== a && set({ pending: { key, rule, action: a } }) }));
+  const ruleBtns = (rule, key) => {
+    const busy = isRulePending(rule);
+    const target = pendingOps[`rule:${rule}`]?.target;
+    return ["observe", "redact", "block"].map((a) => ({
+      label: cap(a),
+      disabled: busy,
+      pending: busy && target === a,
+      style: seg(effOf(rule) === a, ACOL[cap(a)], busy),
+      on: () => !busy && effOf(rule) !== a && set({ pending: { key, rule, action: a } }),
+    }));
+  };
   const pend = ui.pending;
   const pending = (key) => pend?.key === key ? {
     text: `${cap(pend.action)} every ${ruleLabel[pend.rule] || pend.rule} value from now on?${pend.action === "block" ? " The next request with a new value fails with HTTP 400." : pend.action === "observe" ? " Values will be logged but sent unchanged." : ""}`,
-    ok: () => { set({ pending: null }); act({ rules: { [pend.rule]: pend.action } }, `${ruleLabel[pend.rule] || pend.rule} set to ${cap(pend.action)}.`, { rules: { [pend.rule]: overrides[pend.rule] || "default" } }); },
+    ok: () => {
+      const { rule, action } = pend;
+      set({ pending: null });
+      act(
+        { rules: { [rule]: action } },
+        `${ruleLabel[rule] || rule} set to ${cap(action)}.`,
+        { rules: { [rule]: savedOverrides[rule] || "default" } },
+        { opKey: `rule:${rule}`, target: action, optimistic: { rules: { [rule]: action } } },
+      );
+    },
     cancel: () => set({ pending: null }),
   } : null;
   // Allow always confirms and offers undo. `v` needs hash, preview and a name.
   const allowHash = (hash, name, preview, on) => () => {
+    if (pendingOps[`allow:${hash}`]) return;
     if (on && !window.confirm(`Mark ${name} ${preview || "#" + hash} as safe?\n\nThis one value will never be redacted or blocked again, under any rule. Undo it under Allowed values.`)) return;
-    act({ ignore: hash, on }, on ? `Allowed ${name} #${hash}.` : `Restored ${name} #${hash}.`, { ignore: hash, on: !on });
+    act({ ignore: hash, on }, on ? `Allowed ${name} #${hash}.` : `Restored ${name} #${hash}.`, { ignore: hash, on: !on }, { opKey: `allow:${hash}` });
   };
   const allow = (v, on = true) => allowHash(v.hash, nameOf(v), v.preview, on);
   const leaks = (tab === "overview" ? leakVals.slice(leakPage * LEAK_PAGE, (leakPage + 1) * LEAK_PAGE) : []).map((v) => {
     const [tag, why] = LEAK_TAG[v.leakedWhere?.[0]] || ["Could not be changed", "The rule says Redact, but the value sat where it cannot be changed, so it was sent as is."];
     const key = `${v.hash}:${v.rule}`;
+    const dismissPending = Boolean(pendingOps[`dismiss:${v.hash}`] || pendingOps.dismissAll);
+    const allowPending = Boolean(pendingOps[`allow:${v.hash}`]);
     return {
       rule: nameOf(v), group: gLabelOf(v), hash: v.hash, preview: v.preview || "", tag, why, tip: why, loc: place(v.sources[0]), time: age(v.lastSeen),
       key, client: ix.get(v).client, model: v.model || "—",
       signed: v.leakedWhere?.includes("assistant/thinking"),
       ruleName: nameOf(v),
-      view: () => set({ detail: { kind: "value", key } }), allow: allow(v), ruleBtns: ruleBtns(v.rule, key), pending: pending(key),
-      dismiss: () => act(dismissBody([v]), `Dismissed ${nameOf(v)} ${v.preview || "#" + v.hash}.`, { undismiss: [v.hash] }),
+      view: () => set({ detail: { kind: "value", key } }),
+      allow: allow(v), allowPending,
+      ruleBtns: ruleBtns(v.rule, key), rulePending: isRulePending(v.rule), pending: pending(key),
+      dismiss: () => !dismissPending && act(dismissBody([v]), `Dismissed ${nameOf(v)} ${v.preview || "#" + v.hash}.`, { undismiss: [v.hash] }, { opKey: `dismiss:${v.hash}` }),
+      dismissPending,
     };
   });
   // Each reason is explained once, on its first row; later rows keep it as a tooltip on the tag.
   const told = new Set();
   for (const l of leaks) { if (told.has(l.tag)) l.why = ""; else told.add(l.tag); }
-  const dismissAll = openN ? () => { if (window.confirm(`Dismiss all ${openN}? A value comes back only if it shows up somewhere new.`)) act(dismissBody(leakVals), `Dismissed ${openN}.`, { undismiss: leakVals.map((v) => v.hash) }); } : null;
+  const dismissAllPending = Boolean(pendingOps.dismissAll);
+  const dismissAll = openN ? () => {
+    if (dismissAllPending) return;
+    if (window.confirm(`Dismiss all ${openN}? A value comes back only if it shows up somewhere new.`)) {
+      act(dismissBody(leakVals), `Dismissed ${openN}.`, { undismiss: leakVals.map((v) => v.hash) }, { opKey: "dismissAll" });
+    }
+  } : null;
 
   const redactRules = (data.rules || []).filter((r) => effOf(r.id) === "redact").length;
   const onRules = (data.rules || []).filter((r) => effOf(r.id) !== "off").length;
@@ -156,12 +282,24 @@ export function buildView({ data, ui, set, act, range, fit, test, events, sample
 
   // Health problems, also counted on the Health tab dot.
   const ocr = h.ocr || {}, so = sm.ocr || {}, un = h.unscanned || {};
+  const ocrCfg = config.ocr || {};
+  const savedOcrCfg = savedConfig.ocr || {};
+  const ocrQualPending = Boolean(pendingOps["ocr:quality"]);
   const problems = [];
   if (sm.truncated) problems.push({ icon: "warning", title: "Range is cut short", desc: "The log for this range is too large to read in full, so the oldest events are not counted. Pick a shorter range.", cta: null, bg: "var(--amberbg)", c: "var(--amber)" });
   if (!h.module) problems.push({ icon: "power_off", title: "PII_GUARD_MODULE is not set", desc: "Set it in the service drop-in and restart 9Router.", cta: null, bg: "var(--seg)", c: "var(--tx2)" });
   else if (!okScanner) problems.push({ icon: "error", title: "Scanner not loaded", desc: "Requests still go through, but nothing is scanned. Check the Console Log.", cta: null, bg: "var(--redbg)", c: "var(--red)" });
   if (h.errors > 0) problems.push({ icon: "error", title: `${fmt(h.errors)} scanner errors`, desc: `Last: ${h.lastError || "unknown"}. Requests fail open and are never blocked by an error.`, cta: null, bg: "var(--redbg)", c: "var(--red)" });
-  if ((so.status?.partial || 0) > 0) problems.push({ icon: "image_not_supported", title: `${fmt(so.status.partial)} images only partly read`, desc: "Mostly small or blurry screenshots. Enhanced quality reads more of them but takes about 3× as long.", cta: ocr.quality === "basic" ? "Try Enhanced" : null, onCta: () => act({ ocr: { quality: "enhanced" } }), bg: "var(--amberbg)", c: "var(--amber)" });
+  if ((so.status?.partial || 0) > 0) problems.push({
+    icon: "image_not_supported",
+    title: `${fmt(so.status.partial)} images only partly read`,
+    desc: "Mostly small or blurry screenshots. Enhanced quality reads more of them but takes about 3× as long.",
+    cta: ocrCfg.quality === "basic" || (ocrQualPending && pendingOps["ocr:quality"]?.target === "enhanced") ? "Try Enhanced" : null,
+    ctaPending: ocrQualPending,
+    onCta: () => !ocrQualPending && act({ ocr: { quality: "enhanced" } }, "OCR quality set to Enhanced.", { ocr: { quality: savedOcrCfg.quality || "basic" } }, { opKey: "ocr:quality", target: "enhanced", optimistic: { ocr: { quality: "enhanced" } } }),
+    bg: "var(--amberbg)",
+    c: "var(--amber)",
+  });
   if (so.reasons?.queue_full) problems.push({ icon: "warning", title: `OCR queue overflowed ${fmt(so.reasons.queue_full)} times`, desc: "Those images were sent without being scanned; they count in “Images not scanned”. Cached and repeated images no longer use queue space.", cta: null, bg: "var(--amberbg)", c: "var(--amber)" });
   const issues = problems.length;
   const health = issues ? { text: `Scanner: ${issues} ${issues === 1 ? "issue" : "issues"}`, c: !okScanner ? "var(--red)" : "var(--amber)", bg: !okScanner ? "var(--redbg)" : "var(--amberbg)" } : { text: "Scanner OK", c: "var(--green)", bg: "var(--greenbg)" };
@@ -222,26 +360,76 @@ export function buildView({ data, ui, set, act, range, fit, test, events, sample
 
   // Rules
   const confirmBlock = (a) => a !== "Block" || window.confirm("Block stops a request with HTTP 400 the first time a new value appears. After that, the same value is redacted. Continue?");
-  const globalBtns = ["Off", "Observe", "Redact", "Block"].map((a) => ({ label: a, style: seg(mode === a.toLowerCase(), ACOL[a]), on: () => confirmBlock(a) && act({ mode: a.toLowerCase() }) }));
+  const modeOp = pendingOps.mode;
+  const modePending = Boolean(modeOp);
+  const globalBtns = ["Off", "Observe", "Redact", "Block"].map((a) => {
+    const val = a.toLowerCase();
+    return {
+      label: a,
+      disabled: modePending,
+      pending: modePending && modeOp.target === val,
+      style: seg(mode === val, ACOL[a], modePending),
+      on: () => !modePending && mode !== val && confirmBlock(a) && act({ mode: val }, `Default action set to ${a}.`, { mode: savedMode }, { opKey: "mode", target: val, optimistic: { mode: val } }),
+    };
+  });
   const ocrOn = !!ocr.available;
-  const ocrCfg = config.ocr || {};
   const ocrDef = [["mode", "Image OCR", ["Off", "Observe"], ocrOn ? "Reads text inside images. Findings are logged only; images are never changed." : "Set PII_GUARD_OCR=1 in the service drop-in to enable image OCR."],
     ["quality", "OCR quality", ["Basic", "Enhanced"], "Enhanced reads small and rotated text. About 3× slower per image."],
     ["keep", "Keep images", null, ocr.capture ? "On: set by PII_GUARD_CAPTURE_IMAGES. Kept 14 days for OCR replay; backups skip them." : "Off: set PII_GUARD_CAPTURE_IMAGES=1 in the service drop-in."]];
-  const ocrRows = ocrDef.map(([k, label, opts, desc]) => ({ label, desc, hasBtns: !!opts, ro: opts ? null : ocr.capture ? "14 days" : "Off",
-    btns: (opts || []).map((o) => ({ label: o, style: { ...seg((ocrCfg[k] || "") === o.toLowerCase()), ...(ocrOn ? {} : { opacity: 0.5, cursor: "not-allowed" }) }, on: () => ocrOn && act({ ocr: { [k]: o.toLowerCase() } }) })) }));
+  const ocrRows = ocrDef.map(([k, label, opts, desc]) => {
+    const rowOp = pendingOps[`ocr:${k}`];
+    const rowPending = Boolean(rowOp);
+    return {
+      label, desc, hasBtns: !!opts, ro: opts ? null : ocr.capture ? "14 days" : "Off", pending: rowPending,
+      btns: (opts || []).map((o) => {
+        const val = o.toLowerCase();
+        const dis = !ocrOn || rowPending;
+        return {
+          label: o,
+          disabled: dis,
+          pending: rowPending && rowOp.target === val,
+          style: { ...seg((ocrCfg[k] || "") === val, undefined, rowPending), ...(ocrOn ? {} : { opacity: 0.5, cursor: "not-allowed" }) },
+          on: () => ocrOn && !rowPending && (ocrCfg[k] || "") !== val && act(
+            { ocr: { [k]: val } },
+            `${label} set to ${o}.`,
+            { ocr: { [k]: savedOcrCfg[k] || (k === "mode" ? "observe" : "basic") } },
+            { opKey: `ocr:${k}`, target: val, optimistic: { ocr: { [k]: val } } },
+          ),
+        };
+      }),
+    };
+  });
   const groups = (tab === "rules" ? data.groups || [] : []).map((g) => {
     const rs = (data.rules || []).filter((r) => r.group === g.id);
     const set1 = new Set(rs.map((r) => overrides[r.id] || "default"));
     const cur = set1.size === 1 ? cap([...set1][0]) : null;
     const sp = split(rs.map((r) => r.id));
     const open = ui.openGroup === g.id;
+    const grpOp = pendingOps[`group:${g.id}`];
+    const grpPending = Boolean(grpOp);
+    const prevGroupRules = Object.fromEntries(rs.map((r) => [r.id, savedOverrides[r.id] || "default"]));
     return {
-      name: g.label, ruleCount: rs.length, total: fmt(sp.total), bar: sp.bar, open, chev: open ? "expand_more" : "chevron_right",
+      id: g.id, name: g.label, ruleCount: rs.length, total: fmt(sp.total), bar: sp.bar, open, chev: open ? "expand_more" : "chevron_right",
       differs: cur !== "Default", badge: cur ? `${cur} instead of the default (${cap(mode)})` : "Rules in this group differ",
+      pending: grpPending || rs.some((r) => Boolean(pendingOps[`rule:${r.id}`])),
       toggle: () => set((u) => ({ openGroup: u.openGroup === g.id ? null : g.id })),
       rules: rs.map((r) => { const x = split([r.id]); return { name: r.label, total: fmt(x.total), bar: x.bar }; }),
-      btns: ["Default", "Off", "Observe", "Redact", "Block"].map((a) => ({ label: a, style: seg(cur === a, ACOL[a]), on: () => confirmBlock(a) && act({ rules: Object.fromEntries(rs.map((r) => [r.id, a.toLowerCase()])) }) })),
+      btns: ["Default", "Off", "Observe", "Redact", "Block"].map((a) => {
+        const val = a.toLowerCase();
+        const nextRules = Object.fromEntries(rs.map((r) => [r.id, val]));
+        return {
+          label: a,
+          disabled: grpPending,
+          pending: grpPending && grpOp.target === val,
+          style: seg(cur === a, ACOL[a], grpPending),
+          on: () => !grpPending && cur !== a && confirmBlock(a) && act(
+            { rules: nextRules },
+            `${g.label} set to ${a}.`,
+            { rules: prevGroupRules },
+            { opKey: `group:${g.id}`, target: val, optimistic: { rules: nextRules } },
+          ),
+        };
+      }),
     };
   });
 
@@ -266,9 +454,18 @@ export function buildView({ data, ui, set, act, range, fit, test, events, sample
       sel: !!ui.sel[v.hash], bg: ui.sel[v.hash] ? "var(--acc2)" : "transparent",
       toggle: () => set((u) => ({ sel: { ...u.sel, [v.hash]: !u.sel[v.hash] } })),
       view: () => set({ detail: { kind: "value", key } }), menu: ui.menu === key, openMenu: () => set((u) => ({ menu: u.menu === key ? null : key })),
-      allowLabel: v.ignored ? "Scan this value again" : "Mark value as safe", allow: allow(v, !v.ignored), ruleBtns: ruleBtns(v.rule, key), pending: pending(key),
+      allowLabel: v.ignored ? "Scan this value again" : "Mark value as safe", allow: allow(v, !v.ignored), allowPending: Boolean(pendingOps[`allow:${v.hash}`]),
+      ruleBtns: ruleBtns(v.rule, key), rulePending: isRulePending(v.rule), pending: pending(key),
     };
   });
+  const sessionRows = (tab === "findings" && ui.view === "session" ? sortSessions(events.sessionRows || [], ui.ssort, ui.sdesc) : []).map((r) => ({
+    sessionId: r.sessionId, short: String(r.sessionId).slice(0, 8), client: r.client || "—",
+    route: r.combo || r.model || "—", provider: r.provider || "Not recorded", account: r.account || "",
+    first: stamp(new Date(Number(r.first)).toISOString()), last: stamp(new Date(Number(r.last)).toISOString()),
+    lastAge: age(new Date(Number(r.last)).toISOString()), requests: fmt(r.requests), messages: fmt(r.messages),
+    values: fmt(r.values), hasFindings: r.values > 0, textAvailability: r.hasText ? "Stored" : "Events only",
+    open: () => set({ tab: "findings", view: "session", session: r.sessionId, at: "", ssort: ui.ssort, sdesc: ui.sdesc }),
+  }));
   const hits = (tab === "findings" && ui.view === "hit" ? events : []).map((e) => ({
     ...e, ...badge(e.a), rule: e.name || ruleLabel[e.rule] || e.rule, sel: !!ui.sel[e.fullHash], bg: ui.sel[e.fullHash] ? "var(--acc2)" : "transparent",
     toggle: () => set((u) => ({ sel: { ...u.sel, [e.fullHash]: !u.sel[e.fullHash] } })),
@@ -295,6 +492,8 @@ export function buildView({ data, ui, set, act, range, fit, test, events, sample
       context: hit?.context || v?.context || "", noContext: !(hit?.context || v?.context),
       client: hit ? hit.client : v ? ix.get(v).client : "—", model: (hit ? hit.model : v?.model) || "—",
       request: hit?.requestId || v?.requestId || "", session: hit?.sessionId || v?.sessionId || "", hash,
+      provider: (hit ? hit.provider : v?.provider) || "Not recorded", combo: (hit ? hit.combo : v?.combo) || "Not recorded",
+      account: (hit ? hit.account : v?.account) || "Not recorded", tool: hit?.tool || null, resolvedModel: (hit ? hit.resolvedModel : v?.resolvedModel) || (hit?.provider && hit?.model ? `${hit.provider}/${hit.model}` : hit?.model) || "Not recorded",
       // Prompt lookup: newest stored messages holding this value (each message is stored once per session).
       promptQuery: `hash=${hash}`,
       openSession: (id, sessionId) => {
@@ -304,8 +503,9 @@ export function buildView({ data, ui, set, act, range, fit, test, events, sample
       },
       first: v ? stamp(v.firstSeen) : "—", last: v ? stamp(v.lastSeen) : hit ? stamp(hit.ts) : "—", reqs: v ? fmt(v.turns) : "—",
       image: image ? `/api/pii-guard/image?id=${image}` : null, imageLabel: image ? `Image #${(hit?.imageIndex ?? v?.imageIndex ?? 0) + 1}` : "",
-      ruleBtns: rule ? ruleBtns(rule, "detail") : [], pending: pending("detail"),
+      ruleBtns: rule ? ruleBtns(rule, "detail") : [], rulePending: rule ? isRulePending(rule) : false, pending: pending("detail"),
       allowLabel: a === "allowed" ? "Scan this value again" : "Mark value as safe",
+      allowPending: Boolean(hash && pendingOps[`allow:${hash}`]),
       allow: v ? allow(v, a !== "allowed") : allowHash(hash, ruleLabel[rule] || rule, hit?.preview, a !== "allowed"),
       close: () => set({ detail: null, pending: null }),
     };
@@ -344,28 +544,46 @@ export function buildView({ data, ui, set, act, range, fit, test, events, sample
     imgGroups.push({ model: r.model || "—", kind, n: 1, newest: r.ts, oldest: r.ts, rules: r.rules || [], reason: r.reason, cache: r.cache, mode: r.mode });
   }
 
+  const bulkAllowPending = Boolean(pendingOps.bulkAllow);
+
   return {
     status, health, tabs, rangeShort, okScanner,
     s: { leaks: tab === "overview", numbers: tab === "overview", bygroup: tab === "overview", where: tab === "overview", wording: tab === "rules", mode: tab === "rules", groups: tab === "rules", values: tab === "findings", test: tab === "test", health: tab === "health", ocr: tab === "health" },
     goLeaks: () => set({ tab: "overview" }), goHealth: () => set({ tab: "health" }),
-    leaks, noLeaks: leaks.length === 0, leakCount: openN ? `${openN} to review` : "", leakBorder: openN ? "var(--amber)" : "var(--line)", leakIcon: openN ? "gpp_maybe" : "gpp_good", dismissAll,
+    leaks, noLeaks: leaks.length === 0, leakCount: openN ? `${openN} to review` : "", leakBorder: openN ? "var(--amber)" : "var(--line)", leakIcon: openN ? "gpp_maybe" : "gpp_good", dismissAll, dismissAllPending,
     n, cards, sumNote, byGroup, trendTitle: hourly ? "FINDINGS PER HOUR (IST)" : "FINDINGS PER DAY (IST)", fbars, fgap: trend.length > 40 ? "1px" : "3px",
     locs, toggleLoc: () => set((u) => ({ allLoc: !u.allLoc })), locBtn: ui.allLoc ? "Show top 5" : `Show all ${locAll.length}`, byClient,
-    redactRules, globalBtns, piiEx: "{{pii:email#4b7538}}", ocrRows, groups,
-    viewBtns: [["value", "Group by value"], ["hit", "Every hit"], ["prompt", "Prompts"]].map(([k, label]) => ({ label, style: seg(ui.view === k), on: () => set({ view: k, sel: {}, page: 0 }) })),
-    isValues: ui.view === "value", isEvents: ui.view === "hit", isPrompts: ui.view === "prompt",
-    shownLabel: ui.view === "value" ? (rows.length ? `${fmt(page * PAGE + 1)}–${fmt(page * PAGE + shown.length)} of ${fmt(rows.length)} values` : `0 of ${fmt(all.length)} values`) : ui.view === "prompt" ? "Partially masked · kept 14 days" : `${fmt(hits.length)} hits on this page`,
+    redactRules, globalBtns, modePending, piiEx: "{{pii:email#4b7538}}", ocrRows, groups,
+    viewBtns: [["value", "Group by value"], ["hit", "Every hit"], ["prompt", "Prompts"], ["session", "Sessions"]].map(([k, label]) => ({ label, style: seg(ui.view === k), on: () => set({ view: k, sel: {}, page: 0 }) })),
+    isValues: ui.view === "value", isEvents: ui.view === "hit", isPrompts: ui.view === "prompt", isSessions: ui.view === "session",
+    shownLabel: ui.view === "value" ? (rows.length ? `${fmt(page * PAGE + 1)}–${fmt(page * PAGE + shown.length)} of ${fmt(rows.length)} values` : `0 of ${fmt(all.length)} values`) : ui.view === "prompt" ? "Partially masked · kept 14 days" : ui.view === "session" ? "One row per session · requests without a session stay in Every hit" : `${fmt(hits.length)} hits on this page`,
     groupOpts: (data.groups || []).map((g) => [g.id, g.label]), clientOpts: opts((v) => ix.get(v).client), modelOpts: opts((v) => v.model),
     hasSel: selKeys.length > 0, selCount: selKeys.length,
     allSel: (ui.view === "value" ? values : hits).length > 0 && (ui.view === "value" ? values : hits).every((v) => v.sel),
     toggleAll: () => { const list = ui.view === "value" ? values.map((x) => x.hash) : hits.map((x) => x.fullHash); set({ sel: list.every((h) => ui.sel[h]) ? {} : Object.fromEntries(list.map((h) => [h, true])) }); },
-    bulkAllow: () => { if (!window.confirm(`Mark ${selKeys.length} ${selKeys.length === 1 ? "value" : "values"} as safe?\n\nThey will never be redacted or blocked again, under any rule. Undo it under Allowed values.`)) return; act({ ignoreMany: selKeys, on: true }, `Allowed ${selKeys.length} values.`, { ignoreMany: selKeys, on: false }); set({ sel: {} }); },
-    values, noValues: values.length === 0, hits, noHits: hits.length === 0,
+    bulkAllow: () => {
+      if (bulkAllowPending) return;
+      if (!window.confirm(`Mark ${selKeys.length} ${selKeys.length === 1 ? "value" : "values"} as safe?\n\nThey will never be redacted or blocked again, under any rule. Undo it under Allowed values.`)) return;
+      Promise.resolve(act({ ignoreMany: selKeys, on: true }, `Allowed ${selKeys.length} values.`, { ignoreMany: selKeys, on: false }, { opKey: "bulkAllow" }))
+        .then((ok) => { if (ok !== false) set({ sel: {} }); });
+    },
+    bulkAllowPending,
+    values, noValues: values.length === 0, hits, noHits: hits.length === 0, sessionRows, noSessions: sessionRows.length === 0,
     prevValues: page > 0 ? () => set({ page: page - 1, sel: {} }) : null, nextValues: page < pages - 1 ? () => set({ page: page + 1, sel: {} }) : null,
     prevLeaks: leakPage > 0 ? () => set({ leakPage: leakPage - 1 }) : null, nextLeaks: leakPage < leakPages - 1 ? () => set({ leakPage: leakPage + 1 }) : null,
     leakPageLabel: leakPages > 1 ? `${leakPage * LEAK_PAGE + 1}–${Math.min(openN, (leakPage + 1) * LEAK_PAGE)} of ${openN}` : "",
     allowedCount: allowedIds.length, showAllowed: !!ui.showAllowed, toggleAllowed: () => set((u) => ({ showAllowed: !u.showAllowed })),
-    allowed: allowedIds.map((h) => { const v = allowedList.find((x) => x.hash === h); return { hash: h, name: v ? nameOf(v) : "Not seen in this range", preview: v?.preview || `#${h}`, restore: () => act({ ignore: h, on: false }, `Restored #${h}.`, { ignore: h, on: true }) }; }),
+    allowed: allowedIds.map((h) => {
+      const v = allowedList.find((x) => x.hash === h);
+      const restorePending = Boolean(pendingOps[`allow:${h}`]);
+      return {
+        hash: h,
+        name: v ? nameOf(v) : "Not seen in this range",
+        preview: v?.preview || `#${h}`,
+        restorePending,
+        restore: () => !restorePending && act({ ignore: h, on: false }, `Restored #${h}.`, { ignore: h, on: true }, { opKey: `allow:${h}` }),
+      };
+    }),
     detail,
     samples: SAMPLES.map(([label, t]) => ({ label, on: () => set({ testText: t }) })),
     kindBtns: [["text", "Text"], ["image", "Image"]].map(([k, label]) => ({ label, style: seg(ui.testKind === k), on: () => set({ testKind: k }) })),

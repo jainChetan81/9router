@@ -4,7 +4,7 @@
 // Lives in ~/.cache, which vps-backup skips; the directory is 0700 and the files 0600.
 import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 export const PROMPT_CAP = 1024 * 1024, TOOL_CAP = 128 * 1024, REQUEST_CAP = 4 * 1024 * 1024;
@@ -20,6 +20,8 @@ const seen = new Map(), pending = new Map();
 export function promptsFile() {
   const p = process.env.PII_GUARD_PROMPTS;
   if (p && p !== "off") return p;
+  // A test run must never write to the real store in the home directory.
+  if (process.env.VITEST) return join(tmpdir(), `pii-guard-test-${process.pid}`, "prompts.db");
   return process.env.PII_GUARD_EVENTS ? join(dirname(process.env.PII_GUARD_EVENTS), "prompts.db") : join(homedir(), ".cache/pii-guard/prompts.db");
 }
 
@@ -220,6 +222,7 @@ function store({ nodes, bodyFindings = [], requestId, sessionId, model, provider
   }
   const chosen = pick(nodes, sessionId, file);
   const ts = Date.now();
+
   let captured = 0;
   for (const n of chosen) {
     if (n.unsafe) { stats.unsafe++; continue; }
@@ -305,6 +308,91 @@ export function search({ q = "", sessionId = "", requestId = "", hash = "", from
   const rows = d.prepare(sql).all(...(fts ? [fts] : []), ...args, n + 1);
   const page = rows.slice(0, n);
   return { rows: page, next: rows.length > n ? page.at(-1).id : null };
+}
+// Sessions view: one aggregate per stored session, newest first, paged by last_seen. Messages without a
+// session_id never appear here; they stay reachable only through Prompts and per-request links.
+// Unique finding values are folded from the per-message hash lists in JS: the lists are small.
+export function sessions({ q = "", client = "", provider = "", combo = "", hash = "", findings = null, from = 0, to = Date.now(), before = Infinity, limit = 50 } = {}) {
+  const d = open();
+  if (!d) return { rows: [], next: null, unavailable: true };
+  const lo = Math.max(from, Date.now() - TTL_MS);
+  // The ts pair feeds two ? pairs (CTE and outer WHERE), so it repeats in the args in that order.
+  const where = ["m.ts >= ?", "m.ts <= ?"], args = [lo, to, lo, to];
+  // HAVING placeholders come after the outer WHERE ones, and `before` feeds an HAVING ? only,
+  // so it is appended last.
+  if (client) { where.push("g.clients LIKE ?"); args.push(`%\u0001${client}\u0001%`); }
+  if (provider) { where.push("g.providers LIKE ?"); args.push(`%\u0001${provider}\u0001%`); }
+  if (combo) { where.push("EXISTS (SELECT 1 FROM messages f WHERE f.session_id = g.session_id AND f.combo LIKE ?)"); args.push(`${combo}%`); }
+  if (hash) { where.push("EXISTS (SELECT 1 FROM messages f WHERE f.session_id = g.session_id AND (' ' || f.hashes || ' ') LIKE ?)"); args.push(`% ${hash} %`); }
+  if (findings === true) where.push("EXISTS (SELECT 1 FROM messages f2 WHERE f2.session_id = g.session_id AND f2.hashes != '')");
+  if (findings === false) where.push("NOT EXISTS (SELECT 1 FROM messages f2 WHERE f2.session_id = g.session_id AND f2.hashes != '')");
+  if (q) where.push(`(g.session_id LIKE ? OR COALESCE(g.models,'') LIKE ? OR COALESCE(g.clients,'') LIKE ? OR COALESCE(g.providers,'') LIKE ? OR EXISTS (SELECT 1 FROM messages f3 WHERE f3.session_id = g.session_id AND COALESCE(f3.combo,'') LIKE ?))`);
+  if (q) args.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
+  if (Number.isFinite(before)) { where.push("g.last < ?"); args.push(before); }
+  const n = Math.min(Math.max(1, limit), 200);
+  const rows = d.prepare(`WITH g AS (
+      SELECT session_id, MIN(ts) AS first, MAX(ts) AS last, COUNT(*) AS messages,
+        COUNT(DISTINCT request_id) AS requests,
+        '\u0001' || COALESCE(GROUP_CONCAT(DISTINCT client), '') || '\u0001' AS clients,
+        '\u0001' || COALESCE(GROUP_CONCAT(DISTINCT provider), '') || '\u0001' AS providers,
+        '\u0001' || COALESCE(GROUP_CONCAT(DISTINCT model), '') || '\u0001' AS models
+      FROM messages WHERE ts >= ? AND ts <= ? GROUP BY session_id
+    ) SELECT g.session_id AS sessionId, g.first, g.last, g.messages, g.requests, g.clients, g.providers, g.models,
+      MAX(m.client) AS client, MAX(m.provider) AS provider, MAX(m.combo) AS combo, MAX(m.model) AS model,
+      MAX(m.hashes != '') AS hasFindings
+    FROM g JOIN messages m ON m.session_id = g.session_id
+    WHERE ${where.filter((w) => !w.startsWith("g.last")).join(" AND ")}
+    GROUP BY g.session_id HAVING (${where.filter((w) => w.startsWith("g.last")).join(" AND ") || "1=1"})
+    ORDER BY g.last DESC, g.first ASC, g.session_id ASC LIMIT ?`).all(...args, n + 1);
+  // Distinct finding hashes per page, folded in JS from the per-message hash lists: one query
+  // for the page instead of one per session.
+  const page = rows.slice(0, n);
+  const values = new Map();
+  if (page.length) {
+    const ph = page.map(() => "?").join(",");
+    for (const row of d.prepare(`SELECT session_id, hashes FROM messages WHERE hashes != '' AND session_id IN (${ph})`).all(...page.map((r) => r.sessionId)))
+      for (const h of row.hashes.split(" ")) { if (h) { values.set(row.session_id, (values.get(row.session_id) || new Set()).add(h)); } }
+  }
+  return { rows: page.map((r) => ({ ...r, values: values.get(r.sessionId)?.size || 0 })), next: rows.length > n ? rows[n - 1].last : null };
+}
+/** Full conversation for one session, oldest first: session metadata plus messages up to a byte cap
+ *  (oldest kept), each with text and finding counts. Requests without a session never appear. */
+export function conversation({ sessionId, from = 0, to = Date.now(), cap = 800_000, after = 0 } = {}) {
+  const d = open();
+  if (!d) return { unavailable: true };
+  if (typeof sessionId !== "string" || !sessionId || sessionId.length > 200) return { error: "Invalid session id" };
+  const meta = d.prepare(`SELECT MIN(ts) AS first, MAX(ts) AS last FROM messages WHERE session_id = ? AND ts >= ? AND ts <= ?`).get(sessionId, Math.max(from, Date.now() - TTL_MS), to);
+  if (!meta?.first) return { notFound: true };
+  const list = d.prepare(`SELECT id, ts, request_id AS requestId, session_id AS sessionId, model, provider, combo, account, client, role, kind, path, tool, cut, length(text) AS len, hashes
+    FROM messages WHERE session_id = ? AND ts >= ? AND ts <= ? AND id > ? ORDER BY ts ASC, id ASC`)
+    .all(sessionId, Math.max(from, Date.now() - TTL_MS), to, after);
+  // Byte cap oldest-first: truncated tail is fetched later with `after`.
+  const bytes = { used: 0, over: [] }, rows = [];
+  const c = Math.max(Number(cap) || 800_000, 0);
+  for (const row of list) {
+    if (rows.length && bytes.used + row.len > c) { bytes.over.push(row); continue; }
+    bytes.used += row.len;
+    rows.push(row);
+  }
+  const ids = rows.map((r) => r.id);
+  const texts = new Map();
+  for (let i = 0; i < ids.length; i += 100) {
+    const chunk = ids.slice(i, i + 100);
+    const ph = chunk.map(() => "?").join(",");
+    for (const r of d.prepare(`SELECT id, text FROM messages WHERE id IN (${ph})`).all(...chunk)) texts.set(r.id, r.text);
+  }
+  // Distinct finding values in the whole session (even past the byte cap).
+  const allHashes = new Set();
+  for (const r of d.prepare("SELECT hashes FROM messages WHERE session_id = ? AND hashes != '' AND ts >= ? AND ts <= ?").all(sessionId, Math.max(from, Date.now() - TTL_MS), to))
+    for (const h of r.hashes.split(" ")) if (h) allHashes.add(h);
+  return {
+    sessionId, first: meta.first, last: meta.last, values: allHashes.size,
+    messages: {
+      rows: rows.map((r) => ({ ...r, text: texts.get(r.id) ?? "", values: r.hashes ? [...new Set(r.hashes.split(" "))].filter(Boolean) : [] })),
+      total: list.length, shown: rows.length, over: bytes.over.length,
+    },
+    requests: new Set(list.map((r) => r.requestId)).size,
+  };
 }
 export function message(id) {
   const d = open();

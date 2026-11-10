@@ -3,7 +3,8 @@ import { getAdapter } from "../db/driver.js";
 import { DATA_FILE } from "../db/paths.js";
 import { parseJson } from "../db/helpers/jsonCol.js";
 import { hasSessionColumn, sessionSql, sessionMatchSql, statusSql, roleSql } from "./dbColumns.js";
-import { parseMeta, roleOf, clientOfUa, latencyOf, statusOf, bgRole } from "./meta.js";
+import { parseMeta, roleOf, clientOfUa, clientVersionOf, latencyOf, statusOf, bgRole, effectiveRole, resolveRoleName, isErrorStatus } from "./meta.js";
+import { enrichSession } from "./enrichment.js";
 import { num } from "./value.js";
 import { percentile } from "./percentiles.js";
 import { snapshot as liveSnapshot } from "./liveRegistry.js";
@@ -175,8 +176,8 @@ export function normalizeRow(r, hasCol) {
   const la = latencyOf(meta);
   const st = statusOf(meta, r.status);
   const client = clientOfUa(meta?.ua);
-  const roleRaw = roleOf(meta);
-  const role = bgRole(client, roleRaw);
+  const roleRaw = resolveRoleName(meta?.combo);
+  const role = effectiveRole(client, meta?.combo);
   return {
     id: r.id,
     ts: r.timestamp,
@@ -217,6 +218,8 @@ const PARENT_CANDIDATE_CAP = 200;
 const inferredParentCache = new Map();
 const INFERRED_PARENT_CACHE_CAP = 5000;
 export const SESSION_CAP = 2000;
+const hex12 = /^[0-9a-f]{12}$/;
+function isHexId(value) { return typeof value === "string" && hex12.test(value); }
 export const ANALYTICS_SAMPLE_CAP = 20_000;
 const GROUP_ROW_CAP = 20_000;
 const LIVE_ROW_CAP = 20_000;
@@ -405,7 +408,7 @@ function processSessionRows(roleRows, spans) {
     s.client = client;
     const roles = [];
     for (const [roleName, entry] of s._roleMap) {
-      const finalRole = (roleName === "claude-haiku-5-5" && client === "Claude Code") ? "background" : roleName;
+      const finalRole = effectiveRole(client, roleName);
       let r = roles.find((x) => x.role === finalRole);
       if (!r) {
         r = { role: finalRole, models: [] };
@@ -508,10 +511,22 @@ async function listSessionsPageInline(db, fromIso, toIso, { limit = 100, cursor 
   const { sessions } = processSessionRows(roleRows, selected);
   const pageOrder = new Map(selected.map((span, index) => [span.session, index]));
 
+  // T3 enrichment plus real parent links. Guessed links come first; a real T3
+  // parent (inferred:false, parentGuessed:false) wins over a guess.
+  let enrichmentBySession = new Map();
+  try {
+    const hashes = selected.map((span) => span.session).filter(isHexId);
+    const settled = await Promise.allSettled(hashes.map((h) => enrichSession(h)));
+    enrichmentBySession = new Map(hashes.map((h, i) => [h, settled[i].status === "fulfilled" ? settled[i].value : null]));
+  } catch { enrichmentBySession = new Map(); }
+
   const results = sessions.map((s) => {
     const parent = parentMap.get(s.session) || null;
+    const en = enrichmentBySession.get(s.session) || null;
+    const t3Parent = en?.parent || null;
+    const realParent = t3Parent || parent;
     const { _apiKey, _firstMs, _lastMs, ...rest } = s;
-    return { ...rest, parent };
+    return { ...rest, parent: realParent, t3: en ? { title: en.title, project: en.project, directory: en.directory, device: en.device } : null };
   }).sort((a, b) => pageOrder.get(a.session) - pageOrder.get(b.session));
   return {
     sessions: results,
@@ -623,7 +638,67 @@ async function getSessionDetailInline(db, sessionId) {
   const client = norm.length ? norm[0].client : "Unknown";
   const firstTs = norm.length ? norm[0].ts : null;
   const lastTs = norm.length ? norm[norm.length - 1].ts : null;
-  return { session: sessionId, client, firstTs, lastTs, agents, children, truncated: requestTruncated || childrenTruncated };
+
+  // Totals over the full range in SQL, not from the 2,000-row sample.
+  let totals = null;
+  try {
+    totals = db.get(
+      `SELECT COUNT(*) AS requests,
+              COALESCE(SUM(COALESCE(promptTokens,0) + COALESCE(completionTokens,0)),0) AS tokens,
+              COALESCE(SUM(cost),0) AS value,
+              SUM(CASE WHEN ${statusSql()} <> 'ok' THEN 1 ELSE 0 END) AS errors
+       FROM usageHistory WHERE ${whereSql}`,
+      params
+    );
+  } catch { totals = null; }
+
+  // Tool call summary from sanitized meta.tools / meta.toolErrors (spendMeta
+  // validates names). Arguments and results are never stored.
+  let toolCalls = [];
+  try {
+    const toolRows = db.all(
+      `SELECT meta FROM usageHistory WHERE ${whereSql}
+         AND json_valid(meta)
+         AND (json_type(meta,'$.tools') = 'array' OR json_type(meta,'$.toolErrors') = 'array')
+       ORDER BY id DESC LIMIT 2000`,
+      params
+    );
+    const agg = new Map();
+    for (const row of toolRows) {
+      const meta = parseMeta(row.meta) || {};
+      const names = (arr) => {
+        const m = new Map();
+        if (!Array.isArray(arr)) return m;
+        for (const e of arr) {
+          if (!e || typeof e.name !== "string" || !/^[A-Za-z0-9_.:-]{1,64}$/.test(e.name)) continue;
+          m.set(e.name, Math.min(50, Math.max(0, Number(e.count) || 0)));
+        }
+        return m;
+      };
+      const calls = names(meta.tools), errs = names(meta.toolErrors);
+      for (const [name, n] of [...calls, ...errs]) {
+        let t = agg.get(name);
+        if (!t) { t = { name, calls: 0, errors: 0 }; agg.set(name, t); }
+        t.calls += calls.get(name) || 0;
+        t.errors += errs.get(name) || 0;
+      }
+    }
+    toolCalls = [...agg.values()].sort((a, b) => b.calls - a.calls || a.name.localeCompare(b.name));
+  } catch { toolCalls = []; }
+
+  // T3 enrichment: thread title, project, directory, device, real parent.
+  let t3 = null;
+  if (isHexId(sessionId)) {
+    try { t3 = await enrichSession(sessionId); } catch { t3 = null; }
+  }
+  const realParent = t3?.parent || (children.length ? { session: children[0].session, inferred: true, parentGuessed: children[0].parentGuessed !== false } : null);
+
+  // Only the version number leaves the server, never the raw user agent.
+  const clientVersion = clientVersionOf(rows.map((r) => parseMeta(r.meta)?.ua).find(Boolean));
+  return { session: sessionId, client, clientVersion, firstTs, lastTs, agents, children, truncated: requestTruncated || childrenTruncated,
+    totals: totals ? { requests: Number(totals.requests || 0), tokens: Number(totals.tokens || 0), value: num(totals.value), errors: Number(totals.errors || 0) } : null,
+    toolCalls, t3: t3 ? { title: t3.title, project: t3.project, directory: t3.directory, device: t3.device } : null,
+    parent: realParent };
 }
 
 // ---------- analytics ----------
@@ -790,7 +865,18 @@ async function getAnalyticsInline(db, fromIso, toIso) {
 // ---------- live ----------
 export function getLive(db, nowMs = Date.now()) {
   return Promise.resolve(runReadWorker(db, "getLive", [nowMs], () => getLiveInline(db, nowMs)))
-    .then((result) => mergeLiveSnapshot(result, liveSnapshot(), nowMs));
+    .then((result) => mergeLiveSnapshot(result, liveSnapshot(), nowMs))
+    .then(addLiveTitles);
+}
+
+// Live cards show the T3 thread title under the session ID (Agents r1).
+async function addLiveTitles(result) {
+  const list = result?.sessions;
+  if (!Array.isArray(list) || !list.length) return result;
+  try {
+    const titles = await Promise.all(list.map((s) => (isHexId(s.session) ? enrichSession(s.session).then((en) => en?.title || null, () => null) : null)));
+    return { ...result, sessions: list.map((s, i) => (titles[i] ? { ...s, title: titles[i] } : s)) };
+  } catch { return result; }
 }
 
 function mergeLiveSnapshot(result, activeBySession, nowMs) {

@@ -11,6 +11,7 @@ import { NextResponse } from "next/server";
 import { getAdapter } from "@/lib/db/driver.js";
 import { getComboByName, getCustomModels, getModelAliases, getProviderConnections } from "@/lib/localDb.js";
 import { getSettings } from "@/lib/db/repos/settingsRepo.js";
+import { getDisabledModels } from "@/lib/db/repos/disabledModelsRepo.js";
 import { getSessionDetail } from "@/lib/agents/queries.js";
 import {
   deleteOverride,
@@ -93,9 +94,35 @@ function isChatModel(model) {
   return !kind || kind === "llm" || kind === "imageToText";
 }
 
-async function resolveTargetModel(target, depth = 0) {
+// Disabled model ids carry a provider alias from getDisabledModels(); ids live
+// under aliases of the same provider too. Resolve alias ownership once here.
+function targetProviderAliases(prefixList) {
+  return prefixList.map((prefix) => {
+    const entry = providerEntry(prefix);
+    return { id: entry?.id || prefix, aliases: new Set([prefix, entry?.id, entry?.alias, entry?.uiAlias, ...(entry?.aliases || [])].filter(Boolean)) };
+  });
+}
+
+// Chat models that resolve to a provider and are not disabled for it.
+async function enabledChatModelsFor(providerAliasSetIds) {
+  try {
+    const [customModels, connections, disabled] = await Promise.all([
+      getCustomModels(), getProviderConnections(), getDisabledModels(),
+    ]);
+    const disabledEntries = targetProviderAliases(Object.keys(disabled || {}));
+    const requested = targetProviderAliases([...providerAliasSetIds]);
+    const isDisabled = (alias, modelId) => disabledEntries.some((entry) =>
+      entry.aliases.has(alias) && (disabled[entry.id] || []).includes(modelId));
+    return { isDisabled, customModels, connections };
+  } catch {
+    return { isDisabled: () => false, customModels: null, connections: null };
+  }
+}
+
+async function resolveTargetModel(target, depth = 0, disabledCheck = null) {
   if (typeof target !== "string" || !target.trim() || target.length > 256 || depth > 2) return null;
   const model = target.trim();
+  const disabled = disabledCheck?.isDisabled || (() => false);
 
   const combo = await getComboByName(model);
   if (combo) {
@@ -107,11 +134,13 @@ async function resolveTargetModel(target, depth = 0) {
   const aliases = await getModelAliases();
   const aliasTarget = aliases?.[model];
   if (typeof aliasTarget === "string" && aliasTarget !== model) {
-    return resolveTargetModel(aliasTarget, depth + 1);
+    return resolveTargetModel(aliasTarget, depth + 1, disabledCheck);
   }
 
   const slash = model.indexOf("/");
   if (slash < 0) {
+    // Bare model id: resolve against the model catalog (B13). Unambiguous
+    // matches become provider/model; ambiguous or disabled IDs are rejected.
     const [customModels, connections] = await Promise.all([getCustomModels(), getProviderConnections()]);
     const matches = [];
     for (const [prefix, entries] of Object.entries(PROVIDER_MODELS)) {
@@ -134,19 +163,28 @@ async function resolveTargetModel(target, depth = 0) {
       }
     }
     const unique = [...new Map(matches.map((entry) => [`${entry.provider}/${entry.modelId}`, entry])).values()];
-    return unique.length === 1 ? { exists: true, ...unique[0], combo: null, fusion: false } : null;
+    if (unique.length > 1) {
+      // Prefer the provider where the model is not disabled; still ambiguous
+      // otherwise.
+      const enabled = unique.filter((entry) => !disabled(entry.provider, entry.modelId));
+      if (enabled.length === 1) return { exists: true, ...enabled[0], combo: null, fusion: false };
+      return null;
+    }
+    const only = unique[0];
+    if (only && disabled(only.provider, only.modelId)) return null;
+    return only ? { exists: true, ...only, combo: null, fusion: false } : null;
   }
   if (slash <= 0 || slash === model.length - 1) return null;
   const prefix = model.slice(0, slash);
   const modelId = model.slice(slash + 1);
   const provider = targetProviderInfo(prefix);
   const staticModels = [...provider.aliases].flatMap((alias) => PROVIDER_MODELS[alias] || []);
-  const staticMatch = staticModels.find((entry) => entry.id === modelId && isChatModel(entry));
+  const staticMatch = staticModels.find((entry) => entry.id === modelId && isChatModel(entry) && !disabled(provider.id, modelId));
   if (staticMatch) return { exists: true, model, modelId, provider: provider.id, combo: null, fusion: false };
 
   const [customModels, connections] = await Promise.all([getCustomModels(), getProviderConnections()]);
   const customMatch = (customModels || []).find((entry) =>
-    entry?.id === modelId && isChatModel(entry) && provider.aliases.has(entry.providerAlias)
+    entry?.id === modelId && isChatModel(entry) && provider.aliases.has(entry.providerAlias) && !disabled(provider.id, modelId)
   );
   if (customMatch) return { exists: true, model, modelId, provider: provider.id, combo: null, fusion: false };
 
@@ -159,7 +197,7 @@ async function resolveTargetModel(target, depth = 0) {
       return candidate === modelId || candidate === model || candidate === `${prefix}/${modelId}`;
     });
   });
-  if (dynamicMatch) return { exists: true, model, modelId, provider: provider.id, combo: null, fusion: false };
+  if (dynamicMatch && !disabled(provider.id, modelId)) return { exists: true, model, modelId, provider: provider.id, combo: null, fusion: false };
   return null;
 }
 
@@ -243,7 +281,9 @@ export async function PUT(request, context) {
       }
     }
 
-    const resolved = await resolveTargetModel(body.model);
+    const resolved = await resolveTargetModel(body.model, 0, await enabledChatModelsFor([
+      "cc", "cx", "ag", "ocg", "muse", "openrouter", "deepseek", "ocf", "ollama",
+    ]));
     if (!resolved) return jsonError("Model not found", 404);
     if (resolved.fusion) return jsonError("Fusion combo cannot be used as a target", 400);
 
@@ -314,6 +354,7 @@ export async function DELETE(request, context) {
       return NextResponse.json({ error: "Revision conflict", currentRevision: error.currentRevision }, { status: 409 });
     }
     if (error instanceof OverrideNotFoundError) return jsonError("Override not found", 404);
+    if (error?.code === "busy" || error?.status === 503) return busyError();
     return jsonError("Unable to delete override", 500);
   }
 }

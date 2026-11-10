@@ -1,6 +1,7 @@
 // Pure URL <-> UI state for the PII Guard page. Defaults are omitted from the URL so the bare path stays clean.
 export const TABS = ["overview", "findings", "rules", "test", "health"];
-export const VIEWS = ["value", "hit", "prompt"];
+export const VIEWS = ["value", "hit", "prompt", "session"];
+export const SESSION_SORTS = ["last", "first", "requests", "values"];
 export const ACTIONS = ["redact", "observe", "block", "leaked", "allowed"];
 export const SOURCES = ["text", "ocr"];
 export const PRESETS = ["Today", "24h", "7D", "30D", "60D", "All"];
@@ -8,8 +9,7 @@ export const DEFAULT_RANGE = { preset: "24h" };
 const DEFAULT_TAB = "overview", DEFAULT_VIEW = "value";
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
 const pick = (v, list, fallback) => (list.includes(v) ? v : fallback);
-const text = (v) => (typeof v === "string" ? v.trim() : "");
-const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const text = (v) => (typeof v === "string" ? v.trim() : "");const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 // Real calendar day only: 2026-02-30 and 2026-99-99 are rejected by the UTC round-trip.
 export function validDate(v) {
   if (!DATE.test(v)) return false;
@@ -79,6 +79,15 @@ export function parseUrlState(sp) {
   return {
     tab,
     view,
+    ssort: pick(sp.get("ssort"), SESSION_SORTS, "last"),
+    sdesc: sp.get("sdesc") === "0" ? false : true,
+    sf: {
+      client: text(sp.get("sclient")),
+      provider: text(sp.get("sprovider")),
+      combo: text(sp.get("scombo")),
+      hash: (sp.get("shash") || "").toLowerCase().trim(),
+      findings: sp.get("sfind") === "1" ? "1" : sp.get("sfind") === "0" ? "0" : "",
+    },
     q: sp.get("q") || "", // raw: the editing value keeps spaces; trim only where it is compared or sent
     fGroup: text(sp.get("group")),
     fAction: pick(sp.get("action"), ACTIONS, ""),
@@ -105,10 +114,19 @@ function parseDetail(finding, hit) {
 // Serialises the UI slice back to a URLSearchParams, omitting defaults. `keep` holds params this module does not own.
 export function serialiseUrlState(s, keep = new URLSearchParams()) {
   const out = new URLSearchParams(keep);
-  for (const k of ["tab", "view", "q", "group", "action", "client", "model", "source", "range", "from", "to", "session", "at", "finding", "hit", "tests"]) out.delete(k);
+  for (const k of ["tab", "view", "q", "group", "action", "client", "model", "source", "range", "from", "to", "session", "at", "finding", "hit", "tests", "ssort", "sdesc", "sclient", "sprovider", "scombo", "shash", "sfind"]) out.delete(k);
   const set = (k, v) => { if (v) out.set(k, v); };
   set("tab", s.tab !== DEFAULT_TAB ? s.tab : "");
   set("view", s.view !== DEFAULT_VIEW && s.tab === "findings" ? s.view : "");
+  if (s.tab === "findings" && s.view === "session") {
+    set("ssort", s.ssort && s.ssort !== "last" ? s.ssort : "");
+    set("sdesc", s.sdesc === false ? "0" : "");
+    set("sclient", s.sf?.client);
+    set("sprovider", s.sf?.provider);
+    set("scombo", s.sf?.combo);
+    if (s.sf?.hash) set("shash", s.sf.hash);
+    set("sfind", s.sf?.findings || "");
+  }
   if (s.q && s.q.trim()) out.set("q", s.q);
   set("group", s.fGroup);
   set("action", s.fAction);

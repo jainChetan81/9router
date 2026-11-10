@@ -42,7 +42,7 @@ export default function AgentsClient() {
   const [mode, setMode] = useState("loading");
   const [errorText, setErrorText] = useState("");
   const [ui, setUi] = useState({ tab: "live", paused: false, ago: 0, q: "", fClient: "", fRole: "", sel: null, exp: {}, focus: null, hov: null, pick: null, zoom: null, gOff: 0, drawer: null, drawerMode: "routing", conflict: null });
-  const set = useCallback((p) => setUi((u) => ({ ...u, ...(typeof p === "function" ? p(u) : p) })), []);
+  const set = useCallback((p) => setUi((u) => { const next = typeof p === "function" ? p(u) : p; if (next === u) return u; for (const k in next) if (!Object.is(next[k], u[k])) return { ...u, ...next }; return u; }), []);
   const closeDrawer = useCallback(() => { setDraft({}); setCf(false); set({ drawer: null, conflict: null }); }, [set]);
   const [theme, setTheme] = useState("light");
   const [vw, setVw] = useState(1440);
@@ -66,9 +66,11 @@ export default function AgentsClient() {
     }
     return data;
   }, []);
+  const [overrideBusy, setOverrideBusy] = useState(null); // { sid, role, verb: "apply" | "revert" } | null
   const applyOverrides = useCallback(async (sid, changes) => {
     const saved = [];
     let auditWarning = false;
+    setOverrideBusy({ sid, verb: "apply" });
     try {
       let failure = null;
       for (const change of changes) {
@@ -104,9 +106,10 @@ export default function AgentsClient() {
         setRetryRouting({ sid, changes });
         setToast("Could not apply routing. Try again.");
       }
-    }
-  }, [refreshOverrides, overridesBySession, set]);
+    } finally { setOverrideBusy(null); }
+  }, [refreshOverrides, overridesBySession, set, setOverrideBusy]);
   const revertOverride = useCallback(async (sid, role, revision, entry) => {
+    setOverrideBusy({ sid, verb: "revert", role });
     try {
       const q = new URLSearchParams({ combo: role, revision: String(revision ?? entry?.revision ?? 0) });
       const res = await fetch(`/api/agents/sessions/${encodeURIComponent(sid)}/overrides?${q}`, { method: "DELETE" });
@@ -116,7 +119,8 @@ export default function AgentsClient() {
       await refreshOverrides(sid);
       setToast(body.auditWarning ? role + " reverted; audit entry could not be recorded." : role + " reverted to " + (entry?.from || "combo default"));
     } catch (error) { setToast(error.message || "Unable to revert routing."); }
-  }, [refreshOverrides]);
+    finally { setOverrideBusy(null); }
+  }, [refreshOverrides, setOverrideBusy]);
   useEffect(() => {
     if (!ui.drawer) return;
     const timer = setTimeout(() => refreshOverrides(ui.drawer).catch(() => setToast("Unable to load routing overrides.")), 0);
@@ -166,6 +170,7 @@ export default function AgentsClient() {
   }, []);
 
   const liveId = useRef(0);
+  const liveSig = useRef("");
   const uiRef = useRef(ui);
   useEffect(() => { uiRef.current = ui; });
   const loadLive = useCallback(async () => {
@@ -173,8 +178,10 @@ export default function AgentsClient() {
     try {
       const d = await getJson("/api/agents/live");
       if (id !== liveId.current) return;
-      setLive(d);
-      set((u) => ({ ...u, ago: 0 }));
+      // Skip the re-render when the live feed did not change (N5).
+      const sig = JSON.stringify(d);
+      if (sig !== liveSig.current) { liveSig.current = sig; setLive(d); }
+      set({ ago: 0 });
     } catch {
       if (id !== liveId.current) return;
       setMode((m) => (m === "ready" || m === "stale" ? "stale" : m));
@@ -201,25 +208,45 @@ export default function AgentsClient() {
 
 
   const rangeId = useRef(0);
-  const loadRange = useCallback(async () => {
+  const [rangeBusy, setRangeBusy] = useState(false);
+  const [rangeNonce, setRangeNonce] = useState(0);
+  // Sessions and analytics are heavy. Load them on range change, then every
+  // 30 s; only the small /live feed follows the 2 s tick (N5).
+  const loadRange = useCallback(async ({ background = false } = {}) => {
     const id = ++rangeId.current;
-    const q = new URLSearchParams({ preset: range.preset });
-    if (range.preset === "Custom") { q.set("from", range.from); q.set("to", range.to); }
+    if (!background) setRangeBusy(true);
     try {
+      const q = new URLSearchParams({ preset: range.preset });
+      if (range.preset === "Custom") { q.set("from", range.from); q.set("to", range.to); }
       const [s, a] = await Promise.all([getJson(`/api/agents/sessions?${q}`), getJson(`/api/agents/analytics?${q}`)]);
       if (id !== rangeId.current) return;
-      setSessions(s.sessions || []);
+      setRangeBusy(false);
+      // Background refreshes merge pages already loaded by "Load 100 more" (N4).
+      setSessions((old) => {
+        const page = s.sessions || [];
+        if (!background) return page;
+        const seen = new Set(page.map((x) => x.session));
+        const keep = (old || []).filter((x) => !seen.has(x.session));
+        return page.length < (s.total ?? page.length) ? [...page, ...keep] : page;
+      });
       setTotalSessions(s.total ?? (s.sessions || []).length);
-      setMoreCursor(s.nextCursor || null);
-      setAnalytics(a);
+      if (!background) setMoreCursor(s.nextCursor || null);
+      setAnalytics((old) => (old && JSON.stringify(old) === JSON.stringify(a) ? old : a));
       setMode("ready");
     } catch (e) {
       if (id !== rangeId.current) return;
+      setRangeBusy(false);
       setErrorText(e.message || "Request failed");
       setMode((m) => (m === "ready" || m === "stale" ? "stale" : "error"));
     }
-  }, [range]); // tick re-arms loadRange via the effect below, not the closure
-  useEffect(() => { const t = setTimeout(loadRange, 0); return () => clearTimeout(t); }, [loadRange, tick]);
+  }, [range]);
+  useEffect(() => { const t = setTimeout(() => loadRange(), 0); return () => clearTimeout(t); }, [loadRange, rangeNonce]);
+  useEffect(() => {
+    const iv = setInterval(() => { if (!document.hidden && !uiRef.current.paused) loadRange({ background: true }); }, 30000);
+    const vis = () => { if (!document.hidden && !uiRef.current.paused) loadRange({ background: true }); };
+    document.addEventListener("visibilitychange", vis);
+    return () => { clearInterval(iv); document.removeEventListener("visibilitychange", vis); };
+  }, [loadRange]);
 
   useEffect(() => {
     let cancelled = false;
@@ -267,12 +294,32 @@ export default function AgentsClient() {
     if (!ui.sel) return;
     const url = new URL(window.location.href); url.searchParams.set("s", ui.sel); window.history.replaceState({}, "", url);
   }, [ui.sel]);
+  // Keep the tab in the URL so reload and shared links open the same tab.
+  useEffect(() => {
+    const t = new URL(window.location.href).searchParams.get("tab");
+    if (!["sessions", "roles", "tools"].includes(t)) return;
+    const timer = setTimeout(() => set((u) => (u.tab === "live" && !u.tabTouched ? { tab: t } : u)), 0);
+    return () => clearTimeout(timer);
+  }, [set]);
+  useEffect(() => {
+    if (!ui.tabTouched) return;
+    const url = new URL(window.location.href);
+    if (ui.tab === "live") url.searchParams.delete("tab"); else url.searchParams.set("tab", ui.tab);
+    if (url.href !== window.location.href) window.history.replaceState({}, "", url);
+  }, [ui.tab, ui.tabTouched]);
   const sel = ui.sel || null;
   useEffect(() => {
     if (ui.tab !== "sessions" || !sel) return;
     const t = setTimeout(() => loadDetail(sel), 0);
     return () => clearTimeout(t);
-  }, [ui.tab, sel, tick, loadDetail]);
+  }, [ui.tab, sel, loadDetail]);
+  // A live session's detail refreshes every 10 s; ended sessions do not change (N5).
+  const selLive = !!(sel && live?.sessions?.some((x) => x.session === sel));
+  useEffect(() => {
+    if (ui.tab !== "sessions" || !sel || !selLive) return;
+    const iv = setInterval(() => { if (!document.hidden && !uiRef.current.paused) loadDetail(sel); }, 10000);
+    return () => clearInterval(iv);
+  }, [ui.tab, sel, selLive, loadDetail]);
 
   const loadMore = useCallback(async () => {
     if (!moreCursor || moreBusy) return;
@@ -299,9 +346,9 @@ export default function AgentsClient() {
   }, [live, mode]);
 
   const act = useMemo(() => ({
-    tab: (k) => set({ tab: k }),
+    tab: (k) => set({ tab: k, tabTouched: true }),
     pause: () => set((u) => ({ ...u, paused: !u.paused, ago: 0 })),
-    retry: () => { setMode("loading"); setTick((x) => x + 1); },
+    retry: () => { setMode("loading"); setTick((x) => x + 1); setRangeNonce((x) => x + 1); },
     setQ: (q) => set({ q }),
     setClient: (c) => set({ fClient: c }),
     setRole: (r) => set({ fRole: r }),
@@ -315,18 +362,19 @@ export default function AgentsClient() {
     zoom: (k) => set({ zoom: k, gOff: 0 }),
     pan: (d) => set((u) => ({ ...u, gOff: Math.max(0, (u.gOff || 0) + d) })),
     // Every drawer opens from a clean draft, so no edit from another session or an earlier open leaks in (A6).
-    openDrawer: (sid, kind = "routing") => { setDraft({}); setCf(false); set({ drawer: sid, drawerMode: kind, conflict: null }); if (sid) loadDetail(sid); else setOverrides([]); },
+    openDrawer: (sid, kind = "routing") => { setDraft({}); setCf(false); set({ drawer: sid, drawerMode: kind, conflict: null }); if (sid) loadDetail(sid); },
     openDetails: (sid) => { setDraft({}); setCf(false); set({ drawer: sid, drawerMode: "details", conflict: null }); loadDetail(sid); },
     openRouting: (sid) => { setDraft({}); setCf(false); set({ drawer: sid, drawerMode: "routing", conflict: null }); loadDetail(sid); },
     reloadRouting: async (sid) => { await refreshOverrides(sid); set({ conflict: null }); setDraft({}); },
     reloadSession: loadDetail,
     copySession: async (sid) => { try { await navigator.clipboard.writeText(sid); setToast("Copied"); } catch { setToast("Could not copy session ID."); } },
     loadMore,
-    openTimeline: (sid) => { if (sid) { set({ tab: "sessions", sel: sid }); } else set({ tab: "sessions" }); setTick((x) => x + 1); },
+    openTimeline: (sid) => { if (sid) { set({ tab: "sessions", sel: sid, tabTouched: true }); } else set({ tab: "sessions", tabTouched: true }); setTick((x) => x + 1); },
   }), [set, loadMore, loadDetail, refreshOverrides]);
 
   const drawerOverrideState = overridesBySession[ui.drawer] || {};
-  const v = buildView({ live, sessions, totalSessions, detail, detailsBySession, detailLoad, analytics, tools, range, ui: { ...ui, mode, errorText }, vw, combos, models, overrides: drawerOverrideState.overrides || [], overridesBySession, revisions: drawerOverrideState.revisions || {}, draft, cf, toast, moreCursor,
+  const busy = overrideBusy && overrideBusy.sid === ui.drawer ? overrideBusy : null;
+  const v = buildView({ live, sessions, totalSessions, detail, detailsBySession, detailLoad, analytics, tools, range, ui: { ...ui, mode, errorText }, vw, combos, models, overrides: drawerOverrideState.overrides || [], overridesBySession, revisions: drawerOverrideState.revisions || {}, draft, cf, toast, moreCursor, rangeBusy, busy,
     setDraft: (update) => setDraft((old) => ({ ...old, ...(typeof update === "function" ? update(old) : update) })),
     setCf, setToast, applyOverrides, reloadOverrides: refreshOverrides,
     act: { ...act, applyOverrides, revertOverride } });
@@ -407,7 +455,7 @@ export default function AgentsClient() {
               <button onClick={v.togglePause} aria-label={v.paused ? "Resume live feed" : "Pause live feed"} style={{ display: "flex", alignItems: "center", gap: 7, border: 0, background: "transparent", padding: 0, font: "inherit", fontSize: 12, color: v.fresh.c, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>
                 <span style={v.fresh.dot} />{v.fresh.text}<span className="r9-hacc" style={{ fontFamily: "'Material Symbols Outlined'", fontSize: 15 }}>{v.fresh.icon}</span>{v.fresh.btn}
               </button>
-            ) : <RangeBar preset={v.preset} customLabel={v.customLabel} onChange={onRange} />}
+            ) : <div onClick={(e) => { if (rangeBusy) e.stopPropagation(); }}><RangeBar preset={v.preset} customLabel={v.customLabel} onChange={onRange} /></div>}
           </div>
           <div style={{ fontSize: 11, color: "var(--tx2)", display: "flex", alignItems: "center", gap: 4 }}><span className="material-symbols-outlined" style={{ fontSize: 14 }}>schedule</span>Times in IST (UTC+5:30) · Agent telemetry logging began Nov 9</div>
         </div>
@@ -429,15 +477,17 @@ export default function AgentsClient() {
             <button onClick={v.v.emptyGo} style={{ height: 30, padding: "0 14px", borderRadius: 8, border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>{v.v.emptyBtn}</button>
           </div>
         )}
-        {ready && !v.v.empty && v.v.stale && (
+        {ready && v.v.empty && v.v.stale && (
           <div role="status" style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--amber)", background: "var(--amberbg)", border: "1px solid var(--amber)", borderRadius: 8, padding: "8px 12px", marginBottom: 12 }}>
             <span className="material-symbols-outlined" style={{ fontSize: 16 }}>warning</span>{v.v.staleText}
           </div>
         )}
-        {ready && !v.v.empty && ui.tab === "live" && <LiveTab v={v} />}
-        {ready && !v.v.empty && ui.tab === "sessions" && <SessionsTab v={v} ui={ui} moreBusy={moreBusy} />}
-        {ready && !v.v.empty && ui.tab === "roles" && <RolesTab v={v} />}
-        {ready && !v.v.empty && ui.tab === "tools" && <ToolsTab v={v} error={toolsError} loading={!tools && !toolsError} />}
+        {ready && !v.v.empty && <><div aria-busy={rangeBusy || undefined} style={{ opacity: rangeBusy ? 0.55 : 1, transition: "opacity .2s", minWidth: 0 }}><div style={{ display: rangeBusy ? "flex" : "none", alignItems: "center", gap: 8, fontSize: 12, color: "var(--tx2)", marginBottom: 8 }} role="status"><span className="material-symbols-outlined" style={{ fontSize: 16 }}>progress_activity</span>{v.v.loadingText || "Loading…"}</div>
+          {ui.tab === "live" && <LiveTab v={v} />}
+          {ui.tab === "sessions" && <SessionsTab v={v} ui={ui} moreBusy={moreBusy} />}
+          {ui.tab === "roles" && <RolesTab v={v} />}
+          {ui.tab === "tools" && <ToolsTab v={v} error={toolsError} loading={!tools && !toolsError} />}
+        </div></>}
 
         {v.dr && (
           <div role="dialog" aria-modal="true" aria-labelledby="r9-drawer-title" onClick={v.closeDrawer} style={{ position: "fixed", inset: 0, zIndex: 70, background: "rgba(0,0,0,.32)", display: "flex", justifyContent: "flex-end" }}>
@@ -457,7 +507,7 @@ export default function AgentsClient() {
                     <span style={r.chip}>{r.role}</span>
                     <span style={{ fontSize: 12, color: "var(--tx2)" }}>now: <b>{r.cur}</b></span>
                   {r.status && <span style={r.statusStyle}>{r.status}</span>}
-                  {r.canRevert && <button onClick={r.revert} style={{ marginLeft: "auto", height: 26, padding: "0 10px", borderRadius: 7, border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: 12, cursor: "pointer" }}>Revert</button>}
+                  {r.canRevert && <button onClick={r.revert} disabled={!!(v.dr?.revertingRole && (v.dr.revertingRole === r.role || "all" === v.dr.revertingRole))} aria-busy={v.dr?.revertingRole === r.role || undefined} style={{ marginLeft: "auto", height: 26, padding: "0 10px", borderRadius: 7, border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: 12, cursor: "pointer", opacity: v.dr?.revertingRole && v.dr.revertingRole !== r.role ? 0.5 : 1 }}>{v.dr?.revertingRole === r.role ? "Reverting…" : "Revert"}</button>}
                   </div>
                   {r.locked ? <p style={{ margin: 0, fontSize: 12, color: "var(--tx2)" }}><span className="material-symbols-outlined" style={{ fontSize: 14 }}>lock</span> {r.lockText}</p> : <>
                   {r.dirty && <div style={{ fontFamily: "var(--mono)", fontSize: 12, color: "var(--tx2)" }}><s>{r.from}</s> → <b style={{ color: "var(--tx)" }}>{r.to}</b></div>}
@@ -481,14 +531,14 @@ export default function AgentsClient() {
                     {r.role === "" && null}{v.dr.isCodex && <div style={{ fontSize: 11, color: "var(--tx2)" }}>Codex sessions can only use OpenAI models.</div>}
                   </div>
                   {r.warn && <div style={{ padding: "8px 12px", borderRadius: 8, background: "var(--amberbg)", fontSize: 12, color: "var(--amber)" }}><span className="material-symbols-outlined" style={{ fontSize: 16, verticalAlign: "middle", marginRight: 4 }}>warning</span>{r.warn}</div>}
-                  <div className="r9-routing-controls"><div><div className="r9-caps" style={{ marginBottom: 4 }}>MODE</div><div role="group" aria-label={r.modeAria} style={{ display: "flex", gap: 2, padding: 2, borderRadius: 8, background: "var(--seg)" }}>{r.modes.map((m) => <button key={m.label} onClick={m.on} aria-pressed={m.on2} title={m.tip} style={m.style}>{m.label}</button>)}</div></div><label style={{ display: "flex", flexDirection: "column", gap: 4 }}><span className="r9-caps">UNTIL</span><select value={r.expiry} onChange={r.onExp} style={{ height: 28, border: "1px solid var(--line2)", borderRadius: 7, background: "var(--bg)", color: "var(--tx)", font: "inherit", fontSize: 12.5 }}><option value="Session end">Session end</option><option value="1h">1 hour</option><option value="2h">2 hours</option></select></label></div>
+                  <div className="r9-routing-controls"><div><div className="r9-caps" style={{ marginBottom: 4 }}>MODE</div><div role="group" aria-label={r.modeAria} style={{ display: "flex", gap: 2, padding: 2, borderRadius: 8, background: "var(--seg)" }}>{r.modes.map((m) => <button key={m.label} onClick={m.on} aria-pressed={m.on2} title={m.tip} style={m.style}>{m.label}</button>)}</div></div><label style={{ display: "flex", flexDirection: "column", gap: 4 }}><span className="r9-caps">UNTIL</span><select value={r.expiry} onChange={r.onExp} aria-label="Until the override expires" style={{ height: 28, border: "1px solid var(--line2)", borderRadius: 7, background: "var(--bg)", color: "var(--tx)", font: "inherit", fontSize: 12.5 }}><option value="Session end">Session end</option><option value="1h">1 hour</option><option value="2h">2 hours</option></select></label></div>
                   {r.strict && <span style={{ fontSize: 11.5, color: "var(--tx2)" }}>No fallback. If this model fails, the request fails visibly.</span>}
                 </>}
                 </div>
               ))}
             <div style={{ padding: "10px 12px", borderRadius: 8, background: "var(--seg)", fontSize: 12, color: "var(--tx2)" }}>Applies from the next request only. Requests in flight keep their model.{v.dr.isCodex && <span> Codex sessions can only use OpenAI models.</span>} <a href="/dashboard/combos">Edit combo members for everyone →</a></div>
             </div>}
-            {ui.drawerMode === "routing" && <div style={{ position: "sticky", bottom: 0, display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 8, minHeight: 56, padding: "0 16px", borderTop: "1px solid var(--line)", background: "var(--card)" }}><span style={{ marginRight: "auto", fontSize: 12, color: "var(--tx2)" }}>{v.dr.conflict ? "Reload routing to continue" : v.dr.changeText}</span><button onClick={v.closeDrawer} style={{ height: 32, padding: "0 16px", borderRadius: 8, border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: 12.5, cursor: "pointer" }}>Cancel</button><button onClick={v.dr.apply} disabled={v.dr.noChanges || !!v.dr.conflict} style={{ ...v.dr.applyStyle, height: 32, opacity: v.dr.noChanges || v.dr.conflict ? 0.45 : 1 }}>Apply</button></div>}
+            {ui.drawerMode === "routing" && <div style={{ position: "sticky", bottom: 0, display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 8, minHeight: 56, padding: "0 16px", borderTop: "1px solid var(--line)", background: "var(--card)" }}><span style={{ marginRight: "auto", fontSize: 12, color: "var(--tx2)" }}>{v.dr.conflict ? "Reload routing to continue" : v.dr.changeText}</span><button onClick={v.closeDrawer} style={{ height: 32, padding: "0 16px", borderRadius: 8, border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: 12.5, cursor: "pointer" }} disabled={!!v.dr.applying}>Cancel</button><button onClick={v.dr.apply} disabled={v.dr.noChanges || !!v.dr.conflict || !!v.dr.applying} aria-busy={v.dr.applying || undefined} style={{ ...v.dr.applyStyle, height: 32, opacity: v.dr.noChanges || v.dr.conflict || v.dr.applying ? 0.45 : 1 }}>{v.dr.applying ? "Applying…" : "Apply"}</button></div>}
             </div>
           </div>
         )}
@@ -557,9 +607,10 @@ function LiveCard({ c, narrow }) {
     <article style={{ ...c.wrap, background: "var(--card)", border: "1px solid var(--line)", borderRadius: 12, boxShadow: "var(--shadow)", padding: 0, minWidth: 0, display: "flex", flexDirection: "column" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", padding: "12px 12px 8px" }}>
         <span style={{ display: "inline-flex", alignItems: "center", gap: 8, fontSize: 12.5, fontWeight: 600, fontFamily: "var(--mono)" }}><span style={{ ...c.activityDot, width: 8, height: 8, borderRadius: "50%" }} title={c.inFlight == null ? "Session activity" : `${c.inFlight} requests in flight`} />{c.id}</span>
-        <span style={{ fontSize: 11.5, color: "var(--tx2)" }}>{c.client} · since {c.started}</span>
-        {c.isChild && <span title={c.parentTip || ""} style={{ fontSize: 10.5, fontWeight: 600, padding: "1px 7px", borderRadius: 5, background: "var(--seg)", color: "var(--tx2)" }}>inferred child</span>}
+        <span style={{ fontSize: 11.5, color: "var(--tx2)" }}>{c.client} · last active {c.started}</span>
+        {c.isChild && <span title={c.parentTip || ""} style={{ fontSize: 10.5, fontWeight: 600, padding: "1px 7px", borderRadius: 5, background: "var(--seg)", color: "var(--tx2)" }}>{c.parentGuessed !== false ? "inferred child" : "delegated child"}</span>}
         {c.bgNote && <span title="Claude Code Haiku jobs: titles, summaries, WebSearch. Not subagents." style={{ fontSize: 10.5, fontWeight: 600, padding: "1px 7px", borderRadius: 5, background: "var(--amberbg)", color: "var(--chipthink)" }}>+background</span>}
+        {c.title && <div title={c.title} style={{ flexBasis: "100%", fontSize: 12.5, color: "var(--tx)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", minWidth: 0 }}>{c.title}</div>}
       </div>
       <div style={{ display: "flex", flexDirection: "column", marginTop: 0 }}>
         {c.rows.map((r) => (

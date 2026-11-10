@@ -316,3 +316,48 @@ describe("metadata validation and routing updates", () => {
     } finally { spy.mockRestore(); }
   });
 });
+
+describe("sessions aggregation and conversation", () => {
+  it("one row per session with distinct values, filters, and last-seen paging; requests without a session stay out", async () => {
+    // Gaps between runs make the last-seen order match the write order even when
+    // the clock moves less than a millisecond per run.
+    const gap = () => new Promise((r) => setTimeout(r, 3));
+    await run({ messages: [{ role: "user", content: `A ${pan} 1` }] }, "sess-a", "ra", { provider: "openrouter", combo: "combo.x", account: "acc1" }); await gap();
+    await run({ messages: [{ role: "assistant", content: `B ${mail} 2` }] }, "sess-a", "ra", { provider: "openrouter", combo: "combo.x", account: "acc1" }); await gap();
+    await run({ messages: [{ role: "user", content: "nothing here" }] }, "sess-b", "rb"); await gap();
+    await run({ messages: [{ role: "user", content: `A ${pan} 3` }] }, "sess-c", "rc", { provider: "other", combo: "combo.y" }); await gap();
+    await run({ messages: [{ role: "user", content: "orphan request" }] }, "", "rz"); await gap();
+    const { rows } = P.sessions({});
+    expect(rows.map((r) => r.sessionId)).toEqual(["sess-c", "sess-b", "sess-a"]); // newest first
+    const a = rows.find((r) => r.sessionId === "sess-a");
+    expect(a).toMatchObject({ requests: 1, client: "Claude Code" });
+    expect(a.values).toBe(2); // pan + mail
+    expect(rows.find((r) => r.sessionId === "sess-b").values).toBe(0);
+    expect(rows.every((r) => r.sessionId)).toBe(true);
+    // Filters
+    expect(P.sessions({ provider: "openrouter" }).rows.map((r) => r.sessionId).sort()).toEqual(["sess-a"]);
+    expect(P.sessions({ combo: "combo.y" }).rows.map((r) => r.sessionId)).toEqual(["sess-c"]);
+    expect(P.sessions({ hash: detector.scan(pan)[0].hash }).rows.map((r) => r.sessionId)).toEqual(["sess-c", "sess-a"]);
+    expect(P.sessions({ findings: true }).rows.map((r) => r.sessionId)).toEqual(["sess-c", "sess-a"]);
+    expect(P.sessions({ findings: false }).rows.map((r) => r.sessionId)).toEqual(["sess-b"]);
+    expect(P.sessions({ q: "sess-b" }).rows.map((r) => r.sessionId)).toEqual(["sess-b"]);
+    // Paging by last seen
+    expect(P.sessions({ before: rows[0].last }).rows.map((r) => r.sessionId)).toEqual(["sess-b", "sess-a"]);
+  });
+  it("conversation returns oldest-first rows grouped and unique values beyond the cap", async () => {
+    await run({ messages: [{ role: "user", content: `Q ${pan}` }] }, "sess-a", "r1", { provider: "p", combo: "c", account: "acc", client: "Claude Code" });
+    await run({ messages: [{ role: "assistant", content: "ok" }] }, "sess-a", "r2", { provider: "p", combo: "c" });
+    const conv = P.conversation({ sessionId: "sess-a" });
+    expect(conv).toMatchObject({ sessionId: "sess-a", values: 1, requests: 2 });
+    expect(conv.messages.total).toBe(conv.messages.shown);
+    expect(conv.messages.rows[0].role).toBe("user");
+    expect(conv.messages.rows[0].values).toHaveLength(1);
+    expect(conv.messages.rows[1].text).toBe("ok");
+    expect(P.conversation({ sessionId: "missing" }).notFound).toBe(true);
+    // cap: 10 keeps only the first row ("Q AB•••••F" is 10 bytes); the "ok" row goes past it.
+    const tiny = P.conversation({ sessionId: "sess-a", cap: 10 });
+    expect(tiny.messages.shown).toBe(1);
+    expect(tiny.messages.over).toBe(1);
+    expect(tiny.messages.rows[0].text).toBe("Q AB•••••F");
+  });
+});

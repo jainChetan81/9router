@@ -31,10 +31,21 @@ export function statusSql() {
 }
 
 export function roleSql() {
+  // Matches meta.js resolveRoleName/bgRole: haiku inside Claude Code sessions is
+  // background; model-named combos (claude-*, gpt-*, provider/model, any id with
+  // a version digit or separator) are not roles and map to direct.
   return `CASE
     WHEN json_extract(meta, '$.combo') = 'claude-haiku-5-5'
-     AND (LOWER(json_extract(meta, '$.ua')) LIKE 'claude-cli%' OR LOWER(json_extract(meta, '$.ua')) LIKE '%claude-code%')
+     AND (LOWER(COALESCE(json_extract(meta, '$.ua'), '')) LIKE 'claude-cli%'
+          OR LOWER(COALESCE(json_extract(meta, '$.ua'), '')) LIKE '%claude-code%')
     THEN 'background'
-    ELSE COALESCE(NULLIF(json_extract(meta, '$.combo'), ''), 'direct')
+    WHEN COALESCE(json_extract(meta, '$.combo'), '') IN ('', 'daily', 'invalid') THEN 'direct'
+    WHEN json_extract(meta, '$.combo') GLOB '*[0-9]*'
+      OR instr(json_extract(meta, '$.combo'), '/') > 0
+      OR instr(json_extract(meta, '$.combo'), '.') > 0
+      OR instr(json_extract(meta, '$.combo'), '_') > 0
+      OR instr(json_extract(meta, '$.combo'), '-') > 0
+    THEN 'direct'
+    ELSE json_extract(meta, '$.combo')
   END`;
 }

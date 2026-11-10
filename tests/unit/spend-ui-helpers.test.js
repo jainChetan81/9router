@@ -85,8 +85,33 @@ describe("routing map", () => {
   it("gives every node a minimum slot and keeps model labels apart", () => {
     const lay = sankeyLayout(mapRoutes(routes), (l) => l.req, 1000);
     const ys = lay.models.map((m) => m.ly);
-    for (let i = 1; i < ys.length; i++) expect(ys[i] - ys[i - 1]).toBeGreaterThanOrEqual(13);
+    // Labels are 12.5-13px; spacing of 16 keeps consecutive labels apart.
+    for (let i = 1; i < ys.length; i++) expect(ys[i] - ys[i - 1]).toBeGreaterThanOrEqual(16);
     expect(lay.H).toBeGreaterThanOrEqual(380);
+  });
+
+  it("merges duplicate invalid model nodes into one node and adds a config-error flag (S11)", () => {
+    const routesInvalid = {
+      links: [
+        { source: "combo:main", target: "provider:claude", req: 50, v: 5, real: 0, realEst: 0, paid: false },
+        { source: "provider:claude", target: "model:claude:invalid", req: 20, v: 2, real: 0, realEst: 0, paid: false },
+        { source: "provider:openrouter", target: "model:openrouter:invalid", req: 30, v: 3, real: 3, realEst: 1, paid: true },
+      ],
+    };
+    const lay = sankeyLayout(mapRoutes(routesInvalid), (l) => l.req, 1000);
+    const invalidNodes = lay.models.filter((m) => m.name === "invalid");
+    expect(invalidNodes).toHaveLength(1);
+    expect(invalidNodes[0].v).toBe(50);
+    expect(lay.configError).toMatchObject({ req: 50 });
+    // Bands that pointed at merged invalid nodes land in the one surviving node.
+    const invalidMk = lay.bands.filter((b) => b.mk && b.mk.endsWith("|invalid"));
+    expect(invalidMk).toHaveLength(2);
+    expect(new Set(invalidMk.map((b) => b.ty))).toEqual(new Set([invalidMk[0].ty]));
+
+    // No invalid traffic → no config error.
+    const plain = sankeyLayout(mapRoutes(routes), (l) => l.req, 1000);
+    expect(plain.configError).toBeNull();
+    expect(plain.models.every((m) => m.name !== "invalid")).toBe(true);
   });
 
   it("names the combo with the most real spend on a paid provider", () => {

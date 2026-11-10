@@ -8,6 +8,7 @@ import QuotaRunway from "./QuotaRunway";
 import BreakdownDrill from "./BreakdownDrill";
 import RoutingMap from "./RoutingMap";
 import { buildView } from "./view";
+import { feesValid } from "./helpers";
 import "./spend.css";
 import "./shared-page.css";
 
@@ -39,19 +40,25 @@ export default function SpendClient() {
     return () => mo.disconnect();
   }, []);
 
+  // N7: true while a range switch is still fetching (supersede-aware), so the UI can
+  // show a refreshing state; data currently shown stays on screen (no flash to skeleton).
   const loadId = useRef(0);
-  const load = useCallback(async () => {
+  const [refreshing, setRefreshing] = useState(false);
+  const load = useCallback(async (opts = {}) => {
     const id = ++loadId.current; // ignore responses from superseded ranges
     setMode((m) => (m === "ready" ? "ready" : "loading"));
+    setRefreshing(true);
     const q = new URLSearchParams({ preset: range.preset });
     if (range.preset === "Custom") { q.set("from", range.from); q.set("to", range.to); }
     try {
       const d = await getJson(`/api/spend?${q}`);
       if (id !== loadId.current) return;
       setData(d);
+      setRefreshing(false);
       setMode(d.totals.req === 0 ? "empty" : "ready");
     } catch (e) {
       if (id !== loadId.current) return;
+      setRefreshing(false);
       setErrorText(e.message || "Request failed");
       setMode("error");
     }
@@ -89,20 +96,27 @@ export default function SpendClient() {
     return () => ro.disconnect();
   });
 
+  // N2: Save fees pending/success/error, shown inline instead of window alerts.
+  const [feeSave, setFeeSave] = useState({ state: "idle", msg: "" });
+  const feeSaveIdle = useCallback(() => setFeeSave({ state: "idle", msg: "" }), []);
   const saveFees = useCallback(async () => {
     const draft = ui.draft || {};
-    if (!feesValid(draft)) return;
+    if (!feesValid(draft) || feeSave.state === "saving") return;
+    setFeeSave({ state: "saving", msg: "" });
     try {
       const { fees } = await getJson("/api/spend", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ fees: draft }) });
       setData((d) => ({ ...d, fees }));
       set({ editing: false, draft: null });
-    } catch (e) { alert(e.message); }
-  }, [ui.draft, set]);
+      setFeeSave({ state: "saved", msg: "" });
+    } catch (e) {
+      setFeeSave({ state: "error", msg: e.message || "Failed to save fees" });
+    }
+  }, [ui.draft, set, feeSave.state]);
 
   useEffect(() => {
     if (ui.scrollTick) aPanel.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }, [ui.scrollTick]);
-  const v = useMemo(() => data && buildView({ data, quota, ui, set, fit, range, theme, feeRefs, saveFees }), [data, quota, ui, set, fit, range, theme, saveFees, feeRefs]);
+  const v = useMemo(() => data && buildView({ data, quota, ui, set, fit, range, theme, feeRefs, saveFees, feeSave: { ...feeSave, reset: feeSaveIdle } }), [data, quota, ui, set, fit, range, theme, saveFees, feeRefs, feeSave, feeSaveIdle]);
 
   const isLoading = mode === "loading" || !v, isEmpty = mode === "empty", isError = mode === "error";
   const preset = range.preset, customLabel = range.label || "";
@@ -127,11 +141,14 @@ export default function SpendClient() {
         {(s.range) && (<>
           <div className="r9-spend-range" style={{ position: "sticky", top: "0", zIndex: "30", display: "flex", justifyContent: "space-between", alignItems: "center", gap: "12px", flexWrap: "wrap", padding: "8px 24px", background: "var(--bg)", borderBottom: "1px solid var(--line)" }}>
             <div style={{ display: "flex", alignItems: "baseline", gap: "8px" }}><span style={{ fontWeight: "600" }}>{rangeTitle}</span><span style={{ color: "var(--tx3)", fontSize: "12px" }}>{rangeSub}</span></div>
-            <RangeBar preset={preset} customLabel={customLabel} onChange={onRange} today={todayKey} />
-            <span style={{ fontSize: 11, color: "var(--tx2)", display: "flex", alignItems: "center", gap: 4 }}><span className="material-symbols-outlined" style={{ fontSize: 14 }}>schedule</span>Times in IST (UTC+5:30) · Real spend logging began Nov 9</span>
+            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+              <RangeBar preset={preset} customLabel={customLabel} onChange={onRange} today={todayKey} />
+              {(refreshing) && (<span className="r9-spend-refreshing" role="status" style={{ display: "inline-flex", alignItems: "center", gap: "6px", fontSize: "12px", color: "var(--tx2)" }}><span className="r9-spinner" aria-hidden="true"></span>Updating…</span>)}
+            </div>
+            <span className="r9-spend-ist-note" style={{ fontSize: 11, color: "var(--tx2)", display: "flex", alignItems: "center", gap: 4 }}><span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: 14 }}>schedule</span>Times in IST (UTC+5:30) · Real spend logging began Nov 9</span>
           </div>
         </>)}
-        <div className="r9-spend-content" style={{ display: "flex", flexDirection: "column", gap: "16px", padding: "16px 32px 48px" }}>
+        <div className="r9-spend-content" aria-busy={refreshing} style={{ opacity: refreshing ? 0.55 : 1, transition: "opacity .15s", pointerEvents: refreshing ? "none" : "auto", display: "flex", flexDirection: "column", gap: "16px", padding: "16px 32px 48px" }}>
 
           {(isLoading) && (<>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(240px,1fr))", gap: "16px" }}>
@@ -192,11 +209,9 @@ export default function SpendClient() {
                   <div style={{ display: "flex", flexDirection: "column", gap: "2px", padding: "8px 10px", borderRadius: "8px", background: "var(--seg)" }}><span style={{ fontSize: "11px", color: "var(--tx2)" }}>{or.monthLabel}</span><span style={{ fontWeight: "600", fontSize: "15px", fontVariantNumeric: "tabular-nums" }}>{or.month}</span></div>
                 </div>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", fontSize: "12px" }}><span style={{ color: "var(--tx2)" }}>Spent in range · {rangeTitle}</span><span style={{ fontVariantNumeric: "tabular-nums", fontWeight: "600", color: "var(--acc)" }}>{k.or}</span></div>
-                <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: "12px" }}><span style={{ color: "var(--tx2)" }}>{or.budgetLabel}</span><span style={{ fontVariantNumeric: "tabular-nums" }}><b>{or.budgetUsed}</b> of {or.budgetCap}</span></div>
-                  <div style={{ height: "6px", borderRadius: "3px", background: "var(--seg)", overflow: "hidden" }}><div style={{ width: or.budgetW, height: "100%", background: or.budgetC }}></div></div>
-                  <div style={{ fontSize: "11px", color: "var(--tx3)" }}>{or.budgetReset}</div>
-                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", fontSize: "12px" }}><span style={{ color: "var(--tx2)" }}>{or.budgetLabel}</span><span style={{ fontVariantNumeric: "tabular-nums" }}><b>{or.budgetUsed}</b> of {or.budgetCap}</span></div>
+                <div style={{ height: "6px", borderRadius: "3px", background: "var(--seg)", overflow: "hidden" }}><div style={{ width: or.budgetW, height: "100%", background: or.budgetC }}></div></div>
+                <div style={{ fontSize: "11px", color: "var(--tx3)" }}>{or.budgetReset}</div>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", borderTop: "1px solid var(--line)", paddingTop: "10px" }}><span style={{ color: "var(--tx2)", fontSize: "12px" }}>Credit balance</span><span style={{ fontWeight: "600", fontSize: "15px" }}>{or.balance}</span></div>
               </div>
               <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: "12px", boxShadow: "var(--shadow)", padding: "16px 18px", display: "flex", flexDirection: "column", gap: "14px" }}>
@@ -270,7 +285,7 @@ export default function SpendClient() {
                   <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr .8fr", gap: "10px", alignItems: "center", padding: "8px 0", borderTop: "1px solid var(--line)", fontVariantNumeric: "tabular-nums" }}>
                     <div style={{ display: "flex", flexDirection: "column", gap: "1px" }}><span style={{ fontWeight: "600" }}>{r.name}</span><span style={{ fontSize: "11.5px", color: "var(--tx3)" }}>{r.plan}</span></div>
                     <div style={{ textAlign: "right" }}>
-                      {(r.inputReady) && (<><input type="number" min="0" step="any" inputMode="decimal" placeholder="Not set" aria-label={"Fee per month for " + r.name} aria-invalid={!!r.feeErr} ref={r.ref} value={r.draft} onChange={r.onFee} style={{ width: "80px", height: "28px", boxSizing: "border-box", border: "1px solid " + (r.feeErr ? "var(--red)" : "var(--line2)"), borderRadius: "7px", padding: "0 8px", background: "var(--bg)", color: "var(--tx)", font: "inherit", textAlign: "right" }} />{r.feeErr && <span role="alert" style={{ display: "block", fontSize: "11px", color: "var(--red)", marginTop: "2px", textAlign: "right" }}>{r.feeErr}</span>}</>)}
+                      {(r.inputReady) && (<><input type="number" min="0" max="100000" step="any" inputMode="decimal" placeholder="Not set" aria-label={"Fee per month for " + r.name} aria-invalid={!!r.feeErr} ref={r.ref} disabled={v.feeSaving} value={r.draft} onChange={r.onFee} onKeyDown={r.onKey} style={{ width: "80px", height: "28px", boxSizing: "border-box", border: "1px solid " + (r.feeErr ? "var(--red)" : "var(--line2)"), borderRadius: "7px", padding: "0 8px", background: "var(--bg)", color: "var(--tx)", font: "inherit", textAlign: "right" }} />{r.feeErr && <span role="alert" style={{ display: "block", fontSize: "11px", color: "var(--red)", marginTop: "2px", textAlign: "right" }}>{r.feeErr}</span>}</>)}
                       {(r.showFee) && (<><span>{r.fee}</span></>)}{(r.showSet) && (<><button onClick={r.setFee} style={{ border: "0", background: "transparent", padding: "0", font: "inherit", color: "var(--tx3)", textDecoration: "underline dotted", textUnderlineOffset: "3px", cursor: "pointer" }} className="r9-hacc">Not set</button></>)}
                     </div>
                     <div style={{ textAlign: "right", color: "var(--violet)", fontWeight: "600" }}>{r.value}</div>
@@ -278,7 +293,17 @@ export default function SpendClient() {
                   </div>
                 </Fragment>))}
                 {(editing) && (<>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px", paddingTop: "10px", borderTop: "1px solid var(--line)" }}><span style={{ fontSize: "11.5px", color: "var(--tx3)" }}>Saved to 9Router settings.</span><div style={{ display: "flex", gap: "6px" }}><button onClick={cancelEdit} style={{ height: "28px", padding: "0 10px", borderRadius: "7px", border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: "12px", cursor: "pointer" }}>Cancel</button><button onClick={saveEdit} disabled={!v.feesOk} style={{ height: "28px", padding: "0 12px", borderRadius: "7px", border: "0", background: "var(--acc)", color: "#fff", font: "inherit", fontSize: "12px", fontWeight: "600", cursor: v.feesOk ? "pointer" : "not-allowed", opacity: v.feesOk ? 1 : 0.5, whiteSpace: "nowrap" }}>Save fees</button></div></div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: "6px", paddingTop: "10px", borderTop: "1px solid var(--line)" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px" }}>
+                      {(v.feeSaved) && (<span role="status" style={{ fontSize: "11.5px", color: "var(--green)" }}>Saved</span>)}
+                      {(v.feeSaving) && (<span role="status" style={{ display: "inline-flex", alignItems: "center", gap: "6px", fontSize: "11.5px", color: "var(--tx2)" }}><span className="r9-spinner" aria-hidden="true"></span>Saving…</span>)}
+                      {(v.feeError) && (<span role="alert" style={{ fontSize: "11.5px", color: "var(--red)" }}>{v.feeError}</span>)}
+                      <div style={{ display: "flex", gap: "6px" }}>
+                        <button onClick={cancelEdit} disabled={v.feeSaving} style={{ height: "28px", padding: "0 10px", borderRadius: "7px", border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: "12px", cursor: v.feeSaving ? "not-allowed" : "pointer", opacity: v.feeSaving ? 0.5 : 1 }}>Cancel</button>
+                        <button onClick={saveEdit} disabled={!v.feesOk || v.feeSaving} aria-busy={v.feeSaving} style={{ height: "28px", padding: "0 12px", borderRadius: "7px", border: "0", background: "var(--acc)", color: "#fff", font: "inherit", fontSize: "12px", fontWeight: "600", cursor: v.feesOk && !v.feeSaving ? "pointer" : "not-allowed", opacity: v.feesOk && !v.feeSaving ? 1 : 0.5, whiteSpace: "nowrap", display: "inline-flex", alignItems: "center", gap: "5px" }}>{v.feeSaving && <span className="r9-spinner" aria-hidden="true"></span>}{v.feeSaving ? "Saving…" : "Save fees"}</button>
+                      </div>
+                    </div>
+                  </div>
                 </>)}
                 {(notEditing) && (<>
                   <div style={{ display: "flex", justifyContent: "space-between", paddingTop: "10px", borderTop: "1px solid var(--line)", fontVariantNumeric: "tabular-nums", fontWeight: "600" }}><span>Total <span style={{ fontWeight: "400", color: "var(--tx3)" }}>· fees prorated to {dayCount} days</span></span><span>{k.feesPro} → <span style={{ color: "var(--violet)" }}>{k.value}</span> · <span style={{ color: "var(--green)" }}>{k.ratio}</span></span></div>
@@ -317,7 +342,7 @@ export default function SpendClient() {
                   {(ag.sessions).map((x, _i) => (<Fragment key={_i}>
                     <div style={{ borderTop: "1px solid var(--line)", minWidth: "1140px" }}>
                       <div onClick={x.toggle} role="button" tabIndex={0} aria-expanded={x.open} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); x.toggle(); } }} style={{ display: "grid", gridTemplateColumns: "112px 96px 132px minmax(200px,1.4fr) 52px 80px 104px 54px 66px minmax(90px,1fr)", gap: "10px", alignItems: "center", padding: "7px 0", fontSize: "12px", fontVariantNumeric: "tabular-nums", cursor: "pointer", background: x.bg }}>
-                        <span title={x.id} style={{ display: "flex", alignItems: "center", gap: "3px", minWidth: "0", fontFamily: "var(--mono)", fontSize: "11.5px", color: "var(--tx)" }}><span style={{ flex: "none", fontFamily: "'Material Symbols Outlined'", fontSize: "15px", color: "var(--tx3)" }}>{x.chev}</span><span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{x.id}</span></span>
+                        <span title={x.id} style={{ display: "flex", alignItems: "center", gap: "3px", minWidth: "0", fontFamily: "var(--mono)", fontSize: "11.5px", color: "var(--tx)" }}><span style={{ flex: "none", fontFamily: "'Material Symbols Outlined'", fontSize: "15px", color: "var(--tx3)" }}>{x.chev}</span><span>{x.id}</span></span>
                         <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{x.client}</span>
                         <span style={{ minWidth: "0", display: "flex" }}><span title={x.role} style={{ fontSize: "10.5px", fontWeight: "600", padding: "2px 7px", borderRadius: "5px", background: x.roleBg, color: x.roleC, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{x.role}</span></span>
                         <span style={{ display: "flex", gap: "4px", alignItems: "center", minWidth: "0", overflow: "hidden" }}>{(x.chips).map((c, _i) => (<Fragment key={_i}><span title={c.full} style={{ flex: "0 1 auto", minWidth: "0", overflow: "hidden", textOverflow: "ellipsis", fontFamily: "var(--mono)", fontSize: "10.5px", padding: "1px 6px", borderRadius: "4px", background: "var(--seg)", color: "var(--tx2)", whiteSpace: "nowrap" }}>{c.short}</span></Fragment>))}{(x.more) && (<><span title={x.moreTip} style={{ flex: "none", fontSize: "10.5px", fontWeight: "600", color: "var(--tx3)" }}>{x.more}</span></>)}</span>

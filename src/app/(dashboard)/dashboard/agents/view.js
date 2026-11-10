@@ -102,12 +102,12 @@ export const isChatEntry = (m) => {
 
 function statusOf(q) {
   const s = String(q.status ?? "ok");
-  if (s === "ok") return ["OK", "var(--green)", "var(--greenbg)"];
+  if (s === "ok" || s === "success") return ["OK", "var(--green)", "var(--greenbg)"];
   if (s === "aborted") return ["Aborted", "var(--amber)", "var(--amberbg)"];
   return [s, "var(--red)", "var(--redbg)"];
 }
 
-export function buildView({ live, sessions, totalSessions, detail, detailsBySession = {}, detailLoad = {}, analytics, tools, range, ui, act = {}, vw = 1440, now = Date.now(), combos = [], models = [], overrides = [], overridesBySession = {}, revisions = {}, draft = {}, cf = false, toast = null, moreCursor = null, setDraft = () => {}, setCf = () => {}, setToast = () => {}, applyOverrides = async () => {}, reloadOverrides = async () => {} }) {
+export function buildView({ live, sessions, totalSessions, detail, detailsBySession = {}, detailLoad = {}, analytics, tools, range, ui, act = {}, vw = 1440, now = Date.now(), combos = [], models = [], overrides = [], overridesBySession = {}, revisions = {}, draft = {}, cf = false, toast = null, moreCursor = null, rangeBusy = false, busy = null, setDraft = () => {}, setCf = () => {}, setToast = () => {}, applyOverrides = async () => {}, reloadOverrides = async () => {} }) {
   const tab = ui.tab || "live";
   const mode = ui.mode || "loading"; // loading | ready | empty | error | stale
   const ok = mode === "ready" || mode === "stale";
@@ -130,7 +130,7 @@ export function buildView({ live, sessions, totalSessions, detail, detailsBySess
   const fails5 = Math.round(allReq5 * (1 - succAvg / 100));
   const liveKids = kidOfAll(liveSessions);
   const kpis = [
-    ["ACTIVE SESSIONS", String(topLevel.length), liveKids ? liveKids + " delegated children" : "child links need parent IDs", "Sessions with a request in the last 5 minutes." + (liveKids ? " T3 delegated children count under their parent." : " The live feed carries no parent links yet, so children cannot be nested here."), "var(--acc)", "var(--tx)"],
+    ["ACTIVE SESSIONS", String(topLevel.length), liveKids ? liveKids + " delegated children" : "child links come from T3 threads", "Sessions with a request in the last 5 minutes." + (liveKids ? " T3 delegated children count under their parent." : " Parent links load from the local T3 SQLite index; sessions without a match show no link."), "var(--acc)", "var(--tx)"],
     ["IN FLIGHT", inFlightKnown ? String(live.inFlight) : "Not tracked yet", inFlightKnown ? `${stateCounts.streaming} streaming · ${stateCounts.thinking} thinking` : "In-flight requests are not available from this server.", "Current requests tracked by the live feed.", "var(--green)", inFlightKnown ? "var(--tx)" : "var(--tx3)"],
     ["REQUESTS / MIN", (allReq5 / 5).toFixed(1), Math.round(allReq5) + " requests in 5 min", "All agents, background jobs included, over the last 5 minutes.", "var(--blue)", "var(--tx)"],
     ["TOKENS / S", tpsVals.length ? String(Math.round(med(tpsVals))) : "No samples", "median output speed", "Output speed has no samples in the live feed.", "var(--violet)", tpsVals.length ? "var(--tx)" : "var(--tx3)"],
@@ -164,12 +164,13 @@ export function buildView({ live, sessions, totalSessions, detail, detailsBySess
     });
     const flags = rows.map((r) => r._override).filter(Boolean);
     return {
-      id: "s·" + s.session, client: s.client || "Unknown", started: Number.isFinite(lastMs) ? hm(lastMs) : "—",
+      id: "s·" + s.session, title: s.title || "", client: s.client || "Unknown", started: Number.isFinite(lastMs) ? hm(lastMs) : "—",
       inFlight: s.inFlight, activityDot: { background: (s.roles || []).some((r) => r.state === "streaming") ? "var(--green)" : Number.isFinite(activityMs) && now - activityMs < 60000 ? "var(--green)" : "var(--tx3)", animation: (s.roles || []).some((r) => r.state === "streaming") ? "r9pulse 1.6s infinite" : "none" },
-      rows, isChild, more,
+      rows, isChild, more, parentGuessed: isChild ? s.parent?.parentGuessed !== false : !!(s.parent?.parentGuessed),
       wrap: { position: "relative", marginLeft: isChild ? (vw < 900 ? 28 : 40) : 0 },
       parentId: s.parent ? "s·" + (s.parent.session || s.parent) : "",
       infTip: "T3 sends no parent id. Linked by key and timing, so the link is inferred.",
+      parentTip: s.parent ? (s.parent.parentGuessed ? "T3 sends no parent id. Linked by key and timing, so the link is inferred." : "Linked to the T3 parent thread.") : "",
       hasOverride: flags.some((e) => e.mode === "override" && e.status === "active"), hasChanged: flags.some((e) => e.mode === "member" && e.status === "active"), hasPending: flags.some((e) => e.status === "pending"),
       bgNote: (s.roles || []).some((r) => r.role === "background"),
       route: call(act.openRouting, s.session), details: call(act.openDetails, s.session),
@@ -294,7 +295,7 @@ export function buildView({ live, sessions, totalSessions, detail, detailsBySess
         if (!Number.isFinite(qs) || qs + d < w0 || qs > w1) return;
         const dim = fo && fo.model ? (o.s.session === fo.sid && o.l.role === fo.role && q.model === fo.model ? 1 : 0.25) : 1;
         const picked = ui.pick && ui.pick.li === li && ui.pick.ri === ri;
-        const okQ = String(q.status ?? "ok") === "ok";
+        const okQ = ["ok", "success"].includes(String(q.status ?? "ok"));
         bars.push({
           style: { position: "absolute", top: 9, height: 20, left: L(qs).toFixed(3) + "%", width: Math.max(0, L(qs + d) - L(qs)).toFixed(3) + "%", minWidth: 8, padding: 0, borderRadius: 3, boxSizing: "border-box", cursor: "pointer", opacity: dim,
             border: okQ ? 0 : "1px solid var(--red)", background: !okQ ? FAIL : mc(q.model),
@@ -314,7 +315,7 @@ export function buildView({ live, sessions, totalSessions, detail, detailsBySess
     const legend = [...new Set(allReq.map((q) => q.model))].map((m) => ({ m, c: mc(m) }));
     const S2 = allReq.reduce((a, q) => ({ req: a.req + 1, v: a.v + (q.value || 0) }), { req: 0, v: 0 });
     const tok2 = allReq.reduce((a, q) => a + (q.promptTokens || 0) + (q.completionTokens || 0), 0);
-    const err2 = allReq.filter((q) => String(q.status ?? "ok") !== "ok").length;
+    const err2 = allReq.filter((q) => !["ok", "success"].includes(String(q.status ?? "ok"))).length;
     const liveDet = Number.isFinite(Date.parse(det.lastTs)) && now - Date.parse(det.lastTs) < 5 * 60 * 1000;
     g = {
       lanes, ticks, gaps: gapsV, legend,
@@ -382,13 +383,13 @@ export function buildView({ live, sessions, totalSessions, detail, detailsBySess
   orderRoles.forEach((role) => {
     const rows = modelByRole.filter((m) => m.role === role);
     const elig = rows.filter((m) => (m.samples || 0) >= 50 || (m.requests || 0) >= 50);
-    const fast = elig.length > 1 ? elig.reduce((a, b) => (b.tpsP50 || 0) > (a.tpsP50 || 0) ? b : a)[0] : null;
-    const rel = elig.length > 1 ? elig.reduce((a, b) => (b.successRate || 0) > (a.successRate || 0) ? b : a)[0] : null;
+    const fast = elig.length > 1 ? elig.reduce((a, b) => (b.tpsP50 || 0) > (a.tpsP50 || 0) ? b : a, elig[0]) : null;
+    const rel = elig.length > 1 ? elig.reduce((a, b) => (b.successRate || 0) > (a.successRate || 0) ? b : a, elig[0]) : null;
     roRows.push({ head: true, row: false, role, chip: chip(role), desc: (ROLEDESC[role] || "combo") + " · " + cnt(rows.reduce((a, m) => a + (m.requests || 0), 0)) + " requests" });
     rows.forEach((m) => {
       const sc = (m.successRate ?? 1) * 100;
       const sC = sc >= 98 ? "var(--green)" : sc >= 95 ? "var(--amber)" : "var(--red)";
-      roRows.push({ head: false, row: true, model: m.model || "unknown", mc: mc(m.model), prov: prov(m.model), req: cnt(m.requests || 0), noSamples: !(m.samples > 0), configError: m.model === "invalid",
+      roRows.push({ head: false, row: true, model: m.model || "unknown", mc: mc(m.model), prov: prov(m.model), req: cnt(m.requests || 0), noSamples: !(m.samples > 0), configError: m.model === "invalid" || role === "daily",
         tps: m.tpsP50 != null ? String(Math.round(m.tpsP50)) : "—", tpsW: ((m.tpsP50 || 0) / maxTps * 100).toFixed(0) + "%",
         ttft: m.ttftP50 != null ? (m.ttftP50 / 1000).toFixed(1) + " s" : "—",
         lat: (m.totalP50 != null ? (m.totalP50 / 1000).toFixed(1) : "—") + " / " + (m.totalP95 != null ? (m.totalP95 / 1000).toFixed(1) : "—") + " s",
@@ -489,16 +490,22 @@ export function buildView({ live, sessions, totalSessions, detail, detailsBySess
     const firstTs = drawerDetail?.firstTs || drawerSession?.firstTs, lastTs = drawerDetail?.lastTs || drawerSession?.lastTs;
     const first = Date.parse(firstTs), last = Date.parse(lastTs);
     const success = Number.isFinite(requestCount) && requestCount ? ((requestCount - errors) / requestCount * 100).toFixed(1) + "%" : "Not recorded";
-    dd = { sid: "s·" + dId, title: "s·" + dId, client: drawerDetail?.client || drawerSession?.client || dLive?.client || "Unknown", firstTs, lastTs,
-      facts: [["Thread title", "Not recorded"], ["Project", "Not recorded"], ["Directory", "Not recorded"], ["Device", "Not recorded"], ["Client", drawerDetail?.client || drawerSession?.client || dLive?.client || "Not recorded"], ["Client version", drawerDetail?.clientVersion || versionFromUA(drawerDetail?.ua || drawerDetail?.userAgent) || "Not recorded"], ["Started", Number.isFinite(first) ? dayLabel(first) + ", " + hm(first) + " IST" : "Not recorded"], ["Duration", Number.isFinite(first) && Number.isFinite(last) ? durF(last - first) : "Not recorded"], ["Parent", drawerSession?.parent ? "s·" + (drawerSession.parent.session || drawerSession.parent) + (drawerSession.parent.parentGuessed ? " · likely" : "") : "None"]],
-      stats: [["Requests", Number.isFinite(requestCount) ? requestCount.toLocaleString("en-US") : "Not recorded", errors ? errors + " failed" : ""], ["Tokens", Number.isFinite(tokens) ? cnt(tokens) : "Not recorded", "in + out"], ["Value", Number.isFinite(value) ? usd(value) : "Not recorded", "estimate"], ["Real spend", "Not recorded", ""], ["Success", success, "of finished requests"]],
-      roles: byRole, roleSampled: sampled, tools: drawerDetail?.toolCalls || drawerDetail?.tools || [], hasData: !!drawerDetail || (detailLoad.sid === dId && detailLoad.status === "error"), parentSession: drawerSession?.parent?.session || drawerSession?.parent || null, parentGuessed: !!drawerSession?.parent?.parentGuessed,
-      openParent: () => drawerSession?.parent && act.openDetails?.(drawerSession.parent.session || drawerSession.parent), route: () => act.openRouting?.(dId), close: () => act.openDrawer?.(null), copy: () => act.copySession?.(dId),
+    const t3 = drawerDetail?.t3 || null;
+    const totals = drawerDetail?.totals || null;
+    const device = t3?.device || "Not recorded";
+    const directory = t3?.directory || "Not recorded";
+    const projectShown = t3?.project || "Not recorded";
+    const realParent = (t3?.parent && t3.parent.session) || drawerSession?.parent?.session || (drawerSession?.parent && typeof drawerSession.parent === "string" ? drawerSession.parent : null) || null;
+    dd = { sid: "s·" + dId, title: t3?.title || "s·" + dId, client: drawerDetail?.client || drawerSession?.client || dLive?.client || "Unknown", firstTs, lastTs,
+      facts: [["Thread title", t3?.title ? (t3.title.length > 30 ? t3.title.slice(0, 29) + "…" : t3.title) : "Not recorded"], ["Project", projectShown], ["Directory", directory], ["Device", device], ["Client", drawerDetail?.client || drawerSession?.client || dLive?.client || "Not recorded"], ["Client version", drawerDetail?.clientVersion || versionFromUA(drawerDetail?.ua || drawerDetail?.userAgent) || "Not recorded"], ["Started", Number.isFinite(first) ? dayLabel(first) + ", " + hm(first) + " IST" : "Not recorded"], ["Duration", Number.isFinite(first) && Number.isFinite(last) ? durF(last - first) : "Not recorded"], ["Parent", realParent ? "s·" + realParent + (t3?.parent ? "" : " · likely") : "None"]],
+      stats: [["Requests", Number.isFinite(totals?.requests ?? requestCount) ? Number(totals?.requests ?? requestCount).toLocaleString("en-US") : "Not recorded", Number.isFinite(totals?.requests ?? requestCount) && (totals?.errors ?? errors) ? (totals?.errors ?? errors) + " failed" : ""], ["Tokens", Number.isFinite(totals?.tokens ?? tokens) ? cnt(totals?.tokens ?? tokens) : "Not recorded", "in + out"], ["Value", Number.isFinite(totals?.value ?? value) ? usd(totals?.value ?? value) : "Not recorded", "estimate"], ["Real spend", "Not recorded", ""], ["Success", success, "of finished requests"]],
+      roles: byRole, roleSampled: sampled, tools: drawerDetail?.toolCalls || drawerDetail?.tools || [], hasData: !!drawerDetail || (detailLoad.sid === dId && detailLoad.status === "error"), parentSession: realParent, parentGuessed: !t3?.parent && !!drawerSession?.parent?.parentGuessed,
+      openParent: () => realParent && act.openDetails?.(realParent), route: () => act.openRouting?.(dId), close: () => act.openDrawer?.(null), copy: () => act.copySession?.(dId),
       w: vw <= 600 ? "100vw" : "480px" };
   }
   if (dId && (dRoles.length || ui.drawerMode === "details")) {
     const sessionOverrides = overrides || [];
-    const isCodex = (dLive?.client || dDet?.client) === "Codex";
+    const isCodex = (dLive?.client || dDet?.client || drawerSession?.client) === "Codex";
     const modelId = modelIdOf;
     const available = models.filter(isChatEntry).map(modelId).filter(Boolean).filter((m) => !isCodex || /^(openai\/|gpt-|codex)/i.test(m));
     const changed = [];
@@ -546,9 +553,10 @@ export function buildView({ live, sessions, totalSessions, detail, detailsBySess
         modeAria: "Mode for " + role, modes: ["member", "override"].map((m) => ({ label: m === "member" ? "Combo member" : "Override", on2: modeValue === m, tip: m === "member" ? "Use this model as the combo member for this session." : "Route this role directly to this model.", style: seg(modeValue === m), on: () => setDraft({ [role]: { ...edit, mode: m } }) })), strict: modeValue === "override", expiry, onExp: (e) => setDraft({ [role]: { ...edit, expiry: e.target.value } }) };
       }),
       audit: [], noAudit: true,
-      noChanges: changed.length === 0, changeText: changed.length ? changed.length + (changed.length === 1 ? " role changed" : " roles changed") : "No changes",
-      applyStyle: { height: 32, padding: "0 16px", borderRadius: 8, border: 0, background: "var(--acc)", color: "#fff", font: "inherit", fontSize: 12.5, fontWeight: 600, cursor: changed.length ? "pointer" : "default", opacity: changed.length ? 1 : 0.45 },
-      apply: () => changed.length && setCf(true), changes: changed,
+      noChanges: changed.length === 0, changeText: busy?.verb === "apply" ? "Applying…" : changed.length ? changed.length + (changed.length === 1 ? " role changed" : " roles changed") : "No changes",
+      applying: busy?.verb === "apply", revertingRole: busy?.verb === "revert" ? busy.role : null,
+      applyStyle: { height: 32, padding: "0 16px", borderRadius: 8, border: 0, background: "var(--acc)", color: "#fff", font: "inherit", fontSize: 12.5, fontWeight: 600, cursor: changed.length && !busy ? "pointer" : "default", opacity: changed.length && !busy ? 1 : 0.45 },
+      apply: () => changed.length && !busy && setCf(true), changes: changed,
     };
   }
 
@@ -556,7 +564,7 @@ export function buildView({ live, sessions, totalSessions, detail, detailsBySess
   return {
     status, tabs, fresh, paused: !!ui.paused, togglePause: () => act.pause?.(),
     isLiveTab: tab === "live", notLiveTab: tab !== "live", isSessTab: tab === "sessions", isTableTab: tab === "roles" || tab === "tools",
-    preset, customLabel: range?.label || "", rangeTitle,
+    preset, customLabel: range?.label || shortRange(range), rangeTitle,
     v, live: { kpis, cards: liveCards }, tree, g, sm, noSelText: selId && !selShown ? "The selected session is hidden by the filters." : selShown ? "Loading session…" : "Select a session to see its timeline.", ro, dl: null,
     dlNote: "Per-day delegation history is not available from /api/agents/analytics yet.",
     tl, liveWide: vw >= 900, liveNarrow: vw < 900,
@@ -571,3 +579,14 @@ export function buildView({ live, sessions, totalSessions, detail, detailsBySess
 
 function kidOfAll(list) { const tops = new Set(list.filter((s) => !s.parent).map((s) => s.session)); return list.filter((s) => s.parent && tops.has(s.parent.session || s.parent)).length; }
 function latestModel(a) { const rs = a.requests || []; return rs.length ? rs[rs.length - 1].model : null; }
+// A33: short custom chip text ("Nov 5–8"), not "5 – / Nov" wrapping at 390px.
+function shortRange(range) {
+  if (!range || range.preset !== "Custom" || !range.from || !range.to) return "Custom";
+  const f = new Date(range.from), t = new Date(range.to);
+  if (Number.isNaN(+f) || Number.isNaN(+t)) return "Custom";
+  const fm = f.toLocaleDateString("en-US", { month: "short", timeZone: IST });
+  const tm = t.toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: IST });
+  return Number.isNaN(+f) ? "Custom" : fm === t.toLocaleDateString("en-US", { month: "short", timeZone: IST }) && f.getUTCDate() === t.getUTCDate() - 1
+    ? `${fm} ${f.toLocaleDateString("en-US", { day: "numeric", timeZone: IST })}–${t.toLocaleDateString("en-US", { day: "numeric", timeZone: IST })}`
+    : `${fm} ${f.toLocaleDateString("en-US", { day: "numeric", timeZone: IST })}–${tm}`;
+}

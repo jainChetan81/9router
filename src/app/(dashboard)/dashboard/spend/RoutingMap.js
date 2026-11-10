@@ -42,6 +42,7 @@ export default function RoutingMap({ data, state, onRetry, onShow30, rangeTitle 
   };
 
   const layout = live && hasRoutes && !narrow ? sankeyLayout(routes, rv, Math.max(560, sw), { paid: (p) => !!PAID[p] }) : null;
+  const configError = layout?.configError || null;
   const fm = (v) => (rMetric === "req" ? fN(v) : rMetric === "value" ? fV(v) : fR(v));
 
   const groups = live && hasRoutes && narrow ? [...new Set(routes.l1.map((l) => l.combo))].map((c) => {
@@ -55,8 +56,8 @@ export default function RoutingMap({ data, state, onRetry, onShow30, rangeTitle 
   }).sort((a, b) => (a.name === "main" ? -1 : b.name === "main" ? 1 : b.req - a.req)) : [];
 
   const lab = (key, x, y, t1, t2, mono, strong) => (
-    <text key={key} x={x} y={y} textAnchor="start" style={{ fontSize: mono ? 11 : 12, fontFamily: mono ? "var(--mono)" : "inherit", fill: strong ? "var(--tx)" : "var(--tx2)", fontWeight: strong ? 600 : 400, paintOrder: "stroke", stroke: "var(--card)", strokeWidth: 3, strokeLinejoin: "round", pointerEvents: "none" }}>
-      {t1}{t2 ? <tspan style={{ fill: "var(--tx3)", fontWeight: 400, fontFamily: "inherit", fontSize: 10.5 }}>{"  " + t2}</tspan> : null}
+    <text key={key} x={x} y={y} textAnchor="start" style={{ fontSize: mono ? 12.5 : 13, fontFamily: mono ? "var(--mono)" : "inherit", fill: strong ? "var(--tx)" : "var(--tx2)", fontWeight: strong ? 600 : 500, paintOrder: "stroke", stroke: "var(--card)", strokeWidth: 3, strokeLinejoin: "round", pointerEvents: "none" }}>
+      {t1}{t2 ? <tspan style={{ fill: "var(--tx2)", fontWeight: 400, fontFamily: "inherit", fontSize: 11.5 }}>{"  " + t2}</tspan> : null}
     </text>
   );
 
@@ -99,7 +100,7 @@ export default function RoutingMap({ data, state, onRetry, onShow30, rangeTitle 
                     <g key={"c" + c.key}>
                       <rect x={layout.x0} y={c.y} width={layout.nw} height={Math.max(2, c.h)} rx={2} style={{ fill: chip(c.key)[1] }} />
                       <text x={layout.x0 - 8} y={c.y + c.h / 2 - 1} textAnchor="end" style={{ fontSize: 12, fontFamily: "var(--mono)", fill: "var(--tx)", pointerEvents: "none" }}>{c.key}</text>
-                      <text x={layout.x0 - 8} y={c.y + c.h / 2 + 12} textAnchor="end" style={{ fontSize: 10.5, fill: "var(--tx3)", pointerEvents: "none" }}>{(c.key === "main" ? "no combo · " : "") + fm(c.v)}</text>
+                      <text x={layout.x0 - 8} y={c.y + c.h / 2 + 12} textAnchor="end" style={{ fontSize: 11, fill: "var(--tx2)", pointerEvents: "none" }}>{(c.key === "main" ? "no combo · " : "") + fm(c.v)}</text>
                     </g>
                   ))}
                   {layout.provs.map((p) => (
@@ -141,6 +142,12 @@ export default function RoutingMap({ data, state, onRetry, onShow30, rangeTitle 
                 </div>
               ))}
             </div>
+          )}
+          {configError && (
+            <a href="/dashboard/combos" style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", background: "var(--redbg)", color: "var(--red)", borderRadius: "8px", padding: "8px 12px", fontSize: "12.5px", fontWeight: "600" }}>
+              <span style={{ ...MS, fontSize: "17px" }}>warning</span>
+              <span>{fLoc(configError.req)} request{configError.req === 1 ? "" : "s"} routed to a model named “invalid” — a combo points at a model no provider offers. Check <u>combos</u>.</span>
+            </a>
           )}
           {hasRoutes && coTop && (
             <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", background: "var(--acc2)", borderRadius: "8px", padding: "8px 12px", fontSize: "12.5px" }}><span style={{ ...MS, fontSize: "17px", color: "var(--acc)" }}>call_split</span><span><span style={{ fontFamily: "var(--mono)", fontWeight: "600" }}>{coTop.combo}</span> sent {fLoc(coTop.req)} requests (<span style={{ color: "var(--acc)", fontWeight: "600" }}>{fR(coTop.real)} real</span>) to {coTop.prov} in this range.</span></div>

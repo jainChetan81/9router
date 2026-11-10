@@ -174,3 +174,30 @@ describe("cold hit lookup paging", () => {
     expect(nextHitLookupCursor({ pageCount: HIT_LOOKUP_PAGE_LIMIT, next: cursor })).toBeNull();
   });
 });
+
+describe("session view url state", () => {
+  const base = { tab: "findings", view: "session", ssort: "last", sdesc: true, sf: {} };
+  it("round-trips session sort, direction and filters, omitting defaults", () => {
+    const qs = serialiseUrlState({ ...base, ssort: "requests", sdesc: false, sf: { client: "codex", provider: "", combo: "gpt/astra", hash: "0a1b2c3d4e5f", findings: "1" } });
+    expect(qs.toString()).toBe("tab=findings&view=session&ssort=requests&sdesc=0&sclient=codex&scombo=gpt%2Fastra&shash=0a1b2c3d4e5f&sfind=1");
+    const p = parseUrlState(qs);
+    expect(p.tab).toBe("findings");
+    expect(p.view).toBe("session");
+    expect(p.ssort).toBe("requests");
+    expect(p.sdesc).toBe(false);
+    expect(p.sf).toEqual({ client: "codex", provider: "", combo: "gpt/astra", hash: "0a1b2c3d4e5f", findings: "1" });
+    const plain = serialiseUrlState({ ...base, sf: { client: "codex" } });
+    expect(plain.toString()).toBe("tab=findings&view=session&sclient=codex");
+    const p2 = parseUrlState(plain);
+    expect(p2.ssort).toBe("last");
+    expect(p2.sdesc).toBe(true);
+    expect(p2.sf).toEqual({ client: "codex", provider: "", combo: "", hash: "", findings: "" });
+  });
+  it("drops session state once the view changes and keeps a hashed session id in the URL", () => {
+    const withSession = serialiseUrlState({ ...base, session: "a1b2c3d4e5f60718", sf: { client: "codex" } });
+    expect(withSession.toString()).toBe("tab=findings&view=session&sclient=codex&session=a1b2c3d4e5f60718");
+    expect(parseUrlState(withSession).session).toBe("a1b2c3d4e5f60718");
+    const value = serialiseUrlState({ ...base, view: "value", sf: { client: "x" } });
+    expect(value.toString()).toBe("tab=findings");
+  });
+});

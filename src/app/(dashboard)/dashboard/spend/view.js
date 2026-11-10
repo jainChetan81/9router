@@ -42,9 +42,11 @@ const durF = (ms) => { const m = Math.max(1, Math.round(ms / 60000)); return m <
 const realF = (v) => (v >= 0.005 ? usd(v, 1) : v > 0 ? "<$0.01" : "—");
 const short = (m) => SHORT[m] || m;
 
-export function buildView({ data, quota, ui, set, fit, range, feeRefs, saveFees }) {
+export function buildView({ data, quota, ui, set, fit, range, feeRefs, saveFees, feeSave }) {
   const { totals, bars, groups: G, fees, subsMeta } = data;
   const preset = range.preset, hourly = data.range.hourly, dayCount = data.range.days;
+  const feeSaving = feeSave?.state === "saving", feeSaved = feeSave?.state === "saved", feeError = feeSave?.state === "error" ? feeSave.msg : "";
+  const setFeeSaveIdle = () => { if (feeSave?.reset) feeSave.reset(); };
   const loggedLabel = data.loggedSinceLabel || "today";
   const past = bars.filter((b) => !b.future);
   const anyLogged = data.loggedSince !== null && data.loggedSince < data.range.to, allLogged = data.allLogged;
@@ -141,6 +143,7 @@ export function buildView({ data, quota, ui, set, fit, range, feeRefs, saveFees 
       name: s.name, plan: "Subscription", fee: fs ? fmtFee(fees[s.k]) : "Not set", draft: draft[s.k] ?? "", value: usd(totals.subs[s.k]),
       ratio: rt ? (rt >= 10 ? rt.toFixed(0) : rt.toFixed(1)) + "×" : "", c: rt < 1 ? "var(--red)" : "var(--green)",
       onFee: (e) => { const val = e.target.value; set((u) => ({ draft: { ...(u.draft || fees), [s.k]: val } })); },
+      onKey: (e) => { if (e.key === "Enter") { e.preventDefault(); if (!feeSaving) saveFees(); } },
       feeErr: ui.editing ? feeError(draft[s.k]) : "",
     };
   });
@@ -241,7 +244,10 @@ export function buildView({ data, quota, ui, set, fit, range, feeRefs, saveFees 
       feesPro: usd(feesPro) },
     or, ds, trend, chart, readout, subs, dayCount,
     editing: ui.editing, notEditing: !ui.editing,
-    startEdit: () => set({ editing: true, draft: { ...fees } }), cancelEdit: () => set({ editing: false, draft: null }), saveEdit: saveFees,
+    startEdit: () => { set({ editing: true, draft: { ...fees } }); setFeeSaveIdle(); },
+    cancelEdit: () => { set({ editing: false, draft: null }); setFeeSaveIdle(); },
+    saveEdit: saveFees,
+    feeSaving, feeSaved, feeError,
     feesOk: !ui.editing || Object.values(ui.draft || {}).every((x) => !feeError(x)),
     groups, groupHead, rows, rankBtns, outliers: outl, noOutliers: outl.length === 0, topDays, topDaysTitle: hourly ? "TOP 5 HOURS" : "TOP 5 DAYS", ag,
     aWpx: Math.max(260, fit.aW - 44) + "px", detCols: fit.aW < 640 ? "minmax(0,1fr)" : "minmax(0,1fr) minmax(0,1fr)",

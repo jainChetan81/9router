@@ -52,6 +52,7 @@ const ALWAYS_PROTECTED = [
   "/api/pii-guard/image",
   // Masked prompts still hold values the rules miss.
   "/api/pii-guard/prompts",
+  "/api/pii-guard/sessions",
   "/api/agents",
 ];
 
