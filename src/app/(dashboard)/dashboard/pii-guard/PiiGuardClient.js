@@ -7,6 +7,10 @@ import RangeBar from "../spend/RangeBar";
 import { applyIgnoreToSummary } from "@/lib/piiGuard/summary";
 import { buildView, isRefreshingState, place, PAGE, buildPromptFilterKey, buildPromptRequestKey, canLandOnPrompt, buildSessionFilterKey, buildSessionRequestKey, findingMarkers, groupMessages, toolFormat, collapseDefault, PROSE_LINES, ALABEL, stamp, age } from "./view";
 import "../spend/spend.css";
+import RefreshBar from "../spend/RefreshBar";
+import { cacheGet, cacheSet } from "@/lib/clientCache";
+
+const summaryKey = (rk) => `/api/pii-guard?range=${rk}`;
 
 const DAY = 864e5, IST = 5.5 * 3600e3;
 const PRESET_DAYS = { "7D": 7, "30D": 30, "60D": 60, All: 90 };
@@ -196,12 +200,16 @@ export default function PiiGuardClient() {
     loadCtl.current?.abort();
     const ctl = (loadCtl.current = new AbortController());
     const seq = ++loadSeqRef.current;
+    // First load or new range: show the cached summary at once, then revalidate.
+    const hit = reason === "range" || reason === "initial" ? cacheGet(summaryKey(rangeKey)) : null;
+    if (hit) { loadedKeyRef.current = rangeKey; setLoadedSummary({ key: rangeKey, data: hit.data }); setMode("ready"); }
     setRefreshReason(reason);
     const { from, to } = bounds(range);
     try {
       const d = await call(`/api/pii-guard?from=${Math.round(from)}&to=${Math.round(to)}`, null, ctl.signal);
       if (ctl.signal.aborted || seq !== loadSeqRef.current) return;
       loadedKeyRef.current = rangeKey;
+      cacheSet(summaryKey(rangeKey), d);
       setLoadedSummary({ key: rangeKey, data: d });
       setMode("ready");
       setErrorText("");
@@ -506,19 +514,15 @@ export default function PiiGuardClient() {
           </Fragment>))}
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", minWidth: "0", maxWidth: "100%" }}>
-          {isRefreshing && (
-            <span role="status" aria-live="polite" style={{ display: "inline-flex", alignItems: "center", gap: "6px", fontSize: "12px", fontWeight: "500", color: "var(--tx2)", whiteSpace: "nowrap" }}>
-              <Spinner size={12} />Updating…
-            </span>
-          )}
           <RangeBar preset={preset} customLabel={customLabel} onChange={onRange} today={todayKey} />
         </div>
       </div>
     </>)}
 
-    <div className="r9-pii-pad" aria-busy={isRefreshing || undefined} style={{ display: "flex", flexDirection: "column", gap: "16px", padding: "16px 32px 48px", opacity: isRefreshing ? 0.6 : 1, transition: "opacity .15s ease", minWidth: "0" }}>
+    <RefreshBar on={isRefreshing} label="Refreshing PII Guard data" />
+    <div className="r9-pii-pad" aria-busy={isRefreshing || undefined} style={{ display: "flex", flexDirection: "column", gap: "16px", padding: "16px 32px 48px", minWidth: "0" }}>
       {(isLoading) && (<>
-        <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: "12px", padding: "18px", display: "flex", flexDirection: "column", gap: "12px" }}><div style={{ width: "120px", height: "12px", borderRadius: "6px", background: "var(--seg)" }}></div><div style={{ height: "40px", borderRadius: "8px", background: "var(--seg)" }}></div><div style={{ height: "40px", borderRadius: "8px", background: "var(--seg)" }}></div></div>
+        <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: "12px", padding: "18px", display: "flex", flexDirection: "column", gap: "12px" }}><div style={{ width: "120px", height: "12px", borderRadius: "6px", background: "var(--seg)" }} className="r9-shimmer"></div><div style={{ height: "40px", borderRadius: "8px", background: "var(--seg)" }} className="r9-shimmer"></div><div style={{ height: "40px", borderRadius: "8px", background: "var(--seg)" }} className="r9-shimmer"></div></div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))", gap: "16px" }}><div style={{ height: "200px", borderRadius: "12px", background: "var(--card)", border: "1px solid var(--line)" }}></div><div style={{ height: "200px", borderRadius: "12px", background: "var(--card)", border: "1px solid var(--line)" }}></div></div>
         <div style={{ color: "var(--tx3)", fontSize: "12px", display: "flex", alignItems: "center", gap: "6px" }}><span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: "16px" }}>hourglass_top</span>Reading the PII Guard event log…</div>
       </>)}

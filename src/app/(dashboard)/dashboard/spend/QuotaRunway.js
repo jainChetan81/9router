@@ -4,6 +4,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { dur, fDT, fTime, mapQuotaRows, quotaTotal, sameDayIST, sortQuotaRunway } from "@/lib/spend/uiHelpers";
 import useWidth from "./useWidth";
+import { cacheGet, cacheSet, isFresh } from "@/lib/clientCache";
+
+const QUOTA_URL = "/api/spend/quota", QUOTA_TTL = 15 * 60_000;
+const fromCache = () => { const h = cacheGet(QUOTA_URL); if (!h) return null; const rows = h.data; return { state: rows.length ? "live" : "empty", rows, at: h.at, stale: false }; };
 
 const MS = { fontFamily: "'Material Symbols Outlined'", lineHeight: 1 };
 const RC = { high: "var(--red)", warn: "var(--amber)", ok: "var(--green)", unknown: "var(--tx3)", error: "var(--red)" };
@@ -16,17 +20,24 @@ export default function QuotaRunway() {
   const [ref, w] = useWidth();
   const narrow = w < 640;
 
-  const load = useCallback(async ({ quiet = false } = {}) => {
-    if (!quiet) setRes((r) => ({ ...r, state: "loading" }));
+  const load = useCallback(async ({ quiet = false, useCache = false } = {}) => {
+    // Quota is the slowest call (provider APIs). Reuse a recent result across page visits.
+    if (useCache) {
+      const c = fromCache(); // read after mount, so server and client render the same first frame
+      if (c) setRes(c);
+      if (isFresh(cacheGet(QUOTA_URL), QUOTA_TTL)) return;
+    }
+    if (!quiet) setRes((r) => (r.state === "live" ? r : { ...r, state: "loading" }));
     try {
       const r = await fetch("/api/spend/quota", { cache: "no-store" });
       const body = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(body.error || r.statusText);
       const rows = Array.isArray(body.rows) ? body.rows : [];
+      cacheSet(QUOTA_URL, rows);
       setRes({ state: rows.length ? "live" : "empty", rows, at: Date.now(), stale: false });
     } catch { setRes((r) => (quiet && r.state === "live" ? { ...r, stale: true } : { state: "error", rows: [], at: null })); }
   }, []);
-  useEffect(() => { const t = setTimeout(load, 0); return () => clearTimeout(t); }, [load]);
+  useEffect(() => { const t = setTimeout(() => load({ quiet: !!cacheGet(QUOTA_URL), useCache: true }), 0); return () => clearTimeout(t); }, [load]);
   useEffect(() => { const iv = setInterval(() => setNow(Date.now()), 30000); return () => clearInterval(iv); }, []);
   // Live data: refetch every 2 minutes while the tab is visible (the API caches for 60 s).
   useEffect(() => {
@@ -141,9 +152,9 @@ export default function QuotaRunway() {
         <div style={{ display: "flex", flexDirection: "column" }}>
           {[0, 1, 2, 3].map((i) => (
             <div key={i} style={{ display: "flex", gap: "14px", alignItems: "center", padding: "12px 0", borderTop: "1px solid var(--line)" }}>
-              <div style={{ flex: "1 1 180px", height: "12px", borderRadius: "4px", background: "var(--seg)" }}></div>
-              <div style={{ flex: "2 1 240px", height: "6px", borderRadius: "3px", background: "var(--seg)" }}></div>
-              <div style={{ flex: "1 1 160px", height: "12px", borderRadius: "4px", background: "var(--seg)" }}></div>
+              <div style={{ flex: "1 1 180px", height: "12px", borderRadius: "4px", background: "var(--seg)" }} className="r9-shimmer"></div>
+              <div style={{ flex: "2 1 240px", height: "6px", borderRadius: "3px", background: "var(--seg)" }} className="r9-shimmer"></div>
+              <div style={{ flex: "1 1 160px", height: "12px", borderRadius: "4px", background: "var(--seg)" }} className="r9-shimmer"></div>
             </div>
           ))}
         </div>
