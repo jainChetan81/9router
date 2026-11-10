@@ -6,6 +6,9 @@ import ProviderIcon from "@/shared/components/ProviderIcon";
 import QuotaTable from "./QuotaTable";
 import Toggle from "@/shared/components/Toggle";
 import Tooltip from "@/shared/components/Tooltip";
+import SyncButton from "../../../spend/SyncButton";
+import useAutoSync from "../../../spend/useAutoSync";
+import "../../../spend/spend.css";
 import {
   parseQuotaData,
   calculatePercentage,
@@ -32,7 +35,6 @@ import {
   REFRESH_INTERVAL_MS,
   CLAUDE_REFRESH_INTERVAL_MS,
   DEPLETED_QUOTA_THRESHOLD,
-  AUTO_REFRESH_STORAGE_KEY,
   CONNECTIONS_PAGE_SIZE,
   ACCOUNT_PAGE_SIZE_OPTIONS,
   ACCOUNT_PAGE_SIZE_MAX,
@@ -153,6 +155,8 @@ function formatTimeRemaining(value) {
   return days > 0 ? `${days}d ${hours}h` : `${hours}h`;
 }
 
+const QUOTA_FRESH_MS = 5 * 60_000;
+
 export default function ProviderLimits() {
   const { copied, copy } = useCopyToClipboard();
   const searchParams = useSearchParams();
@@ -162,13 +166,19 @@ export default function ProviderLimits() {
   const [quotaData, setQuotaData] = useState({});
   const [loading, setLoading] = useState({});
   const [errors, setErrors] = useState({});
-  const [autoRefresh, setAutoRefresh] = useState(true);
   const [autoPingConfigs, setAutoPingConfigs] = useState({ claude: {}, codex: {} });
   const [scheduleConnection, setScheduleConnection] = useState(null);
   const [lastUpdated, setLastUpdated] = useState(null);
-  const [hasHydratedAutoRefresh, setHasHydratedAutoRefresh] = useState(false);
+  // The sync control uses the Spend design tokens; follow the app theme class.
+  const [isDark, setIsDark] = useState(false);
+  useEffect(() => {
+    const el = document.documentElement, sync = () => setIsDark(el.classList.contains("dark"));
+    sync();
+    const mo = new MutationObserver(sync);
+    mo.observe(el, { attributes: true, attributeFilter: ["class"] });
+    return () => mo.disconnect();
+  }, []);
   const [refreshingAll, setRefreshingAll] = useState(false);
-  const [countdown, setCountdown] = useState(60);
   const [connectionsLoading, setConnectionsLoading] = useState(true);
   const [deletingId, setDeletingId] = useState(null);
   const [togglingId, setTogglingId] = useState(null);
@@ -221,8 +231,6 @@ export default function ProviderLimits() {
     providerFilteredConnections: 0,
   });
 
-  const intervalRef = useRef(null);
-  const countdownRef = useRef(null);
   const tickCountRef = useRef(0);
 
   const fetchConnections = useCallback(
@@ -530,7 +538,6 @@ export default function ProviderLimits() {
     if (refreshingAll) return;
 
     setRefreshingAll(true);
-    setCountdown(60);
 
     // Throttle Claude: poll its quota every Nth auto-tick (manual force bypasses)
     const tick = (tickCountRef.current += 1);
@@ -569,17 +576,31 @@ export default function ProviderLimits() {
       const visibleConnections = await fetchConnections(page);
       setConnectionsLoading(false);
 
-      // Always fetch fresh quota on mount, no cache display
-      setLoading(buildLoadingState(visibleConnections));
+      // Show cached quota at once; fetch only connections whose copy is missing
+      // or older than QUOTA_FRESH_MS ("Refresh all" always fetches).
+      const cache = getQuotaCache();
+      const now = Date.now();
+      const fresh = (conn) => {
+        const at = Date.parse(cache[conn.id]?.cachedAt || "");
+        return Number.isFinite(at) && now - at < QUOTA_FRESH_MS;
+      };
+      const cached = Object.fromEntries(visibleConnections.filter((c) => cache[c.id]).map((c) => [c.id, cache[c.id]]));
       setErrors((prev) =>
         filterQuotaStateByConnections(prev, visibleConnections),
       );
-      setQuotaData((prev) =>
-        filterQuotaStateByConnections(prev, visibleConnections),
-      );
+      setQuotaData((prev) => ({
+        ...filterQuotaStateByConnections(prev, visibleConnections),
+        ...cached, // the stored copy is the newest known value
+      }));
+      const stale = visibleConnections.filter((c) => !fresh(c));
+      const staleIds = new Set(stale.map((c) => c.id));
+      // Loading only for accounts being fetched; clear any flag left from a previous page.
+      setLoading(Object.fromEntries(visibleConnections.map((c) => [c.id, staleIds.has(c.id)])));
+      const times = visibleConnections.map((c) => Date.parse(cache[c.id]?.cachedAt || "")).filter(Number.isFinite);
+      if (!stale.length && times.length) { setLastUpdated(new Date(Math.min(...times))); return; }
 
       await Promise.all(
-        visibleConnections.map((conn) => fetchQuota(conn.id, conn.provider)),
+        stale.map((conn) => fetchQuota(conn.id, conn.provider)),
       );
       setLastUpdated(new Date());
     };
@@ -587,18 +608,6 @@ export default function ProviderLimits() {
     initializeData();
   }, [fetchConnections, fetchQuota, page]);
 
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const stored = window.localStorage.getItem(AUTO_REFRESH_STORAGE_KEY);
-    setAutoRefresh(stored === null ? true : stored === "true");
-    setHasHydratedAutoRefresh(true);
-  }, []);
-
-  // Persist auto-refresh preference
-  useEffect(() => {
-    if (typeof window === "undefined" || !hasHydratedAutoRefresh) return;
-    window.localStorage.setItem(AUTO_REFRESH_STORAGE_KEY, String(autoRefresh));
-  }, [autoRefresh, hasHydratedAutoRefresh]);
 
   // Load auto-ping per-connection configs
   useEffect(() => {
@@ -719,65 +728,9 @@ export default function ProviderLimits() {
     updateQuotaVisibility(next, previous);
   }, [quotaVisibility, updateQuotaVisibility]);
 
-  // Auto-refresh interval
-  useEffect(() => {
-    if (!hasHydratedAutoRefresh || !autoRefresh) {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-        intervalRef.current = null;
-      }
-      if (countdownRef.current) {
-        clearInterval(countdownRef.current);
-        countdownRef.current = null;
-      }
-      return;
-    }
-
-    // Main refresh interval
-    intervalRef.current = setInterval(() => {
-      refreshAll();
-    }, REFRESH_INTERVAL_MS);
-
-    // Countdown interval
-    countdownRef.current = setInterval(() => {
-      setCountdown((prev) => {
-        if (prev <= 1) return 60;
-        return prev - 1;
-      });
-    }, 1000);
-
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-      if (countdownRef.current) clearInterval(countdownRef.current);
-    };
-  }, [autoRefresh, refreshAll, hasHydratedAutoRefresh]);
-
-  // Pause auto-refresh when tab is hidden (Page Visibility API)
-  useEffect(() => {
-    const handleVisibilityChange = () => {
-      if (document.hidden) {
-        if (intervalRef.current) {
-          clearInterval(intervalRef.current);
-          intervalRef.current = null;
-        }
-        if (countdownRef.current) {
-          clearInterval(countdownRef.current);
-          countdownRef.current = null;
-        }
-      } else if (autoRefresh && hasHydratedAutoRefresh) {
-        // Resume auto-refresh when tab becomes visible
-        intervalRef.current = setInterval(() => refreshAll(), REFRESH_INTERVAL_MS);
-        countdownRef.current = setInterval(() => {
-          setCountdown((prev) => (prev <= 1 ? 60 : prev - 1));
-        }, 1000);
-      }
-    };
-
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-    return () => {
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-    };
-  }, [autoRefresh, refreshAll, hasHydratedAutoRefresh]);
+  // Auto-sync: shared page control (off by default, interval saved on the server).
+  const autoSync = useAutoSync("quota", () => refreshAll(true));
+  const manualSync = useCallback(() => refreshAll(true), [refreshAll]);
 
   const sortedConnections = useMemo(
     () =>
@@ -1066,44 +1019,12 @@ export default function ProviderLimits() {
             <span className="hidden sm:inline">Turn on Available</span>
           </button>
 
-          {/* Auto-refresh toggle */}
-          <button
-            onClick={() => setAutoRefresh((prev) => !prev)}
-            className="flex h-8 shrink-0 items-center gap-1 rounded-lg border border-black/10 px-2 text-xs transition-colors hover:bg-black/5 dark:border-white/10 dark:hover:bg-white/5"
-            title={autoRefresh ? "Disable auto-refresh" : "Enable auto-refresh"}
-          >
-            <span
-              className={`material-symbols-outlined text-[14px] ${
-                autoRefresh ? "text-primary" : "text-text-muted"
-              }`}
-            >
-              {autoRefresh ? "toggle_on" : "toggle_off"}
-            </span>
-            <span className="hidden text-text-primary sm:inline">
-              Auto-refresh
-            </span>
-            {autoRefresh && (
-              <span className="text-[10px] text-text-muted tabular-nums">
-                ({countdown}s)
-              </span>
-            )}
-          </button>
+          {/* Auto-sync: "Sync now" plus interval, shared with the other dashboard pages */}
+          <span data-r9={isDark ? "dark" : "light"} style={{ display: "inline-flex" }}>
+            <SyncButton sync={{ ...autoSync, manual: manualSync }} busy={refreshingAll} />
+          </span>
 
 
-          {/* Refresh all button */}
-          <button
-            type="button"
-            onClick={() => refreshAll(true)}
-            disabled={refreshingAll}
-            className="flex h-8 shrink-0 items-center gap-1 rounded-lg border border-black/10 px-2 text-xs text-text-primary transition-colors hover:bg-black/5 dark:border-white/10 dark:hover:bg-white/5 disabled:opacity-50"
-            title="Refresh all"
-          >
-            <span
-              className={`material-symbols-outlined text-[14px] ${refreshingAll ? "animate-spin" : ""}`}
-            >
-              refresh
-            </span>
-          </button>
         </div>
       </div>
 

@@ -7,6 +7,13 @@ import { buildView } from "./view";
 import "../spend/spend.css";
 import "../spend/shared-page.css";
 import "./agents.css";
+import RefreshBar from "../spend/RefreshBar";
+import SyncButton from "../spend/SyncButton";
+import useAutoSync from "../spend/useAutoSync";
+import { cacheInvalidate } from "@/lib/clientCache";
+import { cacheGet, cacheSet, isFresh } from "@/lib/clientCache";
+
+const RANGE_TTL = 5 * 60_000;
 
 let detailRequestSequence = 0;
 const overrideRequestIds = new Map();
@@ -51,7 +58,12 @@ export default function AgentsClient() {
   const [tick, setTick] = useState(0); // bump to force live + range + detail reloads
 
   useEffect(() => {
+    // Combo and model lists change rarely; reuse them across page visits.
+    const hit = cacheGet("/api/agents#catalog");
+    if (hit) setTimeout(() => { setCombos(hit.data.combos); setModels(hit.data.models); }, 0);
+    if (isFresh(hit, RANGE_TTL)) return;
     Promise.all([getJson("/api/combos"), getJson("/api/models")]).then(([c, m]) => {
+      cacheSet("/api/agents#catalog", { combos: c.combos || [], models: m.models || [] });
       setCombos(c.combos || []); setModels(m.models || []);
     }).catch(() => {});
   }, []);
@@ -189,22 +201,8 @@ export default function AgentsClient() {
   }, [set]);
   useEffect(() => { const t = setTimeout(loadLive, 0); return () => clearTimeout(t); }, [loadLive, tick]);
 
-  // Live poll: every 2 s, skipped while paused or when the tab is hidden.
-  useEffect(() => {
-    let t = null;
-    const paused = () => uiRef.current.paused;
-    const tick2 = () => { if (!document.hidden && !paused()) { setTick((x) => x + 1); } };
-    const vis = () => { if (!document.hidden && !paused()) setTick((x) => x + 1); };
-    tick2();
-    t = setInterval(tick2, 2000);
-    document.addEventListener("visibilitychange", vis);
-    return () => { clearInterval(t); document.removeEventListener("visibilitychange", vis); };
-  }, []);
-
-  useEffect(() => {
-    const t = setTimeout(() => set((u) => ({ ...u, ago: Math.min(999, (u.ago || 0) + 2) })), 2000);
-    return () => clearTimeout(t);
-  }, [tick, set]);
+  // No fixed polling: the page sync control (default every 10 s, saved on the
+  // server) bumps `tick`, which reloads live data; "Sync now" also reloads ranges.
 
 
   const rangeId = useRef(0);
@@ -212,14 +210,31 @@ export default function AgentsClient() {
   const [rangeNonce, setRangeNonce] = useState(0);
   // Sessions and analytics are heavy. Load them on range change, then every
   // 30 s; only the small /live feed follows the 2 s tick (N5).
-  const loadRange = useCallback(async ({ background = false } = {}) => {
+  const loadRange = useCallback(async ({ background = false, busy = false } = {}) => {
     const id = ++rangeId.current;
-    if (!background) setRangeBusy(true);
+    const q = new URLSearchParams({ preset: range.preset });
+    if (range.preset === "Custom") { q.set("from", range.from); q.set("to", range.to); }
+    const key = `/api/agents/range?${q}`;
+    // Past sessions and analytics: show the cached copy at once, refetch only
+    // when it is older than RANGE_TTL. The 30 s background refresh still runs.
+    if (!background) {
+      const hit = cacheGet(key);
+      if (hit) {
+        setSessions(hit.data.s.sessions || []);
+        setTotalSessions(hit.data.s.total ?? (hit.data.s.sessions || []).length);
+        setMoreCursor(hit.data.s.nextCursor || null);
+        setAnalytics(hit.data.a);
+        setMode("ready");
+        if (isFresh(hit, RANGE_TTL)) { setRangeBusy(false); return; }
+      } else {
+        setMoreCursor(null); // the old range's cursor must not page the new range
+      }
+    }
+    if (!background || busy) setRangeBusy(true); // auto-sync refreshes stay silent
     try {
-      const q = new URLSearchParams({ preset: range.preset });
-      if (range.preset === "Custom") { q.set("from", range.from); q.set("to", range.to); }
       const [s, a] = await Promise.all([getJson(`/api/agents/sessions?${q}`), getJson(`/api/agents/analytics?${q}`)]);
       if (id !== rangeId.current) return;
+      cacheSet(key, { s, a });
       setRangeBusy(false);
       // Background refreshes merge pages already loaded by "Load 100 more" (N4).
       setSessions((old) => {
@@ -241,18 +256,30 @@ export default function AgentsClient() {
     }
   }, [range]);
   useEffect(() => { const t = setTimeout(() => loadRange(), 0); return () => clearTimeout(t); }, [loadRange, rangeNonce]);
-  useEffect(() => {
-    const iv = setInterval(() => { if (!document.hidden && !uiRef.current.paused) loadRange({ background: true }); }, 30000);
-    const vis = () => { if (!document.hidden && !uiRef.current.paused) loadRange({ background: true }); };
-    document.addEventListener("visibilitychange", vis);
-    return () => { clearInterval(iv); document.removeEventListener("visibilitychange", vis); };
+  // Auto-sync tick: live feed every time; sessions and analytics every 3rd tick at most once a minute.
+  const lastRangeSync = useRef(0);
+  const syncAll = useCallback((force = false) => {
+    setTick((x) => x + 1);
+    const now = Date.now();
+    if (force || now - lastRangeSync.current >= 60_000) {
+      lastRangeSync.current = now;
+      if (force) cacheInvalidate("/api/agents");
+      // Background merge keeps pages loaded with "Load more"; the cache is skipped after invalidation.
+      loadRange({ background: true, busy: force });
+    }
   }, [loadRange]);
+  const autoSync = useAutoSync("agents", () => syncAll(false));
+  const manualSync = useCallback(() => syncAll(true), [syncAll]);
 
   useEffect(() => {
     let cancelled = false;
     const q = new URLSearchParams({ preset: range.preset });
     if (range.preset === "Custom") { q.set("from", range.from); q.set("to", range.to); }
-    getJson(`/api/agents/tools?${q}`).then((data) => {
+    const key = `/api/agents/tools?${q}`, hit = cacheGet(key);
+    if (hit) setTimeout(() => { if (!cancelled) { setTools(hit.data); setToolsError(""); } }, 0);
+    if (isFresh(hit, RANGE_TTL)) return () => { cancelled = true; };
+    getJson(key).then((data) => {
+      cacheSet(key, data);
       if (!cancelled) { setTools(data); setToolsError(""); }
     }).catch((error) => {
       if (!cancelled) { setTools(null); setToolsError(error.message || "Request failed"); }
@@ -315,14 +342,15 @@ export default function AgentsClient() {
   }, [ui.tab, sel, loadDetail]);
   // A live session's detail refreshes every 10 s; ended sessions do not change (N5).
   const selLive = !!(sel && live?.sessions?.some((x) => x.session === sel));
+  // A live session's detail follows the page sync ticks; ended sessions do not change (N5).
   useEffect(() => {
-    if (ui.tab !== "sessions" || !sel || !selLive) return;
-    const iv = setInterval(() => { if (!document.hidden && !uiRef.current.paused) loadDetail(sel); }, 10000);
-    return () => clearInterval(iv);
-  }, [ui.tab, sel, selLive, loadDetail]);
+    if (ui.tab !== "sessions" || !sel || !selLive || !tick) return;
+    const t = setTimeout(() => loadDetail(sel), 0);
+    return () => clearTimeout(t);
+  }, [ui.tab, sel, selLive, loadDetail, tick]);
 
   const loadMore = useCallback(async () => {
-    if (!moreCursor || moreBusy) return;
+    if (!moreCursor || moreBusy || rangeBusy) return;
     setMoreBusy(true);
     try {
       const q = new URLSearchParams({ preset: range.preset, cursor: moreCursor });
@@ -336,7 +364,7 @@ export default function AgentsClient() {
     } catch (error) {
       setToast(error.message || "Unable to load more sessions.");
     } finally { setMoreBusy(false); }
-  }, [moreCursor, moreBusy, range]);
+  }, [moreCursor, moreBusy, rangeBusy, range]);
 
   // Prime the mode once live answers arrive.
   useEffect(() => {
@@ -451,11 +479,8 @@ export default function AgentsClient() {
             }}>
               {v.tabs.map((t) => <button key={t.label} onClick={t.on} style={t.style} role="tab" aria-selected={ui.tab === t.label.toLowerCase()} aria-label={t.count ? t.label + " " + t.count : t.label}>{t.dot && <span style={t.dot} />}{t.label}{t.count && <span style={{ fontSize: 11, color: "var(--tx2)", marginLeft: 8 }}>{t.count}</span>}</button>)}
             </div></div>
-            {ui.tab === "live" ? (
-              <button onClick={v.togglePause} aria-label={v.paused ? "Resume live feed" : "Pause live feed"} style={{ display: "flex", alignItems: "center", gap: 7, border: 0, background: "transparent", padding: 0, font: "inherit", fontSize: 12, color: v.fresh.c, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>
-                <span style={v.fresh.dot} />{v.fresh.text}<span className="r9-hacc" style={{ fontFamily: "'Material Symbols Outlined'", fontSize: 15 }}>{v.fresh.icon}</span>{v.fresh.btn}
-              </button>
-            ) : <div onClick={(e) => { if (rangeBusy) e.stopPropagation(); }}><RangeBar preset={v.preset} customLabel={v.customLabel} onChange={onRange} /></div>}
+            {ui.tab === "live" ? null : <div onClick={(e) => { if (rangeBusy) e.stopPropagation(); }}><RangeBar preset={v.preset} customLabel={v.customLabel} onChange={onRange} /></div>}
+            <SyncButton sync={{ ...autoSync, manual: manualSync }} busy={rangeBusy} />
           </div>
           <div style={{ fontSize: 11, color: "var(--tx2)", display: "flex", alignItems: "center", gap: 4 }}><span className="material-symbols-outlined" style={{ fontSize: 14 }}>schedule</span>Times in IST (UTC+5:30) · Agent telemetry logging began Nov 9</div>
         </div>
@@ -482,7 +507,7 @@ export default function AgentsClient() {
             <span className="material-symbols-outlined" style={{ fontSize: 16 }}>warning</span>{v.v.staleText}
           </div>
         )}
-        {ready && !v.v.empty && <><div aria-busy={rangeBusy || undefined} style={{ opacity: rangeBusy ? 0.55 : 1, transition: "opacity .2s", minWidth: 0 }}><div style={{ display: rangeBusy ? "flex" : "none", alignItems: "center", gap: 8, fontSize: 12, color: "var(--tx2)", marginBottom: 8 }} role="status"><span className="material-symbols-outlined" style={{ fontSize: 16 }}>progress_activity</span>{v.v.loadingText || "Loading…"}</div>
+        {ready && !v.v.empty && <><div aria-busy={rangeBusy || undefined} style={{ minWidth: 0 }}><RefreshBar on={rangeBusy} label={v.v.loadingText || "Refreshing sessions"} />
           {ui.tab === "live" && <LiveTab v={v} />}
           {ui.tab === "sessions" && <SessionsTab v={v} ui={ui} moreBusy={moreBusy} />}
           {ui.tab === "roles" && <RolesTab v={v} />}
@@ -559,10 +584,10 @@ function AgentsSkeleton({ v }) {
   return (
     <div aria-hidden="true">
       <div style={{ display: "grid", gridTemplateColumns: "repeat(6,minmax(150px,1fr))", gap: 10, overflowX: "auto", marginBottom: 14 }}>
-        {v.skel6.map((k, i) => <div key={i} style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: 10, padding: "10px 12px" }}><div style={{ width: k.w, height: 10, borderRadius: 5, background: "var(--seg)" }} /><div style={{ width: k.wb, height: 16, borderRadius: 5, background: "var(--seg)", marginTop: 8 }} /></div>)}
+        {v.skel6.map((k, i) => <div key={i} style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: 10, padding: "10px 12px" }}><div style={{ width: k.w, height: 10, borderRadius: 5, background: "var(--seg)" }} className="r9-shimmer" /><div style={{ width: k.wb, height: 16, borderRadius: 5, background: "var(--seg)", marginTop: 8 }} className="r9-shimmer" /></div>)}
       </div>
       <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: 12, padding: 16 }}>
-        {v.skel8.map((k, i) => <div key={i} style={{ display: "flex", gap: 10, paddingLeft: k.p, paddingTop: 6 }}><div style={{ width: k.w, height: 12, borderRadius: 6, background: "var(--seg)" }} /></div>)}
+        {v.skel8.map((k, i) => <div key={i} style={{ display: "flex", gap: 10, paddingLeft: k.p, paddingTop: 6 }}><div style={{ width: k.w, height: 12, borderRadius: 6, background: "var(--seg)" }} className="r9-shimmer" /></div>)}
       </div>
     </div>
   );

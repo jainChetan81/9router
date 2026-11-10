@@ -3,13 +3,16 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import RangeBar from "./RangeBar";
-import PageHeader from "./PageHeader";
 import QuotaRunway from "./QuotaRunway";
 import BreakdownDrill from "./BreakdownDrill";
 import RoutingMap from "./RoutingMap";
 import { buildView } from "./view";
 import { feesValid } from "./helpers";
 import "./spend.css";
+import RefreshBar from "./RefreshBar";
+import SyncButton from "./SyncButton";
+import useAutoSync from "./useAutoSync";
+import { cacheGet, cacheSet, cacheInvalidate, isFresh, updatedAgo } from "@/lib/clientCache";
 import "./shared-page.css";
 
 async function getJson(url, opts) {
@@ -18,6 +21,8 @@ async function getJson(url, opts) {
   if (!res.ok) throw new Error(body.error || res.statusText);
   return body;
 }
+
+const SPEND_TTL = 15 * 60_000, BALANCE_KEY = "/api/spend#balances";
 
 export default function SpendClient() {
   const router = useRouter();
@@ -44,21 +49,41 @@ export default function SpendClient() {
   // show a refreshing state; data currently shown stays on screen (no flash to skeleton).
   const loadId = useRef(0);
   const [refreshing, setRefreshing] = useState(false);
-  const load = useCallback(async (opts = {}) => {
+  const [loadedAt, setLoadedAt] = useState(0);
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  // Sync: drop cached Spend data and read everything fresh (range data, quota, balances).
+  const [syncNonce, setSyncNonce] = useState(0);
+  const sync = useCallback(() => { cacheInvalidate("/api/spend"); setSyncNonce((n) => n + 1); }, []);
+  const autoSync = useAutoSync("spend", sync);
+  useEffect(() => { const t = setInterval(() => setNowTick(Date.now()), 30_000); return () => clearInterval(t); }, []);
+  const load = useCallback(async () => {
     const id = ++loadId.current; // ignore responses from superseded ranges
-    setMode((m) => (m === "ready" ? "ready" : "loading"));
-    setRefreshing(true);
     const q = new URLSearchParams({ preset: range.preset });
     if (range.preset === "Custom") { q.set("from", range.from); q.set("to", range.to); }
+    const url = `/api/spend?${q}`;
+    // Spend changes slowly: show cached data at once; refetch only when older than SPEND_TTL.
+    const hit = cacheGet(url);
+    if (hit) {
+      setData(hit.data);
+      setLoadedAt(hit.at);
+      setMode(hit.data.totals.req === 0 ? "empty" : "ready");
+      if (isFresh(hit, SPEND_TTL)) { setRefreshing(false); return; }
+    } else {
+      setMode((m) => (m === "ready" ? "ready" : "loading"));
+    }
+    setRefreshing(true);
     try {
-      const d = await getJson(`/api/spend?${q}`);
+      const d = await getJson(url);
       if (id !== loadId.current) return;
+      cacheSet(url, d);
       setData(d);
+      setLoadedAt(Date.now());
       setRefreshing(false);
       setMode(d.totals.req === 0 ? "empty" : "ready");
     } catch (e) {
       if (id !== loadId.current) return;
       setRefreshing(false);
+      if (hit) return; // keep showing the cached data
       setErrorText(e.message || "Request failed");
       setMode("error");
     }
@@ -66,11 +91,14 @@ export default function SpendClient() {
   useEffect(() => {
     const t = setTimeout(load, 0);
     return () => clearTimeout(t);
-  }, [load]);
+  }, [load, syncNonce]);
 
   // Provider balances come from the Quota Tracker endpoints.
   useEffect(() => {
     let off = false;
+    const hit = cacheGet(BALANCE_KEY);
+    if (hit) setTimeout(() => { if (!off) setQuota(hit.data); }, 0);
+    if (isFresh(hit, SPEND_TTL)) return () => { off = true; };
     getJson("/api/providers").then(async ({ connections = [] }) => {
       const want = ["openrouter", "deepseek"];
       const list = connections.filter((c) => want.includes(c.provider) && c.isActive !== false);
@@ -78,10 +106,11 @@ export default function SpendClient() {
       await Promise.all(list.map(async (c) => {
         try { const u = await getJson(`/api/usage/${c.id}`); (out[c.provider] ||= []).push({ name: c.name, ...u }); } catch { /* quota is optional */ }
       }));
+      cacheSet(BALANCE_KEY, out);
       if (!off) setQuota(out);
     }).catch(() => {});
     return () => { off = true; };
-  }, []);
+  }, [syncNonce]);
 
   const checkFade = useCallback(() => {
     const f = (el) => !!el && el.scrollWidth - el.clientWidth - el.scrollLeft > 2;
@@ -106,6 +135,7 @@ export default function SpendClient() {
     try {
       const { fees } = await getJson("/api/spend", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ fees: draft }) });
       setData((d) => ({ ...d, fees }));
+      cacheInvalidate("/api/spend?");
       set({ editing: false, draft: null });
       setFeeSave({ state: "saved", msg: "" });
     } catch (e) {
@@ -137,26 +167,27 @@ export default function SpendClient() {
     <div data-r9={theme} style={{ display: "flex", flexDirection: "column", minHeight: minH, backgroundColor: "var(--bg)", backgroundImage: "linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px)", backgroundSize: "44px 44px", color: "var(--tx)", fontFamily: "system-ui,-apple-system,'Segoe UI',sans-serif", fontSize: "13px", lineHeight: "1.4" }}>
       <div style={{ display: "flex", alignItems: "stretch", flex: "1" }}>
       <main style={{ flex: "1", minWidth: "0", display: "flex", flexDirection: "column" }}>
-        <PageHeader title="Spend" subtitle="Track real spend, subscription value, and usage." icon="payments" />
         {(s.range) && (<>
           <div className="r9-spend-range" style={{ position: "sticky", top: "0", zIndex: "30", display: "flex", justifyContent: "space-between", alignItems: "center", gap: "12px", flexWrap: "wrap", padding: "8px 24px", background: "var(--bg)", borderBottom: "1px solid var(--line)" }}>
             <div style={{ display: "flex", alignItems: "baseline", gap: "8px" }}><span style={{ fontWeight: "600" }}>{rangeTitle}</span><span style={{ color: "var(--tx3)", fontSize: "12px" }}>{rangeSub}</span></div>
             <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
               <RangeBar preset={preset} customLabel={customLabel} onChange={onRange} today={todayKey} />
-              {(refreshing) && (<span className="r9-spend-refreshing" role="status" style={{ display: "inline-flex", alignItems: "center", gap: "6px", fontSize: "12px", color: "var(--tx2)" }}><span className="r9-spinner" aria-hidden="true"></span>Updating…</span>)}
+              {(loadedAt > 0) && (<span className="r9-spend-refreshing" title={new Date(loadedAt).toLocaleString()} style={{ fontSize: "11.5px", color: "var(--tx3)", whiteSpace: "nowrap" }}>{refreshing ? "Refreshing…" : updatedAgo(loadedAt, nowTick)}</span>)}
+              <SyncButton sync={autoSync} busy={refreshing} />
             </div>
             <span className="r9-spend-ist-note" style={{ fontSize: 11, color: "var(--tx2)", display: "flex", alignItems: "center", gap: 4 }}><span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: 14 }}>schedule</span>Times in IST (UTC+5:30) · Real spend logging began Nov 9</span>
           </div>
         </>)}
-        <div className="r9-spend-content" aria-busy={refreshing} style={{ opacity: refreshing ? 0.55 : 1, transition: "opacity .15s", pointerEvents: refreshing ? "none" : "auto", display: "flex", flexDirection: "column", gap: "16px", padding: "16px 32px 48px" }}>
+        <RefreshBar on={refreshing && !isLoading} label="Refreshing spend data" />
+        <div className="r9-spend-content" aria-busy={refreshing} style={{ display: "flex", flexDirection: "column", gap: "16px", padding: "16px 32px 48px" }}>
 
           {(isLoading) && (<>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(240px,1fr))", gap: "16px" }}>
-              <div style={{ height: "118px", borderRadius: "12px", background: "var(--card)", border: "1px solid var(--line)", padding: "18px", boxSizing: "border-box", display: "flex", flexDirection: "column", gap: "12px" }}><div style={{ width: "40%", height: "10px", borderRadius: "5px", background: "var(--seg)" }}></div><div style={{ width: "55%", height: "24px", borderRadius: "6px", background: "var(--seg)" }}></div><div style={{ width: "75%", height: "10px", borderRadius: "5px", background: "var(--seg)" }}></div></div>
-              <div style={{ height: "118px", borderRadius: "12px", background: "var(--card)", border: "1px solid var(--line)", padding: "18px", boxSizing: "border-box", display: "flex", flexDirection: "column", gap: "12px" }}><div style={{ width: "40%", height: "10px", borderRadius: "5px", background: "var(--seg)" }}></div><div style={{ width: "55%", height: "24px", borderRadius: "6px", background: "var(--seg)" }}></div><div style={{ width: "75%", height: "10px", borderRadius: "5px", background: "var(--seg)" }}></div></div>
-              <div style={{ height: "118px", borderRadius: "12px", background: "var(--card)", border: "1px solid var(--line)", padding: "18px", boxSizing: "border-box", display: "flex", flexDirection: "column", gap: "12px" }}><div style={{ width: "40%", height: "10px", borderRadius: "5px", background: "var(--seg)" }}></div><div style={{ width: "55%", height: "24px", borderRadius: "6px", background: "var(--seg)" }}></div><div style={{ width: "75%", height: "10px", borderRadius: "5px", background: "var(--seg)" }}></div></div>
+              <div style={{ height: "118px", borderRadius: "12px", background: "var(--card)", border: "1px solid var(--line)", padding: "18px", boxSizing: "border-box", display: "flex", flexDirection: "column", gap: "12px" }}><div style={{ width: "40%", height: "10px", borderRadius: "5px", background: "var(--seg)" }} className="r9-shimmer"></div><div style={{ width: "55%", height: "24px", borderRadius: "6px", background: "var(--seg)" }} className="r9-shimmer"></div><div style={{ width: "75%", height: "10px", borderRadius: "5px", background: "var(--seg)" }} className="r9-shimmer"></div></div>
+              <div style={{ height: "118px", borderRadius: "12px", background: "var(--card)", border: "1px solid var(--line)", padding: "18px", boxSizing: "border-box", display: "flex", flexDirection: "column", gap: "12px" }}><div style={{ width: "40%", height: "10px", borderRadius: "5px", background: "var(--seg)" }} className="r9-shimmer"></div><div style={{ width: "55%", height: "24px", borderRadius: "6px", background: "var(--seg)" }} className="r9-shimmer"></div><div style={{ width: "75%", height: "10px", borderRadius: "5px", background: "var(--seg)" }} className="r9-shimmer"></div></div>
+              <div style={{ height: "118px", borderRadius: "12px", background: "var(--card)", border: "1px solid var(--line)", padding: "18px", boxSizing: "border-box", display: "flex", flexDirection: "column", gap: "12px" }}><div style={{ width: "40%", height: "10px", borderRadius: "5px", background: "var(--seg)" }} className="r9-shimmer"></div><div style={{ width: "55%", height: "24px", borderRadius: "6px", background: "var(--seg)" }} className="r9-shimmer"></div><div style={{ width: "75%", height: "10px", borderRadius: "5px", background: "var(--seg)" }} className="r9-shimmer"></div></div>
             </div>
-            <div style={{ height: "300px", borderRadius: "12px", background: "var(--card)", border: "1px solid var(--line)", display: "flex", alignItems: "flex-end", gap: "6px", padding: "24px", boxSizing: "border-box" }}>{(skel).map((k, _i) => (<Fragment key={_i}><div style={{ flex: "1", borderRadius: "3px", background: "var(--seg)", height: k.h }}></div></Fragment>))}</div>
+            <div style={{ height: "300px", borderRadius: "12px", background: "var(--card)", border: "1px solid var(--line)", display: "flex", alignItems: "flex-end", gap: "6px", padding: "24px", boxSizing: "border-box" }}>{(skel).map((k, _i) => (<Fragment key={_i}><div style={{ flex: "1", borderRadius: "3px", background: "var(--seg)", height: k.h }} className="r9-shimmer"></div></Fragment>))}</div>
             <div style={{ color: "var(--tx3)", fontSize: "12px", display: "flex", alignItems: "center", gap: "6px" }}><span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: "16px" }}>hourglass_top</span>Reading request rows and quota data…</div>
           </>)}
 
@@ -198,7 +229,7 @@ export default function SpendClient() {
             </div>
           </>)}
 
-          <QuotaRunway />
+          <QuotaRunway syncNonce={syncNonce} />
           {(s.real) && (<>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(300px,1fr))", gap: "16px" }}>
               <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: "12px", boxShadow: "var(--shadow)", padding: "16px 18px", display: "flex", flexDirection: "column", gap: "14px" }}>
@@ -328,7 +359,7 @@ export default function SpendClient() {
                 </div>
               </div>
               {(ag.loading) && (<>
-                <div style={{ display: "flex", flexDirection: "column", gap: "8px", padding: "4px 0" }}>{(ag.skel).map((k, _i) => (<Fragment key={_i}><div style={{ display: "flex", gap: "12px", alignItems: "center" }}><div style={{ width: "70px", height: "12px", borderRadius: "6px", background: "var(--seg)" }}></div><div style={{ width: "90px", height: "12px", borderRadius: "6px", background: "var(--seg)" }}></div><div style={{ width: k.w, height: "12px", borderRadius: "6px", background: "var(--seg)" }}></div><div style={{ flex: "1", height: "6px", borderRadius: "3px", background: "var(--seg)" }}></div></div></Fragment>))}<span style={{ fontSize: "12px", color: "var(--tx3)" }}>Reading sessions…</span></div>
+                <div style={{ display: "flex", flexDirection: "column", gap: "8px", padding: "4px 0" }}>{(ag.skel).map((k, _i) => (<Fragment key={_i}><div style={{ display: "flex", gap: "12px", alignItems: "center" }}><div style={{ width: "70px", height: "12px", borderRadius: "6px", background: "var(--seg)" }} className="r9-shimmer"></div><div style={{ width: "90px", height: "12px", borderRadius: "6px", background: "var(--seg)" }} className="r9-shimmer"></div><div style={{ width: k.w, height: "12px", borderRadius: "6px", background: "var(--seg)" }} className="r9-shimmer"></div><div style={{ flex: "1", height: "6px", borderRadius: "3px", background: "var(--seg)" }} className="r9-shimmer"></div></div></Fragment>))}<span style={{ fontSize: "12px", color: "var(--tx3)" }}>Reading sessions…</span></div>
               </>)}
               {(ag.error) && (<>
                 <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: "12px", padding: "14px 16px", borderRadius: "9px", background: "var(--redbg)", boxSizing: "border-box", minHeight: "64px" }}><span style={{ flex: "none", fontFamily: "'Material Symbols Outlined'", fontSize: "22px", color: "var(--red)" }}>error</span><div style={{ flex: "1 1 220px", minWidth: "0", display: "flex", flexDirection: "column", gap: "2px" }}><span style={{ fontWeight: "600" }}>Couldn&apos;t load sessions</span><span style={{ fontSize: "12px", color: "var(--tx2)" }}>{ag.errorText}</span></div><button onClick={ag.retry} style={{ flex: "none", alignSelf: "center", height: "28px", padding: "0 12px", borderRadius: "7px", border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", font: "inherit", fontSize: "12px", cursor: "pointer" }}>Retry</button></div>

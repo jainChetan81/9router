@@ -7,6 +7,12 @@ import RangeBar from "../spend/RangeBar";
 import { applyIgnoreToSummary } from "@/lib/piiGuard/summary";
 import { buildView, isRefreshingState, place, PAGE, buildPromptFilterKey, buildPromptRequestKey, canLandOnPrompt, buildSessionFilterKey, buildSessionRequestKey, findingMarkers, groupMessages, toolFormat, collapseDefault, PROSE_LINES, ALABEL, stamp, age } from "./view";
 import "../spend/spend.css";
+import RefreshBar from "../spend/RefreshBar";
+import SyncButton from "../spend/SyncButton";
+import useAutoSync from "../spend/useAutoSync";
+import { cacheGet, cacheSet, cacheInvalidate } from "@/lib/clientCache";
+
+const summaryKey = (rk) => `/api/pii-guard?range=${rk}`;
 
 const DAY = 864e5, IST = 5.5 * 3600e3;
 const PRESET_DAYS = { "7D": 7, "30D": 30, "60D": 60, All: 90 };
@@ -196,12 +202,17 @@ export default function PiiGuardClient() {
     loadCtl.current?.abort();
     const ctl = (loadCtl.current = new AbortController());
     const seq = ++loadSeqRef.current;
+    // First load or new range: show the cached summary at once, then revalidate.
+    const hit = reason === "range" || reason === "initial" ? cacheGet(summaryKey(rangeKey)) : null;
+    if (hit) { loadedKeyRef.current = rangeKey; setLoadedSummary({ key: rangeKey, data: hit.data }); setMode("ready"); }
+    else if (reason === "range") setLoadedSummary((prev) => (prev.key === rangeKey ? prev : { key: null, data: null })); // never show another range's data
     setRefreshReason(reason);
     const { from, to } = bounds(range);
     try {
       const d = await call(`/api/pii-guard?from=${Math.round(from)}&to=${Math.round(to)}`, null, ctl.signal);
       if (ctl.signal.aborted || seq !== loadSeqRef.current) return;
       loadedKeyRef.current = rangeKey;
+      cacheSet(summaryKey(rangeKey), d);
       setLoadedSummary({ key: rangeKey, data: d });
       setMode("ready");
       setErrorText("");
@@ -214,17 +225,15 @@ export default function PiiGuardClient() {
       if (seq === loadSeqRef.current) setRefreshReason(null);
     }
   }, [range, rangeKey]);
-  // Poll every 30 s while the tab is visible. The next poll starts after the last one ends; a hidden tab
-  // stops polling and reloads when it is shown again.
+  // Load on open and on range change. No fixed polling: the page sync control
+  // (off by default, interval saved on the server) and "Sync now" reload it.
   useEffect(() => {
-    let t, gen = 0, off = false; // `gen`: only the newest tick schedules the next one, so chains never double up
-    const initialReason = loadedKeyRef.current === null ? "initial" : loadedKeyRef.current !== rangeKey ? "range" : "poll";
-    const tick = async (reason = "poll") => { clearTimeout(t); const g = ++gen; if (document.visibilityState !== "visible") return; await load(reason); if (!off && g === gen) t = setTimeout(() => tick("poll"), 30e3); };
-    const onVis = () => { if (document.visibilityState === "visible") tick("poll"); else clearTimeout(t); };
-    tick(initialReason);
-    document.addEventListener("visibilitychange", onVis);
-    return () => { off = true; clearTimeout(t); loadCtl.current?.abort(); document.removeEventListener("visibilitychange", onVis); };
+    const reason = loadedKeyRef.current === null ? "initial" : loadedKeyRef.current !== rangeKey ? "range" : "poll";
+    const t = setTimeout(() => load(reason), 0);
+    return () => { clearTimeout(t); loadCtl.current?.abort(); };
   }, [load, rangeKey]);
+  const autoSync = useAutoSync("piiGuard", () => load("poll"));
+  const manualSync = useCallback(() => load("manual"), [load]);
 
   // Event log: 50 events per page, newest first, flattened to one row per hit. The server applies the
   // client, model, source and action filters. The 30 s refresh reloads only the newest page.
@@ -345,6 +354,7 @@ export default function PiiGuardClient() {
     try {
       const res = await call("/api/pii-guard", body);
       ok = true;
+      cacheInvalidate("/api/pii-guard?"); // settings changed: cached summaries hold the old config
       if (dataRef.current && res?.config) {
         const nextConfig = res.config;
         setLoadedSummary((prev) => {
@@ -506,19 +516,16 @@ export default function PiiGuardClient() {
           </Fragment>))}
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", minWidth: "0", maxWidth: "100%" }}>
-          {isRefreshing && (
-            <span role="status" aria-live="polite" style={{ display: "inline-flex", alignItems: "center", gap: "6px", fontSize: "12px", fontWeight: "500", color: "var(--tx2)", whiteSpace: "nowrap" }}>
-              <Spinner size={12} />Updating…
-            </span>
-          )}
           <RangeBar preset={preset} customLabel={customLabel} onChange={onRange} today={todayKey} />
+          <SyncButton sync={{ ...autoSync, manual: manualSync }} busy={isRefreshing} />
         </div>
       </div>
     </>)}
 
-    <div className="r9-pii-pad" aria-busy={isRefreshing || undefined} style={{ display: "flex", flexDirection: "column", gap: "16px", padding: "16px 32px 48px", opacity: isRefreshing ? 0.6 : 1, transition: "opacity .15s ease", minWidth: "0" }}>
+    <RefreshBar on={isRefreshing} label="Refreshing PII Guard data" />
+    <div className="r9-pii-pad" aria-busy={isRefreshing || undefined} style={{ display: "flex", flexDirection: "column", gap: "16px", padding: "16px 32px 48px", minWidth: "0" }}>
       {(isLoading) && (<>
-        <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: "12px", padding: "18px", display: "flex", flexDirection: "column", gap: "12px" }}><div style={{ width: "120px", height: "12px", borderRadius: "6px", background: "var(--seg)" }}></div><div style={{ height: "40px", borderRadius: "8px", background: "var(--seg)" }}></div><div style={{ height: "40px", borderRadius: "8px", background: "var(--seg)" }}></div></div>
+        <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: "12px", padding: "18px", display: "flex", flexDirection: "column", gap: "12px" }}><div style={{ width: "120px", height: "12px", borderRadius: "6px", background: "var(--seg)" }} className="r9-shimmer"></div><div style={{ height: "40px", borderRadius: "8px", background: "var(--seg)" }} className="r9-shimmer"></div><div style={{ height: "40px", borderRadius: "8px", background: "var(--seg)" }} className="r9-shimmer"></div></div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))", gap: "16px" }}><div style={{ height: "200px", borderRadius: "12px", background: "var(--card)", border: "1px solid var(--line)" }}></div><div style={{ height: "200px", borderRadius: "12px", background: "var(--card)", border: "1px solid var(--line)" }}></div></div>
         <div style={{ color: "var(--tx3)", fontSize: "12px", display: "flex", alignItems: "center", gap: "6px" }}><span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: "16px" }}>hourglass_top</span>Reading the PII Guard event log…</div>
       </>)}
