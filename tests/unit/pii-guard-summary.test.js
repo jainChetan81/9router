@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { summarize } from "../../src/lib/piiGuard/summary.js";
+import { summarize, applyIgnoreToSummary } from "../../src/lib/piiGuard/summary.js";
 
 describe("summarize", () => {
   it("groups recent values, counts actions, sources, ignores, warnings, and errors", () => {
@@ -152,5 +152,44 @@ describe("summary routing records", () => {
     expect(result.requests).toBe(1);
     expect(result.groups[0]).toMatchObject({ provider: "served", combo: "daily", lastSeen: ts, turns: 1 });
     expect(result.byRule.email.hits).toBe(1);
+  });
+});
+
+describe("applyIgnoreToSummary", () => {
+  const now = "2026-01-01T23:00:00.000Z";
+  const g = (hash, rule, action, extra = {}) => ({ hash, rule, sources: ["user/text"], actions: [action], action, firstSeen: now, lastSeen: now, turns: 1, ignored: false, ...extra });
+  const baseSummary = () => summarize([
+    { ts: now, hits: [{ hash: "aaaaaaaaaaaa", rule: "pan", source: "user/text", action: "leaked" }] },
+    { ts: now, hits: [{ hash: "bbbbbbbbbbbb", rule: "email", source: "user/text", action: "redact" }] },
+  ], { ignore: [], now: Date.parse(now) });
+
+  it("re-projects ignored flags and byAction without re-scanning events", () => {
+    const base = baseSummary();
+    const out = applyIgnoreToSummary(base, ["aaaaaaaaaaaa"]);
+    const pan = out.groups.find((g) => g.hash === "aaaaaaaaaaaa");
+    expect(pan.ignored).toBe(true);
+    expect(out.byAction.pan.values).toMatchObject({ allowed: 1 });
+    expect(out.byAction.all.values.allowed).toBe(1);
+    // Unrelated rule stays put.
+    expect(out.byAction.email.values).toMatchObject({ redact: 1 });
+    // The base summary object itself was not mutated.
+    expect(base.groups[0].ignored).toBe(false);
+    expect(base.byAction.pan.values).not.toHaveProperty("allowed");
+  });
+
+  it("keeps a no-op-ignore summary equivalent and passes through null", () => {
+    const base = baseSummary();
+    const out = applyIgnoreToSummary(base, []);
+    expect(out).not.toBe(base);
+    expect(out.groups).toEqual(base.groups);
+    expect(out.byAction).toEqual(base.byAction);
+    expect(applyIgnoreToSummary(null)).toBeNull();
+  });
+
+  it("removing an ignore restores the worst action", () => {
+    const base = applyIgnoreToSummary(baseSummary(), ["aaaaaaaaaaaa"]);
+    const back = applyIgnoreToSummary(base, []);
+    expect(back.groups[0].ignored).toBe(false);
+    expect(back.byAction.pan.values.leaked).toBe(1);
   });
 });

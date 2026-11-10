@@ -187,3 +187,18 @@ describe("routing record reads", () => {
     expect((await loadEvents(from)).truncated).toBe(false);
   });
 });
+
+describe("summary cache ignore key", () => {
+  it("ignoring a value does not keep a stale allow state after the ignore flips", async () => {
+    const ts = new Date(Date.now() - 5000).toISOString();
+    await writeFile("/tmp/ev.jsonl", JSON.stringify({ ts, hits: [{ hash: "aaaaaaaaaaaa", rule: "r", action: "observe" }] }) + "\n");
+    settings.piiGuard.ignore = ["aaaaaaaaaaaa"];
+    const ignored = await (await GET(new Request("http://localhost/api/pii-guard"))).json();
+    expect(ignored.summary.groups[0].ignored).toBe(true);
+    expect((ignored.summary.byAction.r || ignored.summary.byAction.all).values.allowed).toBeGreaterThan(0);
+    settings.piiGuard.ignore = [];
+    const cleared = await (await GET(new Request("http://localhost/api/pii-guard"))).json();
+    expect(cleared.summary.groups[0].ignored).toBe(false);
+    expect((cleared.summary.byAction.r || cleared.summary.byAction.all).values.allowed).toBeUndefined();
+  });
+});

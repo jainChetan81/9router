@@ -14,10 +14,30 @@ export function routingByRequest(events) {
   return routing;
 }
 
+// Applies config.ignore onto an already-aggregated summary without re-scanning events.
+export function applyIgnoreToSummary(summary, ignore = []) {
+  if (!summary) return summary;
+  const ignored = new Set(Array.isArray(ignore) ? ignore : []);
+  const groups = (summary.groups || []).map((g) => {
+    const nextIgnored = ignored.has(g.hash);
+    return g.ignored === nextIgnored ? g : { ...g, ignored: nextIgnored };
+  });
+  const nextByAction = Object.create(null);
+  for (const [key, entry] of Object.entries(summary.byAction || {})) {
+    nextByAction[key] = { values: Object.create(null), requests: { ...(entry?.requests || {}) } };
+  }
+  const row = (key) => (nextByAction[key] ||= { values: Object.create(null), requests: Object.create(null) });
+  for (const g of groups) {
+    const action = g.ignored ? "allowed" : g.actions.includes("leaked") ? "leaked" : g.action;
+    for (const key of [g.rule, "all"]) row(key).values[action] = (row(key).values[action] || 0) + 1;
+  }
+  return { ...summary, groups, byAction: nextByAction };
+}
+
 // step/origin: bucket hits into a trend (ms per bucket, start of bucket 0). Off when step is not set.
-export function summarize(events, { since, until, now = Date.now(), ignore = [], step, origin } = {}) {
+export function summarize(events, { since, until, now = Date.now(), ignore = [], step, origin, routing: preRouting, times: preTimes, startIndex = 0 } = {}) {
   events = Array.isArray(events) ? events : [];
-  const routing = routingByRequest(events);
+  const routing = preRouting || routingByRequest(events);
   const sinceMs = Number.isFinite(since) ? since : now - DAY;
   const untilMs = Number.isFinite(until) ? until : now;
   const groups = new Map();
@@ -36,39 +56,43 @@ export function summarize(events, { since, until, now = Date.now(), ignore = [],
   let totalOcrEvents = 0;
   const recentOcr = [], reasons = Object.create(null);
 
-  for (const rawEvent of events) {
-    if (rawEvent?.kind === "routing") continue;
-    const event = { ...rawEvent, ...routing.get(rawEvent?.requestId) };
-    if (event?.type === "test" || event?.test === true) continue;
-    const ts = Date.parse(event?.ts);
+  for (let idx = Math.max(0, startIndex); idx < events.length; idx++) {
+    const rawEvent = events[idx];
+    if (!rawEvent || rawEvent.kind === "routing") continue;
+    if (rawEvent.type === "test" || rawEvent.test === true) continue;
+    const ts = preTimes ? preTimes[idx] : Date.parse(rawEvent.ts);
     if (!Number.isFinite(ts) || ts < sinceMs || ts > untilMs) continue;
-    if (event.type === "error") { errors24h += Number.isInteger(event.count) && event.count > 0 ? event.count : 1; continue; }
-    if (event.type === "stats") continue;
+    if (rawEvent.type === "error") { errors24h += Number.isInteger(rawEvent.count) && rawEvent.count > 0 ? rawEvent.count : 1; continue; }
+    if (rawEvent.type === "stats") continue;
 
-    if (event.type === "ocr") {
+    const route = typeof rawEvent.requestId === "string" ? routing.get(rawEvent.requestId) : undefined;
+    const evProvider = route ? route.provider : rawEvent.provider;
+    const evCombo = route && Object.hasOwn(route, "combo") ? route.combo : rawEvent.combo;
+
+    if (rawEvent.type === "ocr") {
       totalOcrEvents++;
-      if (event.reason) reasons[event.reason] = (reasons[event.reason] || 0) + 1;
-      recentOcr.push({ ts: event.ts, requestId: event.requestId, model: event.model, endpoint: event.endpoint, imageIndex: event.imageIndex, status: event.status, ...(event.reason && { reason: event.reason }), cache: event.cache, ocrMs: event.ocrMs, mode: event.mode, ...(typeof event.provider === "string" && event.provider && { provider: event.provider }), ...(typeof event.combo === "string" && event.combo && { combo: event.combo }), rules: [...new Set((Array.isArray(event.hits) ? event.hits : []).filter(hit => hit && hit.action !== "ignored").map(hit => hit.name || hit.rule).filter(Boolean))] });
+      if (rawEvent.reason) reasons[rawEvent.reason] = (reasons[rawEvent.reason] || 0) + 1;
+      recentOcr.push({ ts: rawEvent.ts, requestId: rawEvent.requestId, model: rawEvent.model, endpoint: rawEvent.endpoint, imageIndex: rawEvent.imageIndex, status: rawEvent.status, ...(rawEvent.reason && { reason: rawEvent.reason }), cache: rawEvent.cache, ocrMs: rawEvent.ocrMs, mode: rawEvent.mode, ...(typeof evProvider === "string" && evProvider && { provider: evProvider }), ...(typeof evCombo === "string" && evCombo && { combo: evCombo }), rules: [...new Set((Array.isArray(rawEvent.hits) ? rawEvent.hits : []).filter(hit => hit && hit.action !== "ignored").map(hit => hit.name || hit.rule).filter(Boolean))] });
       // Keep only the newest 20; trim in batches so a long range never holds every OCR event.
       if (recentOcr.length > 200) { recentOcr.sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts)); recentOcr.length = 20; }
-      if (Object.hasOwn(ocrStatus, event.status)) {
-        ocrStatus[event.status]++;
+      if (Object.hasOwn(ocrStatus, rawEvent.status)) {
+        ocrStatus[rawEvent.status]++;
       }
-      if (event.cache === "hit") cacheHit++;
-      else if (event.cache === "miss") {
+      if (rawEvent.cache === "hit") cacheHit++;
+      else if (rawEvent.cache === "miss") {
         cacheMiss++;
-        if (typeof event.ocrMs === "number") missOcrMs.push(event.ocrMs);
-      } else if (event.cache === "coalesced") cacheCoalesced++;
-      else if (event.cache === "none") cacheNone++;
+        if (typeof rawEvent.ocrMs === "number") missOcrMs.push(rawEvent.ocrMs);
+      } else if (rawEvent.cache === "coalesced") cacheCoalesced++;
+      else if (rawEvent.cache === "none") cacheNone++;
 
-      if (Array.isArray(event.hits) && event.hits.length > 0) {
+      if (Array.isArray(rawEvent.hits) && rawEvent.hits.length > 0) {
         imagesWithHits++;
       }
     } else {
       requests++;
     }
 
-    const raw = Array.isArray(event.hits) ? event.hits : Array.isArray(event.new) ? event.new : [];
+    const raw = Array.isArray(rawEvent.hits) ? rawEvent.hits : Array.isArray(rawEvent.new) ? rawEvent.new : [];
     const distinct = new Set();
     for (const hit of raw) {
       if (!hit || typeof hit.hash !== "string" || typeof hit.rule !== "string") continue;
@@ -94,44 +118,50 @@ export function summarize(events, { since, until, now = Date.now(), ignore = [],
       }
       let group = groups.get(key);
       if (!group) {
-        group = { hash: hit.hash, rule: hit.rule, name: hit.name, kind: hit.kind, sources: [], actions: [], action, actionTs: ts, leakedWhere: [], firstSeen: event.ts, lastSeen: event.ts, turns: new Set(), ignored: false };
+        group = { hash: hit.hash, rule: hit.rule, name: hit.name, kind: hit.kind, sources: [], actions: [], action, actionTs: ts, leakedWhere: [], firstSeen: rawEvent.ts, lastSeen: rawEvent.ts, firstMs: ts, lastMs: ts, turns: new Set(), ignored: false };
         groups.set(key, group);
       }
-      if (ts >= Date.parse(group.lastSeen)) { if (typeof event.ua === "string") group.ua = event.ua.slice(0, 80); if (typeof event.model === "string") group.model = event.model.slice(0, 80); // Latest event wins, even absent: a mixed session clears a stale provider/combo.
-        group.provider = typeof event.provider === "string" && event.provider ? event.provider.slice(0, 80) : null;
-        group.combo = typeof event.combo === "string" && event.combo ? event.combo.slice(0, 80) : null; }
+      const isLatest = ts >= group.lastMs;
+      if (isLatest) {
+        if (typeof rawEvent.ua === "string") group.ua = rawEvent.ua.slice(0, 80);
+        if (typeof rawEvent.model === "string") group.model = rawEvent.model.slice(0, 80); // Latest event wins, even absent: a mixed session clears a stale provider/combo.
+        group.provider = typeof evProvider === "string" && evProvider ? evProvider.slice(0, 80) : null;
+        group.combo = typeof evCombo === "string" && evCombo ? evCombo.slice(0, 80) : null;
+      }
       if (!group.name && hit.name) group.name = hit.name;
       if (!group.kind && hit.kind) group.kind = hit.kind;
       if (!group.sources.includes(source)) group.sources.push(source);
       if (!group.actions.includes(action)) group.actions.push(action);
       if (ts > group.actionTs || (ts === group.actionTs && RANK[action] < RANK[group.action])) { group.action = action; group.actionTs = ts; }
       if (action === "leaked" && typeof hit.where === "string" && !group.leakedWhere.includes(hit.where)) group.leakedWhere.push(hit.where);
-      if (ts < Date.parse(group.firstSeen)) group.firstSeen = event.ts;
-      if (ts > Date.parse(group.lastSeen)) group.lastSeen = event.ts;
-      const turnKey = event.requestId || (event.type === "ocr" ? null : event.ts);
+      if (ts < group.firstMs) { group.firstMs = ts; group.firstSeen = rawEvent.ts; }
+      if (ts > group.lastMs) { group.lastMs = ts; group.lastSeen = rawEvent.ts; }
+      const turnKey = rawEvent.requestId || (rawEvent.type === "ocr" ? null : rawEvent.ts);
       if (turnKey) {
         group.turns.add(turnKey);
       } else if (group.turns.size === 0) {
-        group.turns.add(event.ts);
+        group.turns.add(rawEvent.ts);
       }
       if (action === "leaked") leaked.add(hit.hash);
       // Only a hit that was itself blocked counts; event.blocked lists rule names, not values.
       if (action === "block") blocked.add(hit.hash);
       if (turnKey) for (const k of [hit.rule, "all"]) ((ruleTurns[k] ||= Object.create(null))[action] ||= new Set()).add(turnKey);
       if (typeof hit.preview === "string") { group.preview = hit.preview; if (typeof hit.context === "string") group.context = hit.context; }
-      if (event.requestId && ts >= Date.parse(group.lastSeen)) { group.requestId = event.requestId; if (typeof event.sessionId === "string") group.sessionId = event.sessionId.slice(0, 200); }
-      if (event.type === "ocr" && typeof event.sha256Prefix === "string" && ts >= Date.parse(group.lastSeen)) { group.image = event.sha256Prefix; group.imageIndex = event.imageIndex; }
+      if (rawEvent.requestId && isLatest) { group.requestId = rawEvent.requestId; if (typeof rawEvent.sessionId === "string") group.sessionId = rawEvent.sessionId.slice(0, 200); }
+      if (rawEvent.type === "ocr" && typeof rawEvent.sha256Prefix === "string" && isLatest) { group.image = rawEvent.sha256Prefix; group.imageIndex = rawEvent.imageIndex; }
     }
   }
 
   const ignored = new Set(Array.isArray(ignore) ? ignore : []);
-  const outputGroups = [...groups.values()].map(({ actionTs, ...group }) => ({
-    ...group,
-    turns: group.turns.size,
-    ignored: ignored.has(group.hash),
-    sources: group.sources.sort(),
-    actions: group.actions.sort(),
-  })).sort((a, b) => Date.parse(b.lastSeen) - Date.parse(a.lastSeen));
+  const outputGroups = [...groups.values()]
+    .sort((a, b) => b.lastMs - a.lastMs)
+    .map(({ actionTs, firstMs, lastMs, ...group }) => ({
+      ...group,
+      turns: group.turns.size,
+      ignored: ignored.has(group.hash),
+      sources: group.sources.sort(),
+      actions: group.actions.sort(),
+    }));
   const ruleWarnings = Object.create(null);
   for (const [rule, hits] of Object.entries(ruleHits)) {
     const share = hits ? (ruleStuck[rule] || 0) / hits : 0;
