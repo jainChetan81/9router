@@ -120,6 +120,13 @@ export async function updateSettings(updates) {
     const row = db.get(`SELECT data FROM settings WHERE id = 1`);
     const current = row ? parseJson(row.data, {}) : {};
     next = { ...current, ...updates };
+    // Merge nested PII Guard objects so a partial write never resets mode, rules or OCR.
+    if (updates.piiGuard && current.piiGuard && typeof current.piiGuard === "object") {
+      const cur = current.piiGuard, up = updates.piiGuard;
+      next.piiGuard = { ...cur, ...up };
+      if (up.rules !== undefined || cur.rules) next.piiGuard.rules = up.rules !== undefined ? up.rules : cur.rules;
+      if (cur.ocr || up.ocr) next.piiGuard.ocr = { ...(cur.ocr || {}), ...(up.ocr || {}) };
+    }
     db.run(
       `INSERT INTO settings(id, data) VALUES(1, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data`,
       [stringifyJson(next)],

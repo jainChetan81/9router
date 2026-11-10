@@ -43,6 +43,10 @@ export async function PATCH(request) {
       return NextResponse.json({ error: "Use /api/settings/model-effort to update model effort settings" }, { status: 400 });
     }
 
+    if (Object.prototype.hasOwnProperty.call(body, "piiGuard")) {
+      return NextResponse.json({ error: "Use /api/pii-guard to update PII Guard settings" }, { status: 400 });
+    }
+
     // Strip protected secrets before any internal handling sets them
     for (const key of PROTECTED_SETTING_KEYS) delete body[key];
 
