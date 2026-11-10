@@ -183,4 +183,12 @@ describe("session helpers", () => {
     expect(collapseDefault("assistant", "text", "1\n2\n3\n4\n5\n6\n7")).toBe(true);
     expect(PROSE_LINES).toBe(6);
   });
+
+  it("labels a recent image group newest first", () => {
+    const now = Date.now(), ts = (ms) => new Date(now - ms).toISOString();
+    const recent = [{ ts: ts(28e3), model: "m", status: "ok", rules: [] }, { ts: ts(90e3), model: "m", status: "ok", rules: [] }];
+    const v = view(base({ summary: { groups: [], trend: [], ocr: { recent } } }), { ...ui, tab: "health" });
+    expect(v.imgGroups[0].when).toBe("28s–1m ago");
+    expect(v.imgGroups[0].count).toBe("2 images");
+  });
 });

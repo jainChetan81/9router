@@ -536,6 +536,11 @@ export function buildView({ data, ui, set, act, range, fit, test, events, sample
   const ocrStats = [["Images scanned", fmt(so.totalImages), `${fmt(so.imagesWithHits)} with hits`], ["Read OK", fmt(st.scanned), `${fmt(st.partial)} partial · ${fmt(st.empty)} empty · ${fmt(st.skipped)} skipped`],
     ["Cache hit rate", Math.round((so.cacheHitRate || 0) * 100) + "%", `${fmt(so.cache?.hit)} hit · ${fmt(so.cache?.miss)} miss`], ["OCR latency", so.p95OcrMs ? `p95 ${fmt(so.p95OcrMs)} ms` : "—", "on cache misses"],
     ["Queue", `max ${ocr.queueMax || 32}`, `concurrency ${ocr.concurrency || 1} · overflow ${fmt(so.reasons?.queue_full)} in ${rangeShort}`, so.reasons?.queue_full ? "var(--amber)" : null]].map(([label, value, sub, c]) => ({ label, value, sub, c: c || "var(--tx)" }));
+  // Newest first: "28s–1m ago". One label when both ends round to the same age.
+  const imgSpan = (newest, oldest) => {
+    const a = age(newest), b = age(oldest);
+    return a === b ? a : `${a.replace(" ago", "")}–${b}`;
+  };
   const imgGroups = [];
   for (const r of so.recent || []) {
     const hit = r.rules?.length > 0, kind = r.status === "skipped" ? "skipped" : hit ? "hit" : "no hits";
@@ -602,7 +607,7 @@ export function buildView({ data, ui, set, act, range, fit, test, events, sample
     ocrNote: ocrOn ? `${cap(ocrCfg.mode || "observe")} · ${ocrCfg.quality || "basic"} quality` : "OCR not enabled",
     imgGroups: imgGroups.map((g) => ({ model: g.model, count: `${g.n} ${g.n === 1 ? "image" : "images"}`, status: g.kind === "hit" ? `${g.rules.length} ${g.rules.length === 1 ? "hit" : "hits"}` : g.kind,
       detail: g.kind === "hit" ? g.rules.join(", ") : g.kind === "skipped" ? (g.reason || "skipped").replace(/_/g, " ") : `${g.cache === "hit" ? "from cache" : "scanned"} · ${g.mode || "basic"}`,
-      when: g.n > 1 && g.oldest !== g.newest ? `${age(g.oldest).replace(" ago", "")}–${age(g.newest)}` : age(g.newest),
+      when: imgSpan(g.newest, g.oldest),
       bg: g.kind === "hit" ? "var(--redbg)" : g.kind === "skipped" ? "var(--amberbg)" : "var(--greenbg)", c: g.kind === "hit" ? "var(--red)" : g.kind === "skipped" ? "var(--amber)" : "var(--green)" })),
     noImgGroups: imgGroups.length === 0,
     fit,
