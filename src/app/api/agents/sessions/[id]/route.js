@@ -18,6 +18,9 @@ export async function GET(request, { params }) {
     const detail = await getSessionDetail(db, decodedId);
     return NextResponse.json(detail, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
+    if (error?.code === "busy" || error?.status === 503) {
+      return NextResponse.json({ error: "busy" }, { status: 503, headers: { "Retry-After": "1", "Cache-Control": "no-store" } });
+    }
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 }
