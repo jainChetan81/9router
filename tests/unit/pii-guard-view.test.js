@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildView, buildPromptFilterKey, buildPromptRequestKey, canLandOnPrompt, sessionForOpenPrompt, PAGE } from "../../src/app/(dashboard)/dashboard/pii-guard/view.js";
+import { buildView, effectiveConfig, isRefreshingState, buildPromptFilterKey, buildPromptRequestKey, canLandOnPrompt, sessionForOpenPrompt, PAGE, sortSessions, findingMarkers, groupMessages, toolFormat, collapseDefault, PROSE_LINES } from "../../src/app/(dashboard)/dashboard/pii-guard/view.js";
 
 const ui = { tab: "findings", view: "value", q: "", fGroup: "", fAction: "", fClient: "", fModel: "", fSource: "", sel: {}, page: 0, leakPage: 0, testKind: "text", testText: "", imgSel: 0 };
 const base = (over = {}) => ({
@@ -95,5 +95,92 @@ describe("prompt session choice", () => {
 
   it("keeps the finding session fallback only when no prompt row is involved", () => {
     expect(sessionForOpenPrompt("", "", "finding-session")).toBe("finding-session");
+  });
+});
+
+describe("effectiveConfig and isRefreshingState", () => {
+  it("applies pending optimistic ops over the saved config", () => {
+    const saved = { mode: "observe", rules: { pan: "redact" }, ocr: { quality: "basic", mode: "observe" } };
+    const out = effectiveConfig(saved, {
+      "mode:global": { optimistic: { mode: "redact" } },
+      "rule:email": { optimistic: { rules: { email: "block" } } },
+      "rule:pan": { optimistic: { rules: { pan: "default" } } },
+      "ocr:quality": { optimistic: { ocr: { quality: "enhanced" } } },
+      "noop": { optimistic: null },
+    });
+    expect(out.mode).toBe("redact");
+    expect(out.rules).toEqual({ email: "block" });
+    expect(out.ocr).toEqual({ quality: "enhanced", mode: "observe" });
+    expect(out.configKeyIfAny).toBeUndefined();
+    expect(effectiveConfig(saved).rules).toEqual({ pan: "redact" });
+    expect(effectiveConfig().mode).toBe("observe");
+  });
+
+  it("shows Updating… only for range, save, and manual loads with data present", () => {
+    const withData = { hasData: true, mode: "loading", refreshReason: "range" };
+    expect(isRefreshingState(withData)).toBe(true);
+    expect(isRefreshingState({ hasData: true, mode: "ready", refreshReason: "manual" })).toBe(true);
+    // Silent 30s poll and other reasons never show the indicator.
+    expect(isRefreshingState({ hasData: true, mode: "loading", refreshReason: "poll" })).toBe(false);
+    expect(isRefreshingState({ hasData: true, mode: "error", refreshReason: "manual" })).toBe(false);
+    expect(isRefreshingState({ hasData: false, mode: "loading", refreshReason: "range" })).toBe(false);
+  });
+});
+
+describe("session helpers", () => {
+  const rows = [
+    { sessionId: "s2", last: 200, first: 150, requests: 4, values: 2, client: "a" },
+    { sessionId: "s1", last: 300, first: 100, requests: 1, values: 5, client: "b" },
+    { sessionId: "s3", last: 100, first: 300, requests: 9, values: 1, client: "c" },
+  ];
+  it("sortSessions orders by the chosen key with last desc by default", () => {
+    expect(sortSessions(rows).map((r) => r.sessionId)).toEqual(["s1", "s2", "s3"]);
+    expect(sortSessions(rows, "first", false).map((r) => r.sessionId)).toEqual(["s1", "s2", "s3"]);
+    expect(sortSessions(rows, "requests").map((r) => r.sessionId)).toEqual(["s3", "s2", "s1"]);
+    expect(sortSessions(rows, "values", false).map((r) => r.sessionId)).toEqual(["s3", "s2", "s1"]);
+    expect(sortSessions([], "values")).toEqual([]);
+  });
+  it("groupMessages orders request groups by first stored appearance and numbers them 1..n", () => {
+    const rows = [
+      { id: 1, ts: 100, requestId: "r2", role: "user", kind: "text", values: [] },
+      { id: 2, ts: 110, requestId: "r2", role: "assistant", kind: "text", values: [] },
+      { id: 3, ts: 120, requestId: "r1", role: "user", kind: "text", values: [] },
+    ];
+    const groups = groupMessages(rows);
+    expect(groups.map((g) => g.requestId)).toEqual(["r2", "r1"]);
+    expect(groups.map((g) => g.n)).toEqual([1, 2]);
+    expect(groups[0].messages.map((m) => m.id)).toEqual([1, 2]);
+    expect(rows.map((r) => r._index)).toEqual([0, 1, 2]); // one index across groups, shared with findingMarkers;
+  });
+  it("findingMarkers emits one marker per value per message in stored order", () => {
+    const flat = [
+      { id: 1, _index: 0, values: [] },
+      { id: 2, _index: 1, values: ["h1", "h2"] },
+      { id: 3, _index: 2, values: ["h3"] },
+      { id: 4, _index: 3, values: ["h1", "h2"] },
+    ];
+    const markers = findingMarkers(flat);
+    expect(markers.map((m) => [m.id, m.value])).toEqual([["2", "h1"], ["2", "h2"], ["3", "h3"], ["4", "h1"], ["4", "h2"]]);
+    expect(markers.map((m) => m.seq)).toEqual([0, 1, 2, 3, 4]);
+    expect(markers[1].n).toBe(2);
+    expect(findingMarkers([{ id: 9, _index: 0, values: [] }])).toEqual([]);
+  });
+  it("toolFormat turns Bash into code, parsed args into fields, and falls back on garbage", () => {
+    expect(toolFormat("Bash", 'Bash {"command":"npm test"}')).toEqual({ kind: "command", command: "npm test" });
+    const fields = toolFormat("Write", 'Write {"file_path":"/tmp/a","content":"x"}');
+    expect(fields.kind).toBe("fields");
+    expect(fields.fields).toEqual([
+      { key: "file_path", value: "/tmp/a" },
+      { key: "content", value: "x" },
+    ]);
+    expect(toolFormat("Tool", "Tool [1,2")).toEqual({ kind: "text", text: "[1,2" });
+    expect(toolFormat("Tool", "")).toEqual({ kind: "text", text: "Cannot format arguments" });
+  });
+  it("collapseDefault collapses tools, system messages, and prose beyond the line budget", () => {
+    expect(collapseDefault("user", "tool_use", "")).toBe(true);
+    expect(collapseDefault("system", "text", "")).toBe(true);
+    expect(collapseDefault("assistant", "text", "one\ntwo\nthree")).toBe(false);
+    expect(collapseDefault("assistant", "text", "1\n2\n3\n4\n5\n6\n7")).toBe(true);
+    expect(PROSE_LINES).toBe(6);
   });
 });
