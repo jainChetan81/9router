@@ -45,7 +45,7 @@ const short = (m) => SHORT[m] || m;
 export function buildView({ data, quota, ui, set, fit, range, feeRefs, saveFees, feeSave }) {
   const { totals, bars, groups: G, fees, subsMeta } = data;
   const preset = range.preset, hourly = data.range.hourly, dayCount = data.range.days;
-  const feeSaving = feeSave?.state === "saving", feeSaved = feeSave?.state === "saved", feeError = feeSave?.state === "error" ? feeSave.msg : "";
+  const feeSaving = feeSave?.state === "saving", feeSaved = feeSave?.state === "saved", feeSaveError = feeSave?.state === "error" ? feeSave.msg : "";
   const setFeeSaveIdle = () => { if (feeSave?.reset) feeSave.reset(); };
   const loggedLabel = data.loggedSinceLabel || "today";
   const past = bars.filter((b) => !b.future);
@@ -247,7 +247,7 @@ export function buildView({ data, quota, ui, set, fit, range, feeRefs, saveFees,
     startEdit: () => { set({ editing: true, draft: { ...fees } }); setFeeSaveIdle(); },
     cancelEdit: () => { set({ editing: false, draft: null }); setFeeSaveIdle(); },
     saveEdit: saveFees,
-    feeSaving, feeSaved, feeError,
+    feeSaving, feeSaved, feeError: feeSaveError,
     feesOk: !ui.editing || Object.values(ui.draft || {}).every((x) => !feeError(x)),
     groups, groupHead, rows, rankBtns, outliers: outl, noOutliers: outl.length === 0, topDays, topDaysTitle: hourly ? "TOP 5 HOURS" : "TOP 5 DAYS", ag,
     aWpx: Math.max(260, fit.aW - 44) + "px", detCols: fit.aW < 640 ? "minmax(0,1fr)" : "minmax(0,1fr) minmax(0,1fr)",
