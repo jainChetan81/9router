@@ -3,7 +3,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import RangeBar from "./RangeBar";
-import PageHeader from "./PageHeader";
 import QuotaRunway from "./QuotaRunway";
 import BreakdownDrill from "./BreakdownDrill";
 import RoutingMap from "./RoutingMap";
@@ -137,7 +136,6 @@ export default function SpendClient() {
     <div data-r9={theme} style={{ display: "flex", flexDirection: "column", minHeight: minH, backgroundColor: "var(--bg)", backgroundImage: "linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px)", backgroundSize: "44px 44px", color: "var(--tx)", fontFamily: "system-ui,-apple-system,'Segoe UI',sans-serif", fontSize: "13px", lineHeight: "1.4" }}>
       <div style={{ display: "flex", alignItems: "stretch", flex: "1" }}>
       <main style={{ flex: "1", minWidth: "0", display: "flex", flexDirection: "column" }}>
-        <PageHeader title="Spend" subtitle="Track real spend, subscription value, and usage." icon="payments" />
         {(s.range) && (<>
           <div className="r9-spend-range" style={{ position: "sticky", top: "0", zIndex: "30", display: "flex", justifyContent: "space-between", alignItems: "center", gap: "12px", flexWrap: "wrap", padding: "8px 24px", background: "var(--bg)", borderBottom: "1px solid var(--line)" }}>
             <div style={{ display: "flex", alignItems: "baseline", gap: "8px" }}><span style={{ fontWeight: "600" }}>{rangeTitle}</span><span style={{ color: "var(--tx3)", fontSize: "12px" }}>{rangeSub}</span></div>
