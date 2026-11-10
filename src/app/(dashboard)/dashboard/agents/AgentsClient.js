@@ -237,6 +237,8 @@ export default function AgentsClient() {
         setAnalytics(hit.data.a);
         setMode("ready");
         if (isFresh(hit, RANGE_TTL)) { setRangeBusy(false); return; }
+      } else {
+        setMoreCursor(null); // the old range's cursor must not page the new range
       }
     }
     if (!background) setRangeBusy(true); // the 30 s refresh stays silent
@@ -350,7 +352,7 @@ export default function AgentsClient() {
   }, [ui.tab, sel, selLive, loadDetail]);
 
   const loadMore = useCallback(async () => {
-    if (!moreCursor || moreBusy) return;
+    if (!moreCursor || moreBusy || rangeBusy) return;
     setMoreBusy(true);
     try {
       const q = new URLSearchParams({ preset: range.preset, cursor: moreCursor });
@@ -364,7 +366,7 @@ export default function AgentsClient() {
     } catch (error) {
       setToast(error.message || "Unable to load more sessions.");
     } finally { setMoreBusy(false); }
-  }, [moreCursor, moreBusy, range]);
+  }, [moreCursor, moreBusy, rangeBusy, range]);
 
   // Prime the mode once live answers arrive.
   useEffect(() => {

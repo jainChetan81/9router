@@ -8,7 +8,7 @@ import { applyIgnoreToSummary } from "@/lib/piiGuard/summary";
 import { buildView, isRefreshingState, place, PAGE, buildPromptFilterKey, buildPromptRequestKey, canLandOnPrompt, buildSessionFilterKey, buildSessionRequestKey, findingMarkers, groupMessages, toolFormat, collapseDefault, PROSE_LINES, ALABEL, stamp, age } from "./view";
 import "../spend/spend.css";
 import RefreshBar from "../spend/RefreshBar";
-import { cacheGet, cacheSet } from "@/lib/clientCache";
+import { cacheGet, cacheSet, cacheInvalidate } from "@/lib/clientCache";
 
 const summaryKey = (rk) => `/api/pii-guard?range=${rk}`;
 
@@ -203,6 +203,7 @@ export default function PiiGuardClient() {
     // First load or new range: show the cached summary at once, then revalidate.
     const hit = reason === "range" || reason === "initial" ? cacheGet(summaryKey(rangeKey)) : null;
     if (hit) { loadedKeyRef.current = rangeKey; setLoadedSummary({ key: rangeKey, data: hit.data }); setMode("ready"); }
+    else if (reason === "range") setLoadedSummary((prev) => (prev.key === rangeKey ? prev : { key: null, data: null })); // never show another range's data
     setRefreshReason(reason);
     const { from, to } = bounds(range);
     try {
@@ -353,6 +354,7 @@ export default function PiiGuardClient() {
     try {
       const res = await call("/api/pii-guard", body);
       ok = true;
+      cacheInvalidate("/api/pii-guard?"); // settings changed: cached summaries hold the old config
       if (dataRef.current && res?.config) {
         const nextConfig = res.config;
         setLoadedSummary((prev) => {
