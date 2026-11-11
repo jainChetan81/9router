@@ -7,6 +7,17 @@
   - Ignore list by value hash, persistent seen hashes, and scanner error counts.
   - Chat, embeddings, image generation and web search are scanned.
   - Dashboard: summary and health cards, per-rule hits and warnings, findings grouped by value with filters; signed thinking is labeled `assistant/thinking`.
+- **Agents**: in-flight requests on the Live view, with start and first-token marks (OpenAI, Claude, Responses, Gemini, Ollama and Kiro streams).
+- **Agents**: one batch request for session overrides (`GET /api/agents/overrides?ids=…`), and "Load 100 more" paging for sessions.
+- **Spend**: spending clock (IST weekday × hour, cost or requests) and a read-only what-if estimate for moving a combo or model to another priced model.
+- **Usage**: successful zero-token requests, `/v1/search` and `/v1/audio/transcriptions` now write usage rows.
+- **Dashboard**: installable as a phone app (PNG and maskable icons, service worker registration, iOS home screen metadata).
+
+## Fixes
+- **PII guard**: the Every hit view no longer crashes (`buildView()` read the new `{ rows, sessionRows }` events shape as an array).
+- **Agents**: phone layout for session rows and role details; Mode control height; short custom range label.
+- **Spend**: the range bar scrolls inside its row on phones instead of running past the screen.
+- **Tests**: unit tests use a temporary `DATA_DIR`, so they no longer write rows to the live database.
 
 # v0.5.116 (2026-11-08)
 

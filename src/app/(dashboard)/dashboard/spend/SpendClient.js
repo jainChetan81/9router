@@ -171,7 +171,7 @@ export default function SpendClient() {
         {(s.range) && (<>
           <div className="r9-spend-range" style={{ position: "sticky", top: "0", zIndex: "30", display: "flex", justifyContent: "space-between", alignItems: "center", gap: "12px", flexWrap: "wrap", padding: "8px 24px", background: "var(--bg)", borderBottom: "1px solid var(--line)" }}>
             <div style={{ display: "flex", alignItems: "baseline", gap: "8px" }}><span style={{ fontWeight: "600" }}>{rangeTitle}</span><span style={{ color: "var(--tx3)", fontSize: "12px" }}>{rangeSub}</span></div>
-            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+            <div className="r9-spend-range-controls" style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", minWidth: 0, maxWidth: "100%" }}>
               <RangeBar preset={preset} customLabel={customLabel} onChange={onRange} today={todayKey} />
               {(loadedAt > 0) && (<span className="r9-spend-refreshing" title={new Date(loadedAt).toLocaleString()} style={{ fontSize: "11.5px", color: "var(--tx3)", whiteSpace: "nowrap" }}>{refreshing ? "Refreshing…" : updatedAgo(loadedAt, nowTick)}</span>)}
               <SyncButton sync={autoSync} busy={refreshing} />
