@@ -266,24 +266,24 @@ export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, 
     // Each physical upstream call writes its own row, including fusion panels and judge.
     // The shared success flag only blocks a later abort/failure row for the logical request.
     markLogicalSuccess(clientRawRequest);
-    if (!tokens || typeof tokens !== "object") return Promise.resolve(false);
+    const safeTokens = tokens && typeof tokens === "object" && !Array.isArray(tokens) ? tokens : {};
 
-    const inTokens = tokens.input_tokens ?? tokens.prompt_tokens ?? 0;
-    const outTokens = tokens.output_tokens ?? tokens.completion_tokens ?? 0;
-
-    if (inTokens === 0 && outTokens === 0) return Promise.resolve(false);
+    const rawIn = safeTokens.input_tokens ?? safeTokens.prompt_tokens;
+    const rawOut = safeTokens.output_tokens ?? safeTokens.completion_tokens;
+    const inTokens = Number.isFinite(Number(rawIn)) ? Number(rawIn) : 0;
+    const outTokens = Number.isFinite(Number(rawOut)) ? Number(rawOut) : 0;
 
     if (!silent) {
       const time = new Date().toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
       const accountSuffix = connectionId ? ` | account=${connectionId.slice(0, 8)}...` : "";
-      console.log(`${COLORS.green}[${time}] 📊 [${label}] ${provider.toUpperCase()} | in=${inTokens} | out=${outTokens}${accountSuffix}${COLORS.reset}`);
+      console.log(`${COLORS.green}[${time}] 📊 [${label}] ${(provider || "unknown").toUpperCase()} | in=${inTokens} | out=${outTokens}${accountSuffix}${COLORS.reset}`);
     }
 
     // Canonicalize to one storage convention (prompt_tokens cache-inclusive) so
     // cached/cache-creation tokens survive to cost calc + stats. See canonicalizeUsage.
-    const normalized = canonicalizeUsage(tokens) || {
-      prompt_tokens: tokens.prompt_tokens ?? tokens.input_tokens ?? 0,
-      completion_tokens: tokens.completion_tokens ?? tokens.output_tokens ?? 0
+    const normalized = canonicalizeUsage(safeTokens) || {
+      prompt_tokens: inTokens,
+      completion_tokens: outTokens
     };
     const usageLatency = latency || buildUsageLatency(clientRawRequest, {
       stream: clientRawRequest?.body?.stream === true,
@@ -297,7 +297,8 @@ export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, 
       connectionId: connectionId || undefined,
       apiKey: apiKey || undefined,
       endpoint: endpoint || null,
-      meta: spendMeta(clientRawRequest, tokens, { latency: usageLatency, status: "ok", tools })
+      status: "ok",
+      meta: spendMeta(clientRawRequest, safeTokens, { latency: usageLatency, status: "ok", tools })
     })).then(() => true, () => false);
   } catch {
     return Promise.resolve(false);

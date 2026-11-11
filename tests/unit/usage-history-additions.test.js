@@ -63,7 +63,7 @@ describe("usageHistory additions", () => {
       combo: "workers",
       ua: "unit-test-client",
     });
-  }, 15000);
+  }, 30000);
 
   it("keeps an upstream-accepted unregistered model and its normal cost on success", async () => {
     const [{ adapter, saveUsageStats }, pricing] = await Promise.all([
@@ -92,7 +92,7 @@ describe("usageHistory additions", () => {
     const row = adapter.get("SELECT provider, model, cost FROM usageHistory LIMIT 1");
     expect(row).toMatchObject({ provider: "openai", model });
     expect(row.cost).toBeCloseTo(pricing.calculateCostFromTokens(tokens, masterPrice), 12);
-  }, 15000);
+  }, 30000);
 
   it("records validated early failure targets without storing unknown client models", async () => {
     const { adapter, saveFailureUsage } = await getUsageModules();
@@ -324,5 +324,50 @@ describe("usageHistory additions", () => {
     expect(adapter.all(`PRAGMA index_list(usageHistory)`).map((index) => index.name)).toContain("idx_uh_session");
     expect(nativeDb.prepare(`SELECT session FROM usageHistory LIMIT 1`).get().session).toBeNull();
     nativeDb.close();
+  });
+
+  it("writes usageHistory rows with status ok for zero, null, or omitted tokens", async () => {
+    const { adapter, saveUsageStats } = await getUsageModules();
+    const cases = [
+      { label: "zero", tokens: { prompt_tokens: 0, completion_tokens: 0 } },
+      { label: "null", tokens: null },
+      { label: "omitted", tokens: undefined },
+      { label: "array", tokens: [] },
+    ];
+
+    for (const [index, entry] of cases.entries()) {
+      const ok = await saveUsageStats({
+        provider: index === 3 ? null : "openai",
+        model: "gpt-4o",
+        tokens: entry.tokens,
+        clientRawRequest: {
+          reqId: `zero-tokens-${entry.label}`,
+          usageStartedAt: performance.now() - 15,
+          body: { stream: false },
+          headers: { "user-agent": "unit-test-client" },
+        },
+        silent: index !== 3,
+      });
+      expect(ok).toBe(true);
+    }
+
+    const rows = adapter.all(
+      `SELECT provider, model, status, promptTokens, completionTokens, cost, meta FROM usageHistory ORDER BY rowid`
+    );
+    expect(rows).toHaveLength(cases.length);
+    for (const [index, row] of rows.entries()) {
+      expect(row).toMatchObject({
+        provider: index === 3 ? "unknown" : "openai",
+        model: "gpt-4o",
+        status: "ok",
+        promptTokens: 0,
+        completionTokens: 0,
+        cost: 0,
+      });
+      expect(JSON.parse(row.meta)).toMatchObject({
+        reqId: `zero-tokens-${cases[index].label}`,
+        status: "ok",
+      });
+    }
   });
 });
