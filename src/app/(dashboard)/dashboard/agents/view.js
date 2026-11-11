@@ -580,13 +580,14 @@ export function buildView({ live, sessions, totalSessions, detail, detailsBySess
 function kidOfAll(list) { const tops = new Set(list.filter((s) => !s.parent).map((s) => s.session)); return list.filter((s) => s.parent && tops.has(s.parent.session || s.parent)).length; }
 function latestModel(a) { const rs = a.requests || []; return rs.length ? rs[rs.length - 1].model : null; }
 // A33: short custom chip text ("Nov 5–8"), not "5 – / Nov" wrapping at 390px.
-function shortRange(range) {
+export function shortRange(range) {
   if (!range || range.preset !== "Custom" || !range.from || !range.to) return "Custom";
   const f = new Date(range.from), t = new Date(range.to);
   if (Number.isNaN(+f) || Number.isNaN(+t)) return "Custom";
-  const fm = f.toLocaleDateString("en-US", { month: "short", timeZone: IST });
-  const tm = t.toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: IST });
-  return Number.isNaN(+f) ? "Custom" : fm === t.toLocaleDateString("en-US", { month: "short", timeZone: IST }) && f.getUTCDate() === t.getUTCDate() - 1
-    ? `${fm} ${f.toLocaleDateString("en-US", { day: "numeric", timeZone: IST })}–${t.toLocaleDateString("en-US", { day: "numeric", timeZone: IST })}`
-    : `${fm} ${f.toLocaleDateString("en-US", { day: "numeric", timeZone: IST })}–${tm}`;
+  // Short form in IST: "Nov 5–8", or "Oct 30–Nov 2" across months (A33).
+  const part = (d, o) => d.toLocaleDateString("en-US", { ...o, timeZone: IST });
+  const fm = part(f, { month: "short" }), tm = part(t, { month: "short" });
+  const fd = part(f, { day: "numeric" }), td = part(t, { day: "numeric" });
+  if (fm === tm && fd === td) return `${fm} ${fd}`;
+  return fm === tm ? `${fm} ${fd}–${td}` : `${fm} ${fd}–${tm} ${td}`;
 }

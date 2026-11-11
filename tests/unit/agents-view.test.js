@@ -306,3 +306,13 @@ describe("roundShares", () => {
     expect(roundShares([0.5, 0.25, 0.25]).reduce((a, x) => a + x, 0)).toBe(100);
   });
 });
+
+import { shortRange } from "../../src/app/(dashboard)/dashboard/agents/view.js";
+describe("shortRange (A33)", () => {
+  it("uses the short IST form", () => {
+    expect(shortRange({ preset: "Custom", from: "2026-11-04T18:30:00Z", to: "2026-11-07T18:30:00Z" })).toBe("Nov 5–8");
+    expect(shortRange({ preset: "Custom", from: "2026-10-29T18:30:00Z", to: "2026-11-01T18:30:00Z" })).toBe("Oct 30–Nov 2");
+    expect(shortRange({ preset: "Custom", from: "2026-11-04T18:30:00Z", to: "2026-11-04T20:30:00Z" })).toBe("Nov 5");
+    expect(shortRange({ preset: "7D" })).toBe("Custom");
+  });
+});
