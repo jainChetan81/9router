@@ -85,6 +85,45 @@ describe("sticky round-robin combo", () => {
     expect(getStickyComboModel("rr", "concurrent", models)).toBe("p/b");
   });
 
+  it("keeps a newer fallback pin when another request exhausts its failover", async () => {
+    const pendingA = [];
+    let allRequestsEntered;
+    let bRequests = 0;
+    const bothRequestsEntered = new Promise((resolve) => { allRequestsEntered = resolve; });
+    setStickyComboModel("rr", "concurrent-failover", "p/a");
+    const run = () => handleComboChat({
+      body: { messages: [{ role: "user", content: "hi" }] },
+      models,
+      handleSingleModel: async (_body, model) => {
+        if (model === "p/a") {
+          return new Promise((resolve) => {
+            pendingA.push(resolve);
+            if (pendingA.length === 2) allRequestsEntered();
+          });
+        }
+        bRequests += 1;
+        return response(bRequests === 1);
+      },
+      log,
+      comboName: "rr",
+      comboStrategy: "round-robin",
+      sessionId: "concurrent-failover",
+    });
+
+    const earlier = run();
+    const later = run();
+    await bothRequestsEntered;
+    expect(pendingA).toHaveLength(2);
+
+    pendingA[0](response(false));
+    expect((await earlier).ok).toBe(true);
+    expect(getStickyComboModel("rr", "concurrent-failover", models)).toBe("p/b");
+
+    pendingA[1](response(false));
+    expect((await later).status).toBe(500);
+    expect(getStickyComboModel("rr", "concurrent-failover", models)).toBe("p/b");
+  });
+
   it("rotates per request without a session id or when disabled", async () => {
     expect((await first(null))[0]).toBe("p/a");
     expect((await first(null))[0]).toBe("p/b");
