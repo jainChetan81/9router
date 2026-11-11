@@ -146,16 +146,18 @@ export default function AgentsClient() {
     if (now - lastOverridePoll.current < 10000) return;
     lastOverridePoll.current = now;
     let cancelled = false;
-    Promise.all(ids.map(async (sid) => {
-      try {
-        const requestId = (overrideRequestIds.get(sid) || 0) + 1;
-        overrideRequestIds.set(sid, requestId);
-        const d = await getJson(`/api/agents/sessions/${encodeURIComponent(sid)}/overrides`);
-        return [sid, { overrides: d.overrides || [], revisions: d.revisions || {}, requestId }];
-      } catch { return [sid, null]; }
-    })).then((entries) => {
-      if (!cancelled) setOverridesBySession((old) => ({ ...old, ...Object.fromEntries(entries.filter(([sid, value]) => value !== null && overrideRequestIds.get(sid) === value.requestId).map(([sid, value]) => [sid, { overrides: value.overrides, revisions: value.revisions }])) }));
-    });
+    const reqIds = Object.fromEntries(ids.map((sid) => {
+      const requestId = (overrideRequestIds.get(sid) || 0) + 1;
+      overrideRequestIds.set(sid, requestId);
+      return [sid, requestId];
+    }));
+    // One batch request for every live session (was one request per session).
+    getJson(`/api/agents/overrides?ids=${ids.map(encodeURIComponent).join(",")}`).then((d) => {
+      if (cancelled) return;
+      const got = d.sessions || {};
+      const fresh = ids.filter((sid) => got[sid.toLowerCase()] && overrideRequestIds.get(sid) === reqIds[sid]);
+      setOverridesBySession((old) => ({ ...old, ...Object.fromEntries(fresh.map((sid) => { const v = got[sid.toLowerCase()]; return [sid, { overrides: v.overrides || [], revisions: v.revisions || {} }]; })) }));
+    }).catch(() => {});
     return () => { cancelled = true; };
   }, [live]);
 
@@ -556,7 +558,7 @@ export default function AgentsClient() {
                     {r.role === "" && null}{v.dr.isCodex && <div style={{ fontSize: 11, color: "var(--tx2)" }}>Codex sessions can only use OpenAI models.</div>}
                   </div>
                   {r.warn && <div style={{ padding: "8px 12px", borderRadius: 8, background: "var(--amberbg)", fontSize: 12, color: "var(--amber)" }}><span className="material-symbols-outlined" style={{ fontSize: 16, verticalAlign: "middle", marginRight: 4 }}>warning</span>{r.warn}</div>}
-                  <div className="r9-routing-controls"><div><div className="r9-caps" style={{ marginBottom: 4 }}>MODE</div><div role="group" aria-label={r.modeAria} style={{ display: "flex", gap: 2, padding: 2, borderRadius: 8, background: "var(--seg)" }}>{r.modes.map((m) => <button key={m.label} onClick={m.on} aria-pressed={m.on2} title={m.tip} style={m.style}>{m.label}</button>)}</div></div><label style={{ display: "flex", flexDirection: "column", gap: 4 }}><span className="r9-caps">UNTIL</span><select value={r.expiry} onChange={r.onExp} aria-label="Until the override expires" style={{ height: 28, border: "1px solid var(--line2)", borderRadius: 7, background: "var(--bg)", color: "var(--tx)", font: "inherit", fontSize: 12.5 }}><option value="Session end">Session end</option><option value="1h">1 hour</option><option value="2h">2 hours</option></select></label></div>
+                  <div className="r9-routing-controls"><div><div className="r9-caps" style={{ marginBottom: 4 }}>MODE</div><div role="group" aria-label={r.modeAria} style={{ display: "flex", gap: 2, padding: 2, height: 28, boxSizing: "border-box", alignItems: "stretch", borderRadius: 8, background: "var(--seg)" }}>{r.modes.map((m) => <button key={m.label} onClick={m.on} aria-pressed={m.on2} title={m.tip} style={m.style}>{m.label}</button>)}</div></div><label style={{ display: "flex", flexDirection: "column", gap: 4 }}><span className="r9-caps">UNTIL</span><select value={r.expiry} onChange={r.onExp} aria-label="Until the override expires" style={{ height: 28, border: "1px solid var(--line2)", borderRadius: 7, background: "var(--bg)", color: "var(--tx)", font: "inherit", fontSize: 12.5 }}><option value="Session end">Session end</option><option value="1h">1 hour</option><option value="2h">2 hours</option></select></label></div>
                   {r.strict && <span style={{ fontSize: 11.5, color: "var(--tx2)" }}>No fallback. If this model fails, the request fails visibly.</span>}
                 </>}
                 </div>
