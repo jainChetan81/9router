@@ -146,16 +146,18 @@ export default function AgentsClient() {
     if (now - lastOverridePoll.current < 10000) return;
     lastOverridePoll.current = now;
     let cancelled = false;
-    Promise.all(ids.map(async (sid) => {
-      try {
-        const requestId = (overrideRequestIds.get(sid) || 0) + 1;
-        overrideRequestIds.set(sid, requestId);
-        const d = await getJson(`/api/agents/sessions/${encodeURIComponent(sid)}/overrides`);
-        return [sid, { overrides: d.overrides || [], revisions: d.revisions || {}, requestId }];
-      } catch { return [sid, null]; }
-    })).then((entries) => {
-      if (!cancelled) setOverridesBySession((old) => ({ ...old, ...Object.fromEntries(entries.filter(([sid, value]) => value !== null && overrideRequestIds.get(sid) === value.requestId).map(([sid, value]) => [sid, { overrides: value.overrides, revisions: value.revisions }])) }));
-    });
+    const reqIds = Object.fromEntries(ids.map((sid) => {
+      const requestId = (overrideRequestIds.get(sid) || 0) + 1;
+      overrideRequestIds.set(sid, requestId);
+      return [sid, requestId];
+    }));
+    // One batch request for every live session (was one request per session).
+    getJson(`/api/agents/overrides?ids=${ids.map(encodeURIComponent).join(",")}`).then((d) => {
+      if (cancelled) return;
+      const got = d.sessions || {};
+      const fresh = ids.filter((sid) => got[sid.toLowerCase()] && overrideRequestIds.get(sid) === reqIds[sid]);
+      setOverridesBySession((old) => ({ ...old, ...Object.fromEntries(fresh.map((sid) => { const v = got[sid.toLowerCase()]; return [sid, { overrides: v.overrides || [], revisions: v.revisions || {} }]; })) }));
+    }).catch(() => {});
     return () => { cancelled = true; };
   }, [live]);
 
