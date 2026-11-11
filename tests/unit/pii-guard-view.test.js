@@ -192,3 +192,25 @@ describe("session helpers", () => {
     expect(v.imgGroups[0].count).toBe("2 images");
   });
 });
+
+describe("pii-guard every hit view", () => {
+  const hitUi = { ...ui, view: "hit" };
+  const run = (events) => buildView({ data: base(), ui: hitUi, set: () => {}, act: () => {}, range: { preset: "24h" }, fit: null, test: {}, events, samples: [] });
+  const row = { id: "1", ts: 1, t: "00:00:01", rule: "email", name: "", hash: "abcdef", fullHash: "abcdef12", a: "redacted", requestId: "r1" };
+
+  it("renders an empty events object without crashing", () => {
+    const v = run({ rows: [] });
+    expect(v.hits).toEqual([]);
+    expect(v.noHits).toBe(true);
+  });
+
+  it("reads hit rows from the events object the client passes", () => {
+    const v = run({ rows: [row], sessionRows: [] });
+    expect(v.hits).toHaveLength(1);
+    expect(v.hits[0].fullHash).toBe("abcdef12");
+  });
+
+  it("still accepts a plain array", () => {
+    expect(run([row]).hits).toHaveLength(1);
+  });
+});

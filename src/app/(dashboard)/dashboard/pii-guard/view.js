@@ -458,7 +458,7 @@ export function buildView({ data, ui, set, act, range, fit, test, events, sample
       ruleBtns: ruleBtns(v.rule, key), rulePending: isRulePending(v.rule), pending: pending(key),
     };
   });
-  const sessionRows = (tab === "findings" && ui.view === "session" ? sortSessions(events.sessionRows || [], ui.ssort, ui.sdesc) : []).map((r) => ({
+  const sessionRows = (tab === "findings" && ui.view === "session" ? sortSessions(events?.sessionRows || [], ui.ssort, ui.sdesc) : []).map((r) => ({
     sessionId: r.sessionId, short: String(r.sessionId).slice(0, 8), client: r.client || "—",
     route: r.combo || r.model || "—", provider: r.provider || "Not recorded", account: r.account || "",
     first: stamp(new Date(Number(r.first)).toISOString()), last: stamp(new Date(Number(r.last)).toISOString()),
@@ -466,7 +466,7 @@ export function buildView({ data, ui, set, act, range, fit, test, events, sample
     values: fmt(r.values), hasFindings: r.values > 0, textAvailability: r.hasText ? "Stored" : "Events only",
     open: () => set({ tab: "findings", view: "session", session: r.sessionId, at: "", ssort: ui.ssort, sdesc: ui.sdesc }),
   }));
-  const hits = (tab === "findings" && ui.view === "hit" ? events : []).map((e) => ({
+  const hits = (tab === "findings" && ui.view === "hit" ? (Array.isArray(events) ? events : events?.rows || []) : []).map((e) => ({
     ...e, ...badge(e.a), rule: e.name || ruleLabel[e.rule] || e.rule, sel: !!ui.sel[e.fullHash], bg: ui.sel[e.fullHash] ? "var(--acc2)" : "transparent",
     toggle: () => set((u) => ({ sel: { ...u.sel, [e.fullHash]: !u.sel[e.fullHash] } })),
     view: () => set({ detail: { kind: "hit", hit: e } }),
