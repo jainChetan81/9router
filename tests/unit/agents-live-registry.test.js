@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { markFirstToken, register, snapshot, unregister } from "@/lib/agents/liveRegistry.js";
 import { sessionKey } from "@/lib/agents/sessionKey.js";
 
@@ -73,6 +73,35 @@ describe("agents live registry", () => {
     expect(register(reqId, { session: rawSession, model: "openai/gpt-4o-mini" })).toBe(true);
     expect(snapshot()[sessionKey(rawSession)]).toHaveLength(1);
     expect(snapshot()[rawSession]).toBeUndefined();
+    unregister(reqId);
+  });
+
+  it("expires entries after the 10-minute TTL", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-11-11T00:00:00.000Z"));
+      const reqId = `ttl-${crypto.randomUUID()}`;
+      const session = "ttl-session-1";
+      expect(register(reqId, { session, model: "openai/gpt-4o-mini", startedAt: 100 })).toBe(true);
+
+      vi.advanceTimersByTime(10 * 60 * 1000 - 1);
+      expect(snapshot()[sessionKey(session)]).toHaveLength(1);
+
+      vi.advanceTimersByTime(2);
+      expect(snapshot()[sessionKey(session)]).toBeUndefined();
+      expect(markFirstToken(reqId)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("accepts an explicit monotonic timestamp on markFirstToken and preserves the first value", () => {
+    const reqId = `ttft-${crypto.randomUUID()}`;
+    const session = "ttft-session-1";
+    expect(register(reqId, { session, model: "openai/gpt-4o-mini", startedAt: 100 })).toBe(true);
+    expect(markFirstToken(reqId, 245.5)).toBe(true);
+    expect(markFirstToken(reqId, 999.9)).toBe(true);
+    expect(snapshot()[sessionKey(session)][0].firstTokenAt).toBe(245.5);
     unregister(reqId);
   });
 });

@@ -81,9 +81,15 @@ function hasSemanticToken(parsed, format, eventName) {
   return false;
 }
 
-function markSemanticToken(parsed, format, eventName, getTTFT, setTTFT) {
+function markSemanticToken(parsed, format, eventName, getTTFT, setTTFT, onFirstToken) {
   try {
-    if (getTTFT() === null && hasSemanticToken(parsed, format, eventName)) setTTFT(performance.now());
+    if (getTTFT() === null && hasSemanticToken(parsed, format, eventName)) {
+      const now = performance.now();
+      setTTFT(now);
+      if (typeof onFirstToken === "function") {
+        try { onFirstToken(now); } catch { /* live telemetry must not break the stream */ }
+      }
+    }
   } catch { /* timing telemetry must not break the stream */ }
 }
 
@@ -100,6 +106,7 @@ function markSemanticToken(parsed, format, eventName, getTTFT, setTTFT) {
  * @param {object} options.body - Request body (for input token estimation)
  * @param {function} options.onStreamComplete - Callback when stream completes (content, usage)
  * @param {string} options.apiKey - API key for usage tracking
+ * @param {function} [options.onFirstToken] - Callback invoked once on the first semantic token (now)
  */
 export function createSSEStream(options = {}) {
   const {
@@ -116,7 +123,8 @@ export function createSSEStream(options = {}) {
     onStreamComplete = null,
     apiKey = null,
     credentials = null,
-    eventFormat = null
+    eventFormat = null,
+    onFirstToken = null
   } = options;
   const semanticFormat = targetFormat || eventFormat || (
     ["antigravity", "gemini", "gemini-cli", "vertex"].includes(provider) ? FORMATS.GEMINI : FORMATS.OPENAI
@@ -269,7 +277,7 @@ export function createSSEStream(options = {}) {
                 }
               }
 
-              markSemanticToken(parsed, semanticFormat, currentOpenAIResponsesEvent, () => ttftAt, (value) => { ttftAt = value; });
+              markSemanticToken(parsed, semanticFormat, currentOpenAIResponsesEvent, () => ttftAt, (value) => { ttftAt = value; }, onFirstToken);
 
               // Ensure OpenAI-required fields are present on streaming chunks (Letta compat)
               let fieldsInjected = false;
@@ -388,7 +396,7 @@ export function createSSEStream(options = {}) {
         const parsed = parseSSELine(trimmed, targetFormat);
         if (!parsed) continue;
         collectToolNames(toolNames, parsed, currentOpenAIResponsesEvent);
-        markSemanticToken(parsed, semanticFormat, currentOpenAIResponsesEvent, () => ttftAt, (value) => { ttftAt = value; });
+        markSemanticToken(parsed, semanticFormat, currentOpenAIResponsesEvent, () => ttftAt, (value) => { ttftAt = value; }, onFirstToken);
 
         // Responses API same-format passthrough: preserve event framing + track terminal state
         const isOpenAIResponsesStream = targetFormat === FORMATS.OPENAI_RESPONSES;
@@ -549,7 +557,7 @@ export function createSSEStream(options = {}) {
         if (mode === STREAM_MODE.PASSTHROUGH) {
           if (buffer) {
             if (ttftAt === null && buffer.startsWith("data:")) {
-              try { markSemanticToken(JSON.parse(buffer.slice(5).trim()), semanticFormat, currentOpenAIResponsesEvent, () => ttftAt, (value) => { ttftAt = value; }); } catch {}
+              try { markSemanticToken(JSON.parse(buffer.slice(5).trim()), semanticFormat, currentOpenAIResponsesEvent, () => ttftAt, (value) => { ttftAt = value; }, onFirstToken); } catch {}
             }
             let output = buffer;
             if (buffer.startsWith("data:") && !buffer.startsWith("data: ")) {
@@ -580,7 +588,7 @@ export function createSSEStream(options = {}) {
           // accepts "data: " lines, so an NDJSON provider (Ollama) lost whatever
           // arrived without its closing newline.
           const parsed = parseSSELine(buffer.trim(), targetFormat);
-          if (parsed) markSemanticToken(parsed, semanticFormat, currentOpenAIResponsesEvent, () => ttftAt, (value) => { ttftAt = value; });
+          if (parsed) markSemanticToken(parsed, semanticFormat, currentOpenAIResponsesEvent, () => ttftAt, (value) => { ttftAt = value; }, onFirstToken);
           // parseSSELine turns the SSE sentinel "data: [DONE]" into { done: true },
           // which must not be translated. An Ollama chunk also carries done:true,
           // but it is the real final chunk — it holds finish_reason and the token
@@ -656,7 +664,7 @@ export function createSSEStream(options = {}) {
   });
 }
 
-export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider = null, reqLogger = null, toolNameMap = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, customToolNames = null, credentials = null) {
+export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider = null, reqLogger = null, toolNameMap = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, customToolNames = null, credentials = null, onFirstToken = null) {
   return createSSEStream({
     mode: STREAM_MODE.TRANSLATE,
     targetFormat,
@@ -670,11 +678,12 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
     body,
     onStreamComplete,
     apiKey,
-    credentials
+    credentials,
+    onFirstToken
   });
 }
 
-export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, toolNameMap = null, eventFormat = null) {
+export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, toolNameMap = null, eventFormat = null, onFirstToken = null) {
   return createSSEStream({
     mode: STREAM_MODE.PASSTHROUGH,
     // Passthrough streams carry events in the provider format; the first-token
@@ -687,6 +696,7 @@ export function createPassthroughStreamWithLogger(provider = null, reqLogger = n
     connectionId,
     body,
     onStreamComplete,
-    apiKey
+    apiKey,
+    onFirstToken
   });
 }

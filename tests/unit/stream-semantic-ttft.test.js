@@ -3,9 +3,11 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("@/lib/usageDb.js", () => ({
   trackPendingRequest: vi.fn(),
   appendRequestLog: vi.fn(async () => {}),
+  saveRequestDetail: vi.fn(async () => {}),
 }));
 
-const { createSSEStream } = await import("../../open-sse/utils/stream.js");
+const { createSSEStream, createSSETransformStreamWithLogger, createPassthroughStreamWithLogger } = await import("../../open-sse/utils/stream.js");
+const { handleStreamingResponse } = await import("../../open-sse/handlers/chatCore/streamingHandler.js");
 const { FORMATS } = await import("../../open-sse/translator/formats.js");
 
 async function collectTTFT({ format, mode = "translate", provider = "openai", chunks }) {
@@ -105,5 +107,130 @@ describe("stream TTFT telemetry", () => {
       }],
     });
     expect(ttftAt).toBeGreaterThanOrEqual(tokenSentAt);
+  });
+
+  it("invokes onFirstToken once with the semantic timestamp across passthrough, translate, and flush without breaking on errors", async () => {
+    const encoder = new TextEncoder();
+    const runWithStream = async (stream, writes) => {
+      const reader = stream.readable.getReader();
+      const writer = stream.writable.getWriter();
+      const chunks = [];
+      const drain = (async () => {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(new TextDecoder().decode(value));
+        }
+      })();
+      for (const w of writes) await writer.write(encoder.encode(w));
+      await writer.close();
+      await drain;
+      return chunks.join("");
+    };
+
+    const passthroughHits = [];
+    let passthroughCompleteAt = null;
+    const passthrough = createPassthroughStreamWithLogger(
+      "openai",
+      null,
+      "gpt-4o",
+      null,
+      { stream: true },
+      (_c, _u, t) => { passthroughCompleteAt = t; },
+      null,
+      null,
+      FORMATS.OPENAI,
+      (now) => {
+        passthroughHits.push(now);
+        throw new Error("telemetry boom");
+      },
+    );
+    const out1 = await runWithStream(passthrough, [
+      'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n',
+      'data: {"choices":[{"delta":{"content":"first"}}]}\n\n',
+      'data: {"choices":[{"delta":{"content":"second"}}]}\n\n',
+      "data: [DONE]\n\n",
+    ]);
+    expect(passthroughHits).toHaveLength(1);
+    expect(passthroughCompleteAt).toBe(passthroughHits[0]);
+    expect(out1).toContain("first");
+    expect(out1).toContain("second");
+
+    const translateHits = [];
+    let translateCompleteAt = null;
+    const translated = createSSETransformStreamWithLogger(
+      FORMATS.CLAUDE,
+      FORMATS.OPENAI,
+      "claude",
+      null,
+      null,
+      "claude-sonnet-4-5",
+      null,
+      { stream: true },
+      (_c, _u, t) => { translateCompleteAt = t; },
+      null,
+      null,
+      null,
+      (now) => { translateHits.push(now); },
+    );
+    await runWithStream(translated, [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"m1","usage":{"input_tokens":1}}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"!"}}\n\n',
+    ]);
+    expect(translateHits).toHaveLength(1);
+    expect(translateCompleteAt).toBe(translateHits[0]);
+
+    const flushHits = [];
+    const flushOnly = createSSEStream({
+      mode: "passthrough",
+      eventFormat: FORMATS.OPENAI,
+      provider: "openai",
+      body: { stream: true },
+      onFirstToken: (now) => { flushHits.push(now); },
+    });
+    await runWithStream(flushOnly, [
+      'data: {"choices":[{"delta":{"content":"tail-without-newline"}}]}',
+    ]);
+    expect(flushHits).toHaveLength(1);
+
+    const handlerHits = [];
+    const upstream = new Response(
+      new ReadableStream({
+        start(c) {
+          c.enqueue(encoder.encode('data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'));
+          c.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"from-handler"}}]}\n\n'));
+          c.enqueue(encoder.encode("data: [DONE]\n\n"));
+          c.close();
+        },
+      }),
+      { status: 200, headers: { "Content-Type": "text/event-stream" } },
+    );
+    const handled = await handleStreamingResponse({
+      providerResponse: upstream,
+      provider: "openai",
+      model: "gpt-4o",
+      sourceFormat: FORMATS.OPENAI,
+      targetFormat: FORMATS.OPENAI,
+      userAgent: "test",
+      body: { stream: true },
+      stream: true,
+      requestStartTime: Date.now(),
+      streamController: {
+        signal: new AbortController().signal,
+        startTime: Date.now(),
+        isConnected: () => true,
+        handleComplete: () => {},
+        handleError: () => {},
+        handleDisconnect: () => {},
+        abort: () => {},
+      },
+      onFirstToken: (now) => { handlerHits.push(now); },
+    });
+    expect(handled.success).toBe(true);
+    const handledReader = handled.response.body.getReader();
+    while (!(await handledReader.read()).done);
+    expect(handlerHits).toHaveLength(1);
+    expect(Number.isFinite(handlerHits[0])).toBe(true);
   });
 });

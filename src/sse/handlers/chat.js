@@ -33,7 +33,68 @@ import { resolveSmartChoice } from "../services/systemoneRouter.js";
 import { observeRequest, blockMessage } from "@/lib/piiGuard/observe.js";
 import { saveFailureUsage } from "open-sse/handlers/chatCore/requestDetail.js";
 import { resolveSafeUsageTarget } from "../services/usageTarget.js";
-import { register as registerLiveRequest, unregister as unregisterLiveRequest } from "@/lib/agents/liveRegistry.js";
+import { register as registerLiveRequest, unregister as unregisterLiveRequest, markFirstToken } from "@/lib/agents/liveRegistry.js";
+
+function cleanupLiveAbortListener(liveState) {
+  if (liveState?.signal && liveState.onAbort) {
+    try {
+      liveState.signal.removeEventListener("abort", liveState.onAbort);
+    } catch { /* live telemetry must fail open */ }
+    liveState.onAbort = null;
+  }
+}
+
+function finishLiveRequest(clientRawRequest, outcome) {
+  const liveState = clientRawRequest?.liveState;
+  if (liveState) {
+    liveState.closed = true;
+    cleanupLiveAbortListener(liveState);
+  }
+  try {
+    unregisterLiveRequest(clientRawRequest?.reqId, outcome);
+  } catch { /* live telemetry must fail open */ }
+}
+
+function startLiveRequest(clientRawRequest, data) {
+  if (!clientRawRequest || clientRawRequest.isFusionPanel) return false;
+  const reqId = clientRawRequest.reqId;
+  if (!reqId) return false;
+  const liveState = clientRawRequest.liveState;
+  if (liveState?.closed || liveState?.signal?.aborted) {
+    if (liveState) {
+      liveState.closed = true;
+      cleanupLiveAbortListener(liveState);
+    }
+    try { unregisterLiveRequest(reqId, "aborted"); } catch { /* live telemetry must fail open */ }
+    return false;
+  }
+  if (liveState?.signal && !liveState.onAbort && typeof liveState.signal.addEventListener === "function") {
+    liveState.onAbort = () => {
+      finishLiveRequest(clientRawRequest, "aborted");
+    };
+    try {
+      liveState.signal.addEventListener("abort", liveState.onAbort, { once: true });
+    } catch {
+      liveState.onAbort = null;
+    }
+    if (liveState.signal.aborted) {
+      finishLiveRequest(clientRawRequest, "aborted");
+      return false;
+    }
+  }
+  try {
+    return registerLiveRequest(reqId, data);
+  } catch {
+    return false;
+  }
+}
+
+function isStreamingResponse(response, clientRawRequest) {
+  if (!response?.body) return false;
+  const contentType = (response.headers?.get?.("content-type") || "").toLowerCase();
+  if (contentType) return contentType.includes("text/event-stream");
+  return clientRawRequest?.body?.stream === true;
+}
 
 function createUsageContext(request) {
   let settingsPromise = null;
@@ -55,7 +116,7 @@ function createUsageContext(request) {
 }
 
 async function recordFailure({ response = null, clientRawRequest, usageContext, statusCode = null, error = null, errorKind = null, aborted = false }) {
-  try { unregisterLiveRequest(clientRawRequest?.reqId, aborted ? "aborted" : "error"); } catch { /* live telemetry must fail open */ }
+  finishLiveRequest(clientRawRequest, aborted ? "aborted" : "error");
   try {
     const settings = await usageContext.getSettings();
     const validApiKey = await usageContext.isApiKeyValid();
@@ -88,10 +149,10 @@ async function withLogicalUsage(responsePromise, clientRawRequest, usageContext)
       if (clientRawRequest?.usageState) clientRawRequest.usageState.responseCommitted = true;
       if (Number.isInteger(response?.status) && response.status >= 400) {
         await recordFailure({ response, clientRawRequest, usageContext, statusCode: response.status, aborted: response.status === 499 });
-      } else if (response?.body && clientRawRequest?.body?.stream === true) {
-        return wrapLiveTerminal(response, clientRawRequest?.reqId);
+      } else if (isStreamingResponse(response, clientRawRequest)) {
+        return wrapLiveTerminal(response, clientRawRequest);
       } else {
-        try { unregisterLiveRequest(clientRawRequest?.reqId, "ok"); } catch { /* live telemetry must fail open */ }
+        finishLiveRequest(clientRawRequest, "ok");
       }
     } catch { /* usage telemetry must never change the response */ }
     return response;
@@ -111,7 +172,8 @@ async function withLogicalUsage(responsePromise, clientRawRequest, usageContext)
   }
 }
 
-function wrapLiveTerminal(response, reqId) {
+function wrapLiveTerminal(response, clientRawRequest) {
+  const reqId = clientRawRequest?.reqId;
   if (!response?.body || !reqId) return response;
   try {
     const reader = response.body.getReader();
@@ -120,20 +182,21 @@ function wrapLiveTerminal(response, reqId) {
         try {
           const { done, value } = await reader.read();
           if (done) {
-            unregisterLiveRequest(reqId, "ok");
+            finishLiveRequest(clientRawRequest, "ok");
             controller.close();
           } else controller.enqueue(value);
         } catch (error) {
-          unregisterLiveRequest(reqId, error?.name === "AbortError" ? "aborted" : "error");
+          finishLiveRequest(clientRawRequest, error?.name === "AbortError" ? "aborted" : "error");
           controller.error(error);
         }
       },
       async cancel(reason) {
-        try { await reader.cancel(reason); } finally { unregisterLiveRequest(reqId, "aborted"); }
+        try { await reader.cancel(reason); } finally { finishLiveRequest(clientRawRequest, "aborted"); }
       },
     });
     return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
   } catch {
+    finishLiveRequest(clientRawRequest, "error");
     return response;
   }
 }
@@ -163,6 +226,7 @@ export async function handleChat(request, clientRawRequest = null) {
     clientRawRequest.usageResponseCommitted = false;
     clientRawRequest.validatedApiKey = null;
     clientRawRequest.usageState = { responseCommitted: false, failureRecorded: false, successRecorded: false };
+    clientRawRequest.liveState = { closed: false, signal: request?.signal || null, onAbort: null };
   } catch { /* telemetry context is best-effort */ }
   let body;
   try {
@@ -207,9 +271,6 @@ export async function handleChat(request, clientRawRequest = null) {
   if (contextMarker) body.model = modelStr;
 
   const sessionId = session?.sessionId || null;
-  try {
-    registerLiveRequest(reqId, { session: sessionId, combo: modelStr, model: modelStr, startedAt: usageStartedAt });
-  } catch { /* live telemetry must fail open */ }
 
   // Request summary is emitted as the unified "▶" line in chatCore (has fmt/thinking/account)
 
@@ -254,7 +315,6 @@ export async function handleChat(request, clientRawRequest = null) {
   const userAgent = request?.headers?.get("user-agent") || "";
   const bypassResponse = handleBypassRequest(body, modelStr, userAgent, !!settings.ccFilterNaming);
   if (bypassResponse) {
-    try { unregisterLiveRequest(reqId, "ok"); } catch { /* live telemetry must fail open */ }
     return bypassResponse.response || bypassResponse;
   }
 
@@ -265,6 +325,12 @@ export async function handleChat(request, clientRawRequest = null) {
   if (comboModels) {
     clientRawRequest.combo = modelStr;
     clientRawRequest.usageTarget = { provider: null, model: modelStr };
+    startLiveRequest(clientRawRequest, {
+      session: sessionId,
+      combo: modelStr,
+      model: modelStr,
+      startedAt: usageStartedAt,
+    });
     // Check for combo-specific strategy first, fallback to global
     const comboStrategies = settings.comboStrategies || {};
     const comboSpecificStrategy = comboStrategies[modelStr]?.fallbackStrategy;
@@ -440,15 +506,13 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   if (clientRawRequest) {
     clientRawRequest.usageTarget = await resolveSafeUsageTarget(modelStr, modelInfo);
     if (clientRawRequest.usageState) clientRawRequest.usageState.modelResolved = true;
-    try {
-      registerLiveRequest(clientRawRequest.reqId, {
-        session: clientRawRequest.session,
-        combo: clientRawRequest.combo || null,
-        model: modelStr,
-        provider,
-        startedAt: clientRawRequest.usageStartedAt,
-      });
-    } catch { /* live telemetry must fail open */ }
+    startLiveRequest(clientRawRequest, {
+      session: clientRawRequest.session,
+      combo: clientRawRequest.combo || null,
+      model: modelStr,
+      provider,
+      startedAt: clientRawRequest.usageStartedAt,
+    });
   }
 
   // Routing shown in the unified "▶" line (client model → provider/model)
@@ -541,6 +605,15 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       providerOverrides: (chatSettings.providerOverrides || {})[provider] || null,
       // Detect source format by endpoint + body
       sourceFormatOverride: request?.url ? detectFormatByEndpoint(new URL(request.url).pathname, body) : null,
+      onFirstToken: clientRawRequest?.reqId && !clientRawRequest?.isFusionPanel
+        ? (now) => {
+            try {
+              if (!clientRawRequest.liveState?.closed && !clientRawRequest.liveState?.signal?.aborted) {
+                markFirstToken(clientRawRequest.reqId, now);
+              }
+            } catch { /* live telemetry must fail open */ }
+          }
+        : null,
       onCredentialsRefreshed: async (newCreds) => {
         await updateProviderCredentials(credentials.connectionId, {
           ...newCreds,

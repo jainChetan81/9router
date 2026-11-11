@@ -14,7 +14,7 @@ import { sessionKey } from "./sessionKey.js";
 
 const REGISTRY_KEY = Symbol.for("9router.agents.liveRegistry");
 const MAX_ENTRIES = 500;
-const TTL_MS = 30 * 60 * 1000;
+const TTL_MS = 10 * 60 * 1000;
 
 const state = globalThis[REGISTRY_KEY] || (globalThis[REGISTRY_KEY] = { entries: new Map() });
 
@@ -83,7 +83,7 @@ export function register(reqId, data) {
   }
 }
 
-export function markFirstToken(reqId) {
+export function markFirstToken(reqId, at = null) {
   try {
     const id = cleanLabel(reqId, 128);
     if (!id) return false;
@@ -93,7 +93,9 @@ export function markFirstToken(reqId) {
       state.entries.delete(id);
       return false;
     }
-    if (entry.firstTokenAt == null) entry.firstTokenAt = monotonicNow();
+    if (entry.firstTokenAt == null) {
+      entry.firstTokenAt = Number.isFinite(at) ? at : monotonicNow();
+    }
     return true;
   } catch {
     return false;
