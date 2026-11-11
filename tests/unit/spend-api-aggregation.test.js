@@ -87,6 +87,9 @@ describe("spend aggregation SQL (N6/B10)", () => {
     const today = aggregateSpend(wrapped, { params: new URLSearchParams({ preset: "Today" }), now: NOW, skipCache: true });
     expect(today.now).toBe(NOW);
     expect(today.bars).toHaveLength(24);
+    expect(today.clock.reduce((n, cell) => n + cell.req, 0)).toBe(4);
+    expect(Number(today.clock.find((cell) => Number(cell.weekday) === 2 && Number(cell.hour) === 0)?.req)).toBe(2);
+    expect(today.whatIfGroups.find((g) => g.kind === "combo" && g.name === "c2")?.req).toBe(1);
     // Range starts at IST midnight of Nov 10 = Nov 9 18:30Z, so the 18:29Z row is out.
     expect(today.totals.req).toBe(4); // 18:35Z, 19:10Z, 20:20Z, 20:30Z rows
     // 4 logged (with ua) = routes exist; only the gpt-nr row is not logged.
@@ -137,7 +140,11 @@ describe("spend aggregation SQL (N6/B10)", () => {
     expect(thirty.groups.client.map((c) => c.k)).toContain("T3 Code");
     expect(new Set(thirty.groups.routes.nodes.filter((n) => n.kind === "combo").map((n) => n.id))).toEqual(new Set(["combo:c1", "combo:c2", "combo:main"]));
 
-    // ---- Drwxilldown tree per provider, session list ----
+    const empty = aggregateSpend(wrapped, { params: new URLSearchParams({ preset: "Custom", from: "2026-10-01", to: "2026-10-02" }), now: NOW, skipCache: true });
+    expect(empty.clock).toEqual([]);
+    expect(empty.whatIfGroups).toEqual([]);
+
+    // ---- Drilldown tree per provider, session list ----
     const treeNames = new Set(thirty.groups.providerTree.map((p) => p.k));
     expect(treeNames.has("openrouter")).toBe(true);
     expect(treeNames.has("claude")).toBe(true);

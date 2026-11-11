@@ -4,6 +4,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "rea
 import { useRouter } from "next/navigation";
 import RangeBar from "./RangeBar";
 import QuotaRunway from "./QuotaRunway";
+import SpendExtras from "./SpendExtras";
 import BreakdownDrill from "./BreakdownDrill";
 import RoutingMap from "./RoutingMap";
 import { buildView } from "./view";
@@ -229,6 +230,7 @@ export default function SpendClient() {
             </div>
           </>)}
 
+          {(ready || isEmpty) && data && <SpendExtras data={data} />}
           <QuotaRunway syncNonce={syncNonce} />
           {(s.real) && (<>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(300px,1fr))", gap: "16px" }}>

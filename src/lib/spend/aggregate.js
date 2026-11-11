@@ -206,6 +206,12 @@ export function aggregateSpend(db, { params, now = Date.now(), fees = {}, skipCa
     [range.from, range.from, step, fromIso, toIso],
   );
 
+  const clock = db.all(`SELECT CAST(strftime('%w', timestamp, '+5 hours', '+30 minutes') AS INTEGER) AS weekday,
+    CAST(strftime('%H', timestamp, '+5 hours', '+30 minutes') AS INTEGER) AS hour,
+    COUNT(*) AS req, SUM(${COST_EXPR}) AS cost
+    FROM usageHistory WHERE ${tsWhere} AND unixepoch(timestamp, 'subsec') IS NOT NULL
+    GROUP BY 1, 2`, [fromIso, toIso]);
+  const whatIfGroups = new Map();
   const byKey = new Map(), byModel = new Map(), byModelEffort = new Map();
   const byCombo = new Map(), byClient = new Map(), bySess = new Map(), byProv = new Map();
   const ddProviders = new Map(), ddModelSplits = new Map(), ddRoutes = new Map();
@@ -226,6 +232,15 @@ export function aggregateSpend(db, { params, now = Date.now(), fees = {}, skipCa
       cacheWrite: Number(r.cwSum) || 0,
       output: Number(r.outSum) || 0,
     };
+
+    for (const [kind, name] of [["model", r.model], ["combo", r.hasUa ? (r.combo || "main") : null]]) {
+      if (!name) continue;
+      const id = JSON.stringify([kind, name]);
+      let group = whatIfGroups.get(id);
+      if (!group) whatIfGroups.set(id, group = { kind, name, cost: 0, req: 0, input: 0, cacheRead: 0, cacheWrite: 0, output: 0 });
+      group.cost += costSum; group.req += rReq;
+      for (const key of ["input", "cacheRead", "cacheWrite", "output"]) group[key] += split[key];
+    }
 
     const provider = r.provider || "unknown";
     const model = r.model || "unknown";
@@ -466,6 +481,7 @@ export function aggregateSpend(db, { params, now = Date.now(), fees = {}, skipCa
 
   const body = {
     now,
+    clock, whatIfGroups: [...whatIfGroups.values()],
     range: { ...range, first: bars[0]?.label, last: [...bars].reverse().find((b) => !b.future)?.label, days: range.hourly ? 1 : nB },
     loggedSince,
     loggedSinceLabel: loggedSince ? fmtIstDay(loggedSince) : null,

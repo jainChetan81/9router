@@ -25,3 +25,15 @@
   [data-r9] .r9-spend-content { padding: 12px 16px 40px !important; }
   [data-r9] .r9-tablist { width: max-content; max-width: 100%; }
 }
+
+[data-r9] .r9-extra-card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); padding: 16px 18px; min-width: 0; }
+[data-r9] .r9-extra-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+[data-r9] .r9-extra-card h2 { font-size: 15px; font-weight: 600; margin: 0; }
+[data-r9] .r9-extra-card p { color: var(--tx2); margin: 6px 0 12px; }
+[data-r9] .r9-extra-card select { background: var(--seg); color: var(--tx); border: 1px solid var(--line); border-radius: 6px; padding: 6px; max-width: 100%; }
+[data-r9] .r9-extra-controls { display: flex; flex-wrap: wrap; gap: 12px; }
+[data-r9] .r9-extra-controls label { display: grid; gap: 4px; min-width: 0; max-width: 100%; }
+[data-r9] .r9-clock-scroll { overflow-x: auto; }
+[data-r9] .r9-clock { border-spacing: 3px; font-size: 11px; color: var(--tx2); }
+[data-r9] .r9-clock th { font-weight: 500; text-align: center; }
+[data-r9] .r9-clock td { min-width: 20px; height: 20px; border-radius: 3px; }
