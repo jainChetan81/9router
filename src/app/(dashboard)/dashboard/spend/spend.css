@@ -33,3 +33,4 @@
 [data-r9] .r9-sync-spin{display:inline-block;animation:r9spin 1s linear infinite}
 @media(prefers-reduced-motion:reduce){[data-r9] .r9-sync-spin{animation:none}}
 @media(max-width:600px){[data-r9] .r9-sync-auto-label{display:none}}
+@media(max-width:600px){[data-r9] .r9-spend-range-controls .r9-range-root{max-width:100%;min-width:0}[data-r9] .r9-spend-range-controls .r9-range-root>.r9-scroll-x{max-width:100%;overflow-x:auto}}
