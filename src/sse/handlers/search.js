@@ -15,6 +15,39 @@ import { updateProviderCredentials, checkAndRefreshToken } from "../services/tok
 import { handleComboChat, getComboModelsFromData } from "open-sse/services/combo.js";
 import { getKeyAccessContext, enforceKeyAccessProvider } from "../services/keyAccess.js";
 import { observeRequest, blockMessage } from "@/lib/piiGuard/observe.js";
+import { saveUsageStats } from "open-sse/handlers/chatCore/requestDetail.js";
+import {
+  createMediaUsageContext,
+  createMediaRawRequest,
+  resolveExplicitSessionId,
+  recordMediaFailure,
+  withMediaLogicalUsage,
+} from "../services/mediaUsage.js";
+
+function resolveSafeSearchUsageTarget(providerInput, combos = null) {
+  if (typeof providerInput !== "string" || !providerInput.trim()) {
+    return { provider: null, model: "invalid", combo: null };
+  }
+  const input = providerInput.trim();
+  if (Array.isArray(combos) && getComboModelsFromData(input, combos)) {
+    return { provider: null, model: input, combo: input };
+  }
+  const providerId = resolveProviderId(input);
+  const resolvedProvider = AI_PROVIDERS[providerId];
+  if (!resolvedProvider) return { provider: null, model: "invalid", combo: null };
+  const supportsSearch = !!resolvedProvider.searchConfig || !!resolvedProvider.searchViaChat;
+  return {
+    provider: providerId,
+    model: supportsSearch ? providerId : "invalid",
+    combo: null,
+  };
+}
+
+function applySafeSearchTarget(clientRawRequest, target) {
+  if (!clientRawRequest || !target) return;
+  clientRawRequest.usageTarget = { provider: target.provider, model: target.model };
+  if (target.combo) clientRawRequest.combo = target.combo;
+}
 
 /**
  * Handle web search request for the SSE/Next.js server.
@@ -23,38 +56,57 @@ import { observeRequest, blockMessage } from "@/lib/piiGuard/observe.js";
  * @param {Request} request
  */
 export async function handleSearch(request) {
+  const usageContext = createMediaUsageContext(request);
+  const clientRawRequest = createMediaRawRequest(request, "/v1/search");
+
   let body;
   try {
     body = await request.json();
   } catch {
     log.warn("SEARCH", "Invalid JSON body");
-    return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid JSON body");
+    return recordMediaFailure({
+      response: errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid JSON body"),
+      clientRawRequest,
+      usageContext,
+      errorKind: "bad_request",
+    });
   }
 
-  const url = new URL(request.url);
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    log.warn("SEARCH", "Invalid JSON body");
+    return recordMediaFailure({
+      response: errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid JSON body"),
+      clientRawRequest,
+      usageContext,
+      errorKind: "bad_request",
+    });
+  }
+
+  clientRawRequest.session = resolveExplicitSessionId(clientRawRequest.headers, body);
   // Accept either `provider` or `model` (UI sends `model` since provider IS the model for webSearch)
   let providerInput = body.provider || body.model;
   let query = body.query;
 
-  log.request("POST", `${url.pathname} | ${providerInput}`);
+  log.request("POST", `${clientRawRequest.endpoint} | ${providerInput}`);
 
   // Log API key (masked)
-  const apiKey = extractApiKey(request);
-  if (apiKey) {
-    log.debug("AUTH", `API Key: ${log.maskKey(apiKey)}`);
+  const suppliedApiKey = usageContext.apiKey;
+  if (suppliedApiKey) {
+    log.debug("AUTH", `API Key: ${log.maskKey(suppliedApiKey)}`);
   } else {
     log.debug("AUTH", "No API key provided (local mode)");
   }
 
   // Enforce API key if enabled in settings
-  const settings = await getSettings();
+  const settings = await usageContext.getSettings();
+  const validApiKey = suppliedApiKey ? await usageContext.isApiKeyValid() : false;
+  const apiKey = validApiKey ? suppliedApiKey : null;
   if (settings.requireApiKey) {
-    if (!apiKey) {
+    if (!suppliedApiKey) {
       log.warn("AUTH", "Missing API key (requireApiKey=true)");
       return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");
     }
-    const valid = await isValidApiKey(apiKey);
-    if (!valid) {
+    if (!validApiKey) {
       log.warn("AUTH", "Invalid API key (requireApiKey=true)");
       return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
     }
@@ -62,57 +114,107 @@ export async function handleSearch(request) {
 
   if (!providerInput || typeof providerInput !== "string") {
     log.warn("SEARCH", "Missing provider/model");
-    return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing required field: provider (or model)");
+    return recordMediaFailure({
+      response: errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing required field: provider (or model)"),
+      clientRawRequest,
+      usageContext,
+      errorKind: "bad_request",
+    });
   }
+
+  let cachedCombos = null;
+  const loadCombos = async () => {
+    cachedCombos ??= await getCombos();
+    return cachedCombos;
+  };
 
   if (!query || typeof query !== "string" || !query.trim()) {
     log.warn("SEARCH", "Missing query");
-    return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing required field: query");
+    applySafeSearchTarget(clientRawRequest, resolveSafeSearchUsageTarget(providerInput, await loadCombos().catch(() => [])));
+    return recordMediaFailure({
+      response: errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing required field: query"),
+      clientRawRequest,
+      usageContext,
+      errorKind: "bad_request",
+    });
   }
 
   let guard;
   if (process.env.PII_GUARD_MODULE) {
-    const combo = settings.piiGuard?.mode !== "off" && getComboModelsFromData(providerInput, await getCombos()) ? providerInput : undefined;
-    guard = await observeRequest(body, { endpoint: url.pathname, userAgent: request.headers.get("user-agent"), model: providerInput, combo }, settings.piiGuard);
-    if (guard?.blocked) return errorResponse(HTTP_STATUS.BAD_REQUEST, blockMessage(guard.blocked, false));
+    const combosForGuard = await loadCombos();
+    const combo = settings.piiGuard?.mode !== "off" && getComboModelsFromData(providerInput, combosForGuard) ? providerInput : undefined;
+    guard = await observeRequest(body, {
+      endpoint: clientRawRequest.endpoint,
+      userAgent: request?.headers?.get?.("user-agent") ?? clientRawRequest.headers["user-agent"] ?? null,
+      model: providerInput,
+      combo,
+    }, settings.piiGuard);
+    if (guard?.blocked) {
+      applySafeSearchTarget(clientRawRequest, resolveSafeSearchUsageTarget(providerInput, combosForGuard));
+      return recordMediaFailure({
+        response: errorResponse(HTTP_STATUS.BAD_REQUEST, blockMessage(guard.blocked, false)),
+        clientRawRequest,
+        usageContext,
+        errorKind: "blocked",
+      });
+    }
     providerInput = body.provider || body.model; // redaction may have rewritten it
     query = body.query;
   }
 
   // Combo expansion: providerInput may be a combo name → run fallback/round-robin across providers
-  const combos = await getCombos();
+  const combos = await loadCombos();
   const comboModels = getComboModelsFromData(providerInput, combos);
+  applySafeSearchTarget(clientRawRequest, resolveSafeSearchUsageTarget(providerInput, combos));
 
   // Per-key access control: the provider IS the model here, so a
   // restricted key needs the provider id (or the combo) on its list.
   const keyAccessDenied = await enforceKeyAccessProvider(await getKeyAccessContext(request), providerInput, comboModels);
-  if (keyAccessDenied) return keyAccessDenied;
+  if (keyAccessDenied) {
+    return recordMediaFailure({
+      response: keyAccessDenied,
+      clientRawRequest,
+      usageContext,
+      errorKind: "blocked",
+    });
+  }
+
+  const isAborted = () => Boolean(request?.signal?.aborted);
   if (comboModels) {
     const comboStrategies = settings.comboStrategies || {};
     const comboStrategy = comboStrategies[providerInput]?.fallbackStrategy || settings.comboStrategy || "fallback";
     const comboStickyLimit = settings.comboStickyRoundRobinLimit;
     log.info("SEARCH", `Combo "${providerInput}" with ${comboModels.length} providers (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
-    return handleComboChat({
+    return withMediaLogicalUsage(handleComboChat({
       body,
       models: comboModels,
-      handleSingleModel: (b, m) => handleSingleProviderSearch(b, m, request, apiKey, settings, guard, providerInput),
+      handleSingleModel: (b, m) => handleSingleProviderSearch(b, m, request, apiKey, settings, guard, providerInput, clientRawRequest),
       log,
       comboName: providerInput,
       comboStrategy,
       comboStickyLimit
-    });
+    }), clientRawRequest, usageContext, { isAborted });
   }
 
-  return handleSingleProviderSearch(body, providerInput, request, apiKey, settings, guard);
+  return withMediaLogicalUsage(
+    handleSingleProviderSearch(body, providerInput, request, apiKey, settings, guard, null, clientRawRequest),
+    clientRawRequest,
+    usageContext,
+    { isAborted }
+  );
 }
 
-async function handleSingleProviderSearch(body, providerInput, request, apiKey, settings, guard, combo) {
+async function handleSingleProviderSearch(body, providerInput, request, apiKey, settings, guard, combo, clientRawRequest) {
   const query = body.query;
   const providerId = resolveProviderId(providerInput);
   const resolvedProvider = AI_PROVIDERS[providerId];
 
   if (!resolvedProvider) {
     log.warn("SEARCH", "Unknown provider", { provider: providerInput });
+    if (clientRawRequest) {
+      clientRawRequest.usageTarget = { provider: null, model: combo || "invalid" };
+      if (clientRawRequest.usageState) clientRawRequest.usageState.failureKind = "not_found";
+    }
     return errorResponse(HTTP_STATUS.BAD_REQUEST, `Unknown provider: ${providerInput}`);
   }
 
@@ -121,7 +223,15 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
 
   if (!supportsSearch) {
     log.warn("SEARCH", "Provider does not support web search", { provider: providerId });
+    if (clientRawRequest) {
+      clientRawRequest.usageTarget = { provider: providerId, model: combo || "invalid" };
+      if (clientRawRequest.usageState) clientRawRequest.usageState.failureKind = "bad_request";
+    }
     return errorResponse(HTTP_STATUS.BAD_REQUEST, `Provider ${providerId} does not support web search`);
+  }
+
+  if (clientRawRequest) {
+    clientRawRequest.usageTarget = { provider: providerId, model: providerId };
   }
 
   if (providerInput !== providerId) {
@@ -156,7 +266,20 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
       log
     });
     await guard?.recordRouting?.({ provider: providerId, resolvedModel: providerId, account: null, ...(combo && { combo }) });
-    if (result.success) return result.response;
+    if (result.success) {
+      await saveUsageStats({
+        provider: providerId,
+        model: providerId,
+        tokens: { prompt_tokens: 0, completion_tokens: 0 },
+        connectionId: null,
+        apiKey,
+        endpoint: clientRawRequest?.endpoint,
+        clientRawRequest,
+        label: "SEARCH",
+        silent: true,
+      });
+      return result.response;
+    }
     return result.response;
   }
 
@@ -203,10 +326,15 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
       }
       if (excludeConnectionIds.size === 0) {
         log.error("AUTH", `No credentials for provider: ${providerId}`);
+        if (clientRawRequest?.usageState) clientRawRequest.usageState.failureKind = "auth";
         return errorResponse(HTTP_STATUS.BAD_REQUEST, `No credentials for provider: ${providerId}`);
       }
       log.warn("SEARCH", "No more accounts available", { provider: providerId });
       return errorResponse(lastStatus || HTTP_STATUS.SERVICE_UNAVAILABLE, lastError || "All accounts unavailable");
+    }
+
+    if (clientRawRequest && credentials?.connectionId) {
+      clientRawRequest.usageTarget = { ...clientRawRequest.usageTarget, connectionId: credentials.connectionId };
     }
 
     log.info("AUTH", `\x1b[32mUsing ${providerId} account: ${credentials.connectionName}\x1b[0m`);
@@ -233,7 +361,20 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
     });
 
     await guard?.recordRouting?.({ provider: providerId, resolvedModel: providerId, account: credentials.connectionName, ...(combo && { combo }) });
-    if (result.success) return result.response;
+    if (result.success) {
+      await saveUsageStats({
+        provider: providerId,
+        model: providerId,
+        tokens: { prompt_tokens: 0, completion_tokens: 0 },
+        connectionId: credentials.connectionId,
+        apiKey,
+        endpoint: clientRawRequest?.endpoint,
+        clientRawRequest,
+        label: "SEARCH",
+        silent: true,
+      });
+      return result.response;
+    }
 
     const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, credentialProviderId, searchLockKey);
 

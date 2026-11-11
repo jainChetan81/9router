@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import { saveRequestUsage, appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
-import { COLORS } from "../../utils/stream.js";
-import { canonicalizeUsage } from "../../utils/usageTracking.js";
+import { COLORS, canonicalizeUsage } from "../../utils/usageTracking.js";
 import { collectToolErrors } from "@/lib/agents/toolErrors.js";
 import { sanitizeToolName } from "../../utils/toolTelemetry.js";
 

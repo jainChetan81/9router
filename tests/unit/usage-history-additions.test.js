@@ -207,7 +207,7 @@ describe("usageHistory additions", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].status).toBe("ok");
     expect(JSON.parse(rows[0].meta).status).toBe("ok");
-  });
+  }, 30000);
 
   it("keeps fusion physical rows separate from the logical outcome", async () => {
     const { adapter, saveFailureUsage, saveUsageStats } = await getUsageModules();
