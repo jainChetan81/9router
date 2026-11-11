@@ -77,6 +77,24 @@ describe("stream TTFT telemetry", () => {
         { text: 'data: {"candidates":[{"content":{"parts":[{"text":"hello"}]}}]}\n\n', delayBefore: true, semantic: true },
       ],
     },
+    {
+      label: "Ollama message content",
+      format: FORMATS.OLLAMA,
+      mode: "passthrough",
+      chunks: [
+        { text: 'data: {"model":"llama","message":{"role":"assistant","content":""}}\n\n' },
+        { text: 'data: {"model":"llama","message":{"role":"assistant","content":"hi"}}\n\n', delayBefore: true, semantic: true },
+      ],
+    },
+    {
+      label: "Kiro OpenAI-shaped chunk",
+      format: FORMATS.KIRO,
+      mode: "passthrough",
+      chunks: [
+        { text: 'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n' },
+        { text: 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n', delayBefore: true, semantic: true },
+      ],
+    },
   ])("starts at the first semantic token for $label", async ({ format, mode, chunks }) => {
     const { ttftAt, tokenSentAt } = await collectTTFT({ format, mode, chunks });
     expect(ttftAt).toBeGreaterThanOrEqual(tokenSentAt);

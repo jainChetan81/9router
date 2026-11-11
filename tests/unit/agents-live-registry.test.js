@@ -95,6 +95,26 @@ describe("agents live registry", () => {
     }
   });
 
+  it("keeps a streaming entry past 10 minutes and drops it after 1 hour", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-11-11T00:00:00.000Z"));
+      const reqId = `stream-${crypto.randomUUID()}`;
+      const session = "stream-session-1";
+      expect(register(reqId, { session, model: "openai/gpt-4o-mini", startedAt: 100 })).toBe(true);
+      vi.advanceTimersByTime(60 * 1000);
+      expect(markFirstToken(reqId, 200)).toBe(true);
+
+      vi.advanceTimersByTime(20 * 60 * 1000);
+      expect(snapshot()[sessionKey(session)]).toHaveLength(1);
+
+      vi.advanceTimersByTime(40 * 60 * 1000);
+      expect(snapshot()[sessionKey(session)]).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("accepts an explicit monotonic timestamp on markFirstToken and preserves the first value", () => {
     const reqId = `ttft-${crypto.randomUUID()}`;
     const session = "ttft-session-1";

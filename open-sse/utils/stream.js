@@ -46,6 +46,13 @@ function hasOpenAIChatToken(parsed) {
   });
 }
 
+function hasOllamaToken(parsed) {
+  const msg = parsed?.message;
+  if (!msg) return hasOpenAIChatToken(parsed);
+  return [msg.content, msg.thinking].some(hasNonEmptyText) ||
+    (Array.isArray(msg.tool_calls) && msg.tool_calls.some((call) => hasNonEmptyText(call?.function?.name)));
+}
+
 function hasClaudeToken(parsed) {
   if (parsed?.type === "content_block_start") return parsed.content_block?.type === "tool_use";
   if (parsed?.type !== "content_block_delta") return false;
@@ -77,7 +84,9 @@ function hasSemanticToken(parsed, format, eventName) {
   if (format === FORMATS.CLAUDE) return hasClaudeToken(parsed);
   if (format === FORMATS.OPENAI_RESPONSES) return hasResponsesToken(parsed, eventName);
   if ([FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.VERTEX, FORMATS.ANTIGRAVITY].includes(format)) return hasGeminiToken(parsed);
-  if ([FORMATS.OPENAI, FORMATS.OPENAI_RESPONSE].includes(format)) return hasOpenAIChatToken(parsed);
+  // Kiro chunks arrive in OpenAI chat shape from its executor.
+  if ([FORMATS.OPENAI, FORMATS.OPENAI_RESPONSE, FORMATS.KIRO].includes(format)) return hasOpenAIChatToken(parsed);
+  if (format === FORMATS.OLLAMA) return hasOllamaToken(parsed);
   return false;
 }
 

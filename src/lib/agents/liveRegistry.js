@@ -15,6 +15,9 @@ import { sessionKey } from "./sessionKey.js";
 const REGISTRY_KEY = Symbol.for("9router.agents.liveRegistry");
 const MAX_ENTRIES = 500;
 const TTL_MS = 10 * 60 * 1000;
+// A request that already streams its first token ends through unregister().
+// This longer limit only removes entries whose terminal cleanup was missed.
+const STREAMING_TTL_MS = 60 * 60 * 1000;
 
 const state = globalThis[REGISTRY_KEY] || (globalThis[REGISTRY_KEY] = { entries: new Map() });
 
@@ -40,11 +43,14 @@ function cleanHash(value) {
   return /^(?:sha256:)?[a-f\d]{32,128}$/i.test(hash) ? hash : null;
 }
 
+function isExpired(entry, now) {
+  return now - entry.registeredAt > (entry.firstTokenAt == null ? TTL_MS : STREAMING_TTL_MS);
+}
+
 function pruneExpired(now) {
-  // Entries use Map insertion order, so expired entries are always at the head.
+  // At most MAX_ENTRIES entries, so a full scan is cheap.
   for (const [reqId, entry] of state.entries) {
-    if (now - entry.registeredAt <= TTL_MS) break;
-    state.entries.delete(reqId);
+    if (isExpired(entry, now)) state.entries.delete(reqId);
   }
 }
 
@@ -89,7 +95,7 @@ export function markFirstToken(reqId, at = null) {
     if (!id) return false;
     const entry = state.entries.get(id);
     if (!entry) return false;
-    if (Date.now() - entry.registeredAt > TTL_MS) {
+    if (isExpired(entry, Date.now())) {
       state.entries.delete(id);
       return false;
     }
