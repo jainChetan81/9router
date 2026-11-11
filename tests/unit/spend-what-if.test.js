@@ -7,4 +7,10 @@ describe("what-if estimate", () => {
     expect(result.cost).toBeCloseTo(1.5);
     expect(result.delta).toBeCloseTo(-0.5);
   });
+
+  it("charges reasoning tokens at the reasoning rate, falling back to output", () => {
+    const base = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, reasoning: 1_000_000, cost: 0 };
+    expect(estimateMove(base, { input: 1, output: 4, reasoning: 6 }).cost).toBeCloseTo(6);
+    expect(estimateMove(base, { input: 1, output: 4 }).cost).toBeCloseTo(4);
+  });
 });

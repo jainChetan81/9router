@@ -1,9 +1,29 @@
 import { NextResponse } from "next/server";
 import { getAdapter } from "@/lib/db/driver.js";
-import { getSettings, updateSettings } from "@/lib/localDb";
+import { getSettings, updateSettings, getPricingForModel } from "@/lib/localDb";
 import { SUBS, aggregateSpend, invalidateSpendCache } from "@/lib/spend/aggregate.js";
 
 export const dynamic = "force-dynamic";
+
+// What-if targets: every provider/model pair seen in the last 60 days, with the
+// same effective price the usage logger uses (user override, then defaults).
+async function resolveWhatIfTargets(db) {
+  try {
+    const rows = db.all(`SELECT DISTINCT provider, model FROM usageHistory
+      WHERE timestamp >= ? AND provider IS NOT NULL AND model IS NOT NULL AND model != 'invalid' LIMIT 500`,
+      [new Date(Date.now() - 60 * 86400000).toISOString()]);
+    const out = [];
+    for (const { provider, model } of rows) {
+      const p = await getPricingForModel(provider, model);
+      if (p && Number.isFinite(p.input) && Number.isFinite(p.output) && (p.input > 0 || p.output > 0)) {
+        out.push({ provider, model, price: { input: p.input, output: p.output, cached: p.cached, cache_creation: p.cache_creation, reasoning: p.reasoning } });
+      }
+    }
+    return out.sort((a, b) => `${a.provider}/${a.model}`.localeCompare(`${b.provider}/${b.model}`));
+  } catch {
+    return [];
+  }
+}
 
 const FEE_NUM = /^\d*\.?\d+$|^\d+\.$/;
 
@@ -13,7 +33,8 @@ export async function GET(request) {
     const params = new URL(request.url).searchParams;
     const settings = await getSettings();
     const payload = aggregateSpend(db, { params, now: Date.now(), fees: settings.spendFees || {} });
-    return NextResponse.json(payload, { headers: { "Cache-Control": "no-store" } });
+    const whatIfTargets = await resolveWhatIfTargets(db);
+    return NextResponse.json({ ...payload, whatIfTargets }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     return NextResponse.json({ error: error.message }, { status: 500 });
   }

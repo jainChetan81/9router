@@ -112,6 +112,7 @@ const REAL_EST_EXPR = `(CASE WHEN ${REAL_SET} THEN 0.0 WHEN provider IN ('openro
 const PT_EXPR = `COALESCE(CASE WHEN ${TOK_VALID} THEN NULLIF(json_extract(tokens, '$.prompt_tokens'), '') END, CASE WHEN ${TOK_VALID} THEN NULLIF(json_extract(tokens, '$.input_tokens'), '') END, promptTokens, 0)`;
 const CR_EXPR = `MAX(0, COALESCE(CASE WHEN ${TOK_VALID} THEN NULLIF(json_extract(tokens, '$.cached_tokens'), '') END, CASE WHEN ${TOK_VALID} THEN NULLIF(json_extract(tokens, '$.cache_read_input_tokens'), '') END, 0))`;
 const CW_EXPR = `MAX(0, COALESCE(CASE WHEN ${TOK_VALID} THEN NULLIF(json_extract(tokens, '$.cache_creation_input_tokens'), '') END, 0))`;
+const RS_EXPR = `MAX(0, COALESCE(CASE WHEN ${TOK_VALID} THEN NULLIF(json_extract(tokens, '$.reasoning_tokens'), '') END, 0))`;
 const OUT_EXPR = `MAX(0, COALESCE(CASE WHEN ${TOK_VALID} THEN NULLIF(json_extract(tokens, '$.completion_tokens'), '') END, CASE WHEN ${TOK_VALID} THEN NULLIF(json_extract(tokens, '$.output_tokens'), '') END, completionTokens, 0))`;
 
 export function aggregateSpend(db, { params, now = Date.now(), fees = {}, skipCache = false } = {}) {
@@ -198,7 +199,8 @@ export function aggregateSpend(db, { params, now = Date.now(), fees = {}, skipCa
        SUM(MAX(0, (${PT_EXPR}) - (${CR_EXPR}) - (${CW_EXPR}))) AS inSum,
        SUM(${CR_EXPR}) AS crSum,
        SUM(${CW_EXPR}) AS cwSum,
-       SUM(${OUT_EXPR}) AS outSum
+       SUM(${OUT_EXPR}) AS outSum,
+       SUM(${RS_EXPR}) AS rsSum
      FROM usageHistory
      WHERE ${tsWhere}
      GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9
@@ -231,15 +233,16 @@ export function aggregateSpend(db, { params, now = Date.now(), fees = {}, skipCa
       cacheRead: Number(r.crSum) || 0,
       cacheWrite: Number(r.cwSum) || 0,
       output: Number(r.outSum) || 0,
+      reasoning: Number(r.rsSum) || 0,
     };
 
     for (const [kind, name] of [["model", r.model], ["combo", r.hasUa ? (r.combo || "main") : null]]) {
       if (!name) continue;
       const id = JSON.stringify([kind, name]);
       let group = whatIfGroups.get(id);
-      if (!group) whatIfGroups.set(id, group = { kind, name, cost: 0, req: 0, input: 0, cacheRead: 0, cacheWrite: 0, output: 0 });
+      if (!group) whatIfGroups.set(id, group = { kind, name, cost: 0, req: 0, input: 0, cacheRead: 0, cacheWrite: 0, output: 0, reasoning: 0 });
       group.cost += costSum; group.req += rReq;
-      for (const key of ["input", "cacheRead", "cacheWrite", "output"]) group[key] += split[key];
+      for (const key of ["input", "cacheRead", "cacheWrite", "output", "reasoning"]) group[key] += split[key];
     }
 
     const provider = r.provider || "unknown";
