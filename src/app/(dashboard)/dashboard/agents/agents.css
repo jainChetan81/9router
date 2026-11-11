@@ -114,17 +114,20 @@
   [data-r9] .r9-sessions-layout [role="option"] { grid-template-columns: 16px minmax(0,1fr) !important; min-height: 44px !important; }
   [data-r9] .r9-sessions-layout [role="option"] > span:nth-child(2) { flex-wrap: wrap; }
   [data-r9] .r9-sessions-layout [role="option"] > span:nth-child(2) > span:first-child { overflow-wrap: anywhere; word-break: break-word; font-size: 11.5px; }
-  [data-r9] .r9-session-row { grid-template-columns: 16px minmax(0,1fr) 8px auto !important; }
-  [data-r9] .r9-session-row > span:nth-child(4) { grid-column: 2 / 3 !important; justify-self: start !important; font-size: 11px !important; white-space: normal !important; }
+  [data-r9] .r9-session-row { grid-template-columns: 16px minmax(0,1fr) !important; }
+  [data-r9] .r9-session-row > span:nth-child(2) { grid-column: 2 !important; overflow: visible !important; overflow-wrap: anywhere; }
+  [data-r9] .r9-session-row > span:nth-child(4) { grid-column: 2 !important; grid-row: 2; justify-self: start !important; font-size: 11px !important; white-space: normal !important; }
   [data-r9] .r9-sessions-layout [role="option"] > span:nth-child(3) { display: none !important; }
   [data-r9] .r9-sessions-layout [role="option"] > span:nth-child(4) { grid-column: 2 !important; justify-self: start !important; font-size: 11px !important; }
   [data-r9] .r9-sessions-layout [role="listbox"] { max-height: 50vh !important; }
   [data-r9] .r9-client-filter { max-width: 100%; }
   [data-r9] .r9-client-filter button { height: 36px; }
   [data-r9] .r9-sessions-layout select, [data-r9] .r9-sessions-layout input { height: 36px !important; }
-  [data-r9] .r9-detail-role { grid-template-columns: auto minmax(0,1fr) auto; padding: 6px 0; }
+  [data-r9] .r9-detail-role { grid-template-columns: minmax(0,1fr) auto; padding: 6px 0; }
+  [data-r9] .r9-detail-role > span:first-child { grid-column: 1 / -1; justify-self: start; }
+  [data-r9] .r9-detail-model { grid-column: 1 / -1; white-space: normal; overflow: visible; overflow-wrap: anywhere; }
   [data-r9] .r9-share-track { display: none; }
-  [data-r9] .r9-detail-role b { grid-column: 3; }
+  [data-r9] .r9-detail-role b { grid-column: 2; }
   [data-r9] .r9-routing-controls { grid-template-columns: 1fr; }
   [data-r9] .r9-routing-controls select, [data-r9] .r9-routing-controls [role="group"] button { height: 36px !important; }
   [data-r9] .r9-timeline-toolbar { align-items: flex-start; flex-direction: column; }
