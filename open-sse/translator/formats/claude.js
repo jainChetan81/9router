@@ -59,10 +59,13 @@ export function hasValidContent(msg) {
 // some clients send the bare object). Wrap it as a one-block array and strip any
 // client-placed cache_control: a bare-object marker must never survive
 // normalization, on any path, guard or no guard.
-function normalizeMessageContent(msg) {
+function normalizeMessageContent(msg, preserveSignedThinking = false) {
   const c = msg?.content;
   if (c && typeof c === "object" && !Array.isArray(c)) {
-    delete c.cache_control;
+    const keepCacheControl = preserveSignedThinking
+      && (c.type === CLAUDE_BLOCK.THINKING || c.type === CLAUDE_BLOCK.REDACTED_THINKING)
+      && isValidClaudeSignature(c.signature);
+    if (!keepCacheControl) delete c.cache_control;
     msg.content = [c];
   }
   return msg;
@@ -336,7 +339,9 @@ export function normalizeClaudePassthrough(body, model = "") {
       if (!Array.isArray(msg.content)) return true;
       msg.content = msg.content.filter(block =>
         !(block?.type === CLAUDE_BLOCK.TEXT && !String(block.text ?? "").trim())
-        && !(block?.type === CLAUDE_BLOCK.THINKING && !String(block.thinking ?? "").trim()));
+        && !((block?.type === CLAUDE_BLOCK.THINKING || block?.type === CLAUDE_BLOCK.REDACTED_THINKING)
+          && !String(block.thinking ?? "").trim()
+          && !isValidClaudeSignature(block.signature)));
       return msg.content.length > 0;
     });
     body.messages = ensureTrailingUserTurn(body.messages, originalLastRole);
@@ -566,12 +571,16 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
     // Pass 1: remove cache_control + filter empty messages
     for (let i = 0; i < len; i++) {
       const msg = body.messages[i];
-      normalizeMessageContent(msg);
+      normalizeMessageContent(msg, provider === "claude");
 
       // Remove cache_control from content blocks
       if (Array.isArray(msg.content)) {
         for (const block of msg.content) {
-          delete block.cache_control;
+          if (!(provider === "claude"
+            && (block.type === CLAUDE_BLOCK.THINKING || block.type === CLAUDE_BLOCK.REDACTED_THINKING)
+            && isValidClaudeSignature(block.signature))) {
+            delete block.cache_control;
+          }
         }
       }
 
@@ -632,21 +641,20 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
           // Claude native: preserve valid signatures, drop invalid blocks.
           // anthropic-compatible: replace with default (safe fallback for lenient upstreams).
           // DeepSeek (official + opencode-go models): keep existing thinking as-is;
-          // add an unsigned placeholder only if missing.
-          // Every branch: a block with no visible thinking text goes — the upstream
-          // Messages API rejects it outright (400 "each thinking block must contain
-          // non-whitespace thinking"), and a valid signature does not save it.
+          // add an unsigned placeholder only if missing. Native Claude preserves every
+          // validly signed block unchanged, including Fable's empty-text signatures.
           const isClaudeNative = provider === "claude";
           const kept = [];
           for (const block of msg.content) {
             const isThinking = block.type === CLAUDE_BLOCK.THINKING || block.type === CLAUDE_BLOCK.REDACTED_THINKING;
             if (isThinking) {
-              if (!String(block.thinking ?? "").trim()) continue;
               if (isClaudeNative) {
                 if (isValidClaudeSignature(block.signature)) {
                   hasKeptThinking = true;
                   kept.push(block);
                 }
+              } else if (!String(block.thinking ?? "").trim()) {
+                continue;
               } else if (deepSeekServed) {
                 hasKeptThinking = true;
                 kept.push(block);

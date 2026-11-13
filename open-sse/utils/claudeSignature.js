@@ -1,6 +1,7 @@
 // Claude thinking signature validation (ported from CLIProxyAPI internal/signature).
 // E-form: single-layer base64, decoded[0] == 0x12 (Claude marker).
 // R-form: double-layer base64, outer decoded[0] == 'E', inner decoded[0] == 0x12.
+// Fable form: protobuf bytes start with field-1 varint (0x08), then field-2 (0x12).
 // Cache prefix "...#sig" stripped before validation.
 
 const MAX_CLAUDE_SIGNATURE_LEN = 32 * 1024 * 1024;
@@ -33,6 +34,13 @@ export function isValidClaudeSignature(rawSignature) {
       if (!outer.length || outer[0] !== 0x45) return false; // 'E'
       const inner = Buffer.from(outer.toString(), "base64");
       return inner.length > 0 && inner[0] === CLAUDE_SIGNATURE_MARKER;
+    }
+    const decoded = Buffer.from(sig, "base64");
+    if (decoded.length >= 3 && decoded[0] === 0x08) {
+      // Skip the field-1 varint and require the next protobuf tag to be 0x12.
+      let i = 1;
+      while (i < decoded.length && (decoded[i++] & 0x80) !== 0) {}
+      return i < decoded.length && decoded[i] === CLAUDE_SIGNATURE_MARKER;
     }
     return false;
   } catch {
