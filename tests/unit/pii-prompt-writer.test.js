@@ -59,6 +59,43 @@ describeIfLibrary("prompt store batching", () => {
   });
 });
 
+describeIfLibrary("prompt store insert idempotency", () => {
+  const row = (i, sessionId = "s") => ({ ts: Date.now() + i, requestId: `r${i}`, sessionId, model: null, provider: null, combo: null, account: null, client: null, role: "user", kind: "text", path: `messages[0].content`, text: `row ${i}`, cut: 0, hashes: "", digest: `dg${i}`, tool: null });
+
+  it("a retried batch inserts nothing twice, even after a worker restart", () => {
+    const h = D.openDb(file);
+    const ops = [1, 2, 3].map((i) => ({ row: row(i) }));
+    expect(D.writeOps(h, ops)).toMatchObject({ stored: 3 });
+    // The same batch arrives again (late retry after an RPC timeout).
+    expect(D.writeOps(h, ops)).toMatchObject({ stored: 0 });
+    // And again from a fresh connection, as the writer thread would.
+    D.closeDb(h);
+    const h2 = D.openDb(file);
+    expect(D.writeOps(h2, ops)).toMatchObject({ stored: 0 });
+    expect(h2.db.prepare("SELECT COUNT(*) AS n FROM messages").get().n).toBe(3);
+    expect(D.textBytes(h2)).toBe(D.writeOps(h2, []).stored ? 0 : sum2(h2));
+  });
+
+  const sum2 = (h) => Number(h.db.prepare("SELECT COALESCE(SUM(length(CAST(text AS BLOB))), 0) AS n FROM messages").get().n);
+
+  it("pre-existing duplicates are deduped before the unique index is created", () => {
+    const h = D.openDb(file);
+    const ops = [1, 2, 3].map((i) => ({ row: row(i) }));
+    D.writeOps(h, ops);
+    D.closeDb(h);
+    // Simulate a database from an even older build: no unique index yet and a
+    // duplicate row inside. Drop the index, duplicate a row, then reopen.
+    const raw = D.openDb(file);
+    raw.db.exec("DROP INDEX IF EXISTS messages_dedupe");
+    raw.db.exec(`INSERT INTO messages (ts, request_id, session_id, role, kind, path, text, cut, hashes, digest)
+      SELECT ts, request_id, session_id, role, kind, path, text, cut, hashes, digest FROM messages LIMIT 1`);
+    D.closeDb(raw);
+    const h2 = D.openDb(file); // runs the dedupe-then-index migration
+    expect(h2.db.prepare("SELECT COUNT(*) AS n FROM messages").get().n).toBe(3);
+    D.closeDb(h2);
+  });
+});
+
 describeIfLibrary("prompt store retention", () => {
   const fill = (h, n, size, ts = Date.now()) => D.writeOps(h, Array.from({ length: n }, (_, i) => ({ row: { ts: ts + i, requestId: `r${i}`, sessionId: "s", model: null, provider: null, combo: null, account: null, client: null, role: "user", kind: "text", path: "p", text: `w${i} `.repeat(Math.ceil(size / 6)).slice(0, size), cut: 0, hashes: "", digest: `d${i}`, tool: null } })));
   const sum = (h) => Number(h.db.prepare("SELECT COALESCE(SUM(length(CAST(text AS BLOB))), 0) AS n FROM messages").get().n);

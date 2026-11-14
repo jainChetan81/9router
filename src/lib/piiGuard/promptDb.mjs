@@ -40,6 +40,14 @@ export function openDb(file, { busyTimeout = 0 } = {}) {
       CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text); END;
       CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.id, old.text); END;
       CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);`);
+    // Idempotent inserts: a digest identifies one message of a session. After
+    // an RPC timeout the worker may still have written the batch before the
+    // late retry arrives, so re-running it must not duplicate rows.
+    // Additive and crash-safe for an existing live database: deduplicate any
+    // existing digest pairs first, then create the unique index.
+    db.exec(`DELETE FROM messages WHERE digest IS NOT NULL AND rowid NOT IN (
+        SELECT MIN(rowid) FROM messages WHERE digest IS NOT NULL GROUP BY session_id, request_id, path, digest);`);
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS messages_dedupe ON messages(session_id, request_id, path, digest);`);
     // Migration for rows a schema without the routing columns created: add them, old rows stay NULL.
     // A lock or a lost race against another opener retries a few times; missing columns mean the
     // connection is not used (prompts stay off) rather than INSERTs failing on every row.
@@ -78,10 +86,12 @@ export function usedBytes(h) {
   return (n("page_count") - n("freelist_count")) * n("page_size");
 }
 
-/** One transaction for a whole batch. `ops` keeps request order: { row } inserts, { route } updates a request's rows. */
+/** One transaction for a whole batch. `ops` keeps request order: { row } inserts, { route } updates a request's rows.
+ *  Inserts are idempotent on (session_id, request_id, path, digest): a batch a timed-out call retries after the
+ *  worker already wrote it inserts nothing the second time. */
 export function writeOps(h, ops) {
   const d = h.db;
-  const ins = d.prepare("INSERT INTO messages (ts, request_id, session_id, model, provider, combo, account, client, role, kind, path, text, cut, hashes, digest, tool) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+  const ins = d.prepare("INSERT OR IGNORE INTO messages (ts, request_id, session_id, model, provider, combo, account, client, role, kind, path, text, cut, hashes, digest, tool) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
   const upd = d.prepare("UPDATE messages SET provider=?, combo=?, account=? WHERE request_id=?");
   let stored = 0, bytes = 0;
   d.exec("BEGIN IMMEDIATE");
@@ -89,7 +99,8 @@ export function writeOps(h, ops) {
     for (const op of ops) {
       if (op.route) { upd.run(op.route.provider ?? null, op.route.combo ?? null, op.route.account ?? null, op.route.requestId); continue; }
       const r = op.row;
-      ins.run(r.ts, r.requestId, r.sessionId, r.model, r.provider, r.combo, r.account, r.client, r.role, r.kind, r.path, r.text, r.cut, r.hashes, r.digest, r.tool);
+      const info = ins.run(r.ts, r.requestId, r.sessionId, r.model, r.provider, r.combo, r.account, r.client, r.role, r.kind, r.path, r.text, r.cut, r.hashes, r.digest, r.tool);
+      if (Number(info?.changes) === 0) continue; // already stored: the retry hit a duplicate
       stored++; bytes += Buffer.byteLength(r.text);
     }
     if (bytes) d.prepare("UPDATE meta SET value = value + ? WHERE key = 'text_bytes'").run(bytes);
