@@ -17,7 +17,19 @@ import { cacheGet, cacheSet, isFresh } from "@/lib/clientCache";
 const RANGE_TTL = 5 * 60_000;
 
 let detailRequestSequence = 0;
+// Sequence per session so a finished fetch does not overwrite a newer one.
+// Bounded: oldest entry goes once the cap is reached (only in-flight fetches
+// read it, so evicting stale ids is safe).
 const overrideRequestIds = new Map();
+const OVERRIDE_IDS_MAX = 200;
+function nextOverrideRequestId(sid) {
+  if (overrideRequestIds.size >= OVERRIDE_IDS_MAX && !overrideRequestIds.has(sid)) {
+    overrideRequestIds.delete(overrideRequestIds.keys().next().value);
+  }
+  const requestId = (overrideRequestIds.get(sid) || 0) + 1;
+  overrideRequestIds.set(sid, requestId);
+  return requestId;
+}
 
 // Last answer per URL with its ETag. The Agents GET routes reply 304 when the
 // data did not change; the stored answer is then reused as it is.
@@ -109,8 +121,7 @@ export default function AgentsClient() {
 
   const refreshOverrides = useCallback(async (sid) => {
     if (!sid) return {};
-    const requestId = (overrideRequestIds.get(sid) || 0) + 1;
-    overrideRequestIds.set(sid, requestId);
+    const requestId = nextOverrideRequestId(sid);
     const data = await getJson(`/api/agents/sessions/${encodeURIComponent(sid)}/overrides`);
     if (overrideRequestIds.get(sid) === requestId) {
       setOverridesBySession((old) => ({ ...old, [sid]: { overrides: data.overrides || [], revisions: data.revisions || {} } }));
@@ -185,11 +196,7 @@ export default function AgentsClient() {
     if (now - lastOverridePoll.current < 10000) return;
     lastOverridePoll.current = now;
     let cancelled = false;
-    const reqIds = Object.fromEntries(ids.map((sid) => {
-      const requestId = (overrideRequestIds.get(sid) || 0) + 1;
-      overrideRequestIds.set(sid, requestId);
-      return [sid, requestId];
-    }));
+    const reqIds = Object.fromEntries(ids.map((sid) => [sid, nextOverrideRequestId(sid)]));
     // One batch request for every live session (was one request per session).
     getJson(`/api/agents/overrides?ids=${ids.map(encodeURIComponent).join(",")}`).then((d) => {
       if (cancelled) return;
