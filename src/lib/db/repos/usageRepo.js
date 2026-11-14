@@ -1,7 +1,7 @@
 import { EventEmitter } from "events";
 import { getAdapter, getAdapterSync } from "../driver.js";
 import { parseJson, stringifyJson } from "../helpers/jsonCol.js";
-import { getMeta, setMeta } from "../helpers/metaStore.js";
+import { getMeta, setMeta, setMetaSync } from "../helpers/metaStore.js";
 import { DAY_MS, fmtIstDay, fmtIstHhmm, istDayKey, istDayKeyOffset, istDayKeyToMs, istMidnightMs } from "../../spend/time.js";
 import { bumpCoalesced } from "../../live/bus.js";
 
@@ -106,6 +106,26 @@ function scheduleDailyFlush() {
   usageDailyBuffer.timer?.unref?.();
 }
 
+// Highest usageHistory id folded into usageDaily, stored in _meta inside the
+// same transaction as the merged rows. A crash between flushes loses only the
+// in-memory buffer; rows past this marker are re-aggregated at startup.
+const FLUSHED_MAX_ID_KEY = "usageDailyFlushedMaxId";
+
+// Merge one rollup delta into usageDaily and record the history marker. Runs
+// inside a transaction, so the marker can never name a row whose rollup was
+// not written.
+function mergeSnapshotIntoDaily(db, snapshot) {
+  const maxRow = db.get(`SELECT MAX(id) AS m FROM usageHistory`);
+  const maxId = Number(maxRow?.m) || 0;
+  for (const [dateKey, delta] of snapshot) {
+    const row = db.get(`SELECT data FROM usageDaily WHERE dateKey = ?`, [dateKey]);
+    const day = row ? parseJson(row.data, getEmptyDay()) : getEmptyDay();
+    mergeDay(day, delta);
+    db.run(`INSERT INTO usageDaily(dateKey, data) VALUES(?, ?) ON CONFLICT(dateKey) DO UPDATE SET data = excluded.data`, [dateKey, stringifyJson(day)]);
+  }
+  if (maxId) setMetaSync(db, FLUSHED_MAX_ID_KEY, maxId);
+}
+
 async function flushDailyBuffer() {
   if (usageDailyBuffer.days.size === 0) return;
 
@@ -117,14 +137,7 @@ async function flushDailyBuffer() {
   usageDailyBuffer.days = new Map();
   try {
     const db = getAdapterSync();
-    db.transaction(() => {
-      for (const [dateKey, delta] of snapshot) {
-        const row = db.get(`SELECT data FROM usageDaily WHERE dateKey = ?`, [dateKey]);
-        const day = row ? parseJson(row.data, getEmptyDay()) : getEmptyDay();
-        mergeDay(day, delta);
-        db.run(`INSERT INTO usageDaily(dateKey, data) VALUES(?, ?) ON CONFLICT(dateKey) DO UPDATE SET data = excluded.data`, [dateKey, stringifyJson(day)]);
-      }
-    });
+    db.transaction(() => mergeSnapshotIntoDaily(db, snapshot));
   } catch (err) {
     // Roll the failed snapshot back into the buffer so nothing is lost.
     for (const [dateKey, delta] of snapshot) {
@@ -492,23 +505,76 @@ const _shutdownUsageFlush = () => {
     }
     if (usageDailyBuffer.days.size > 0) {
       const db = getAdapterSync();
-      db.transaction(() => {
-        for (const [dateKey, delta] of usageDailyBuffer.days) {
-          const row = db.get(`SELECT data FROM usageDaily WHERE dateKey = ?`, [dateKey]);
-          const day = row ? parseJson(row.data, getEmptyDay()) : getEmptyDay();
-          mergeDay(day, delta);
-          db.run(`INSERT INTO usageDaily(dateKey, data) VALUES(?, ?) ON CONFLICT(dateKey) DO UPDATE SET data = excluded.data`, [dateKey, stringifyJson(day)]);
-        }
-      });
+      db.transaction(() => mergeSnapshotIntoDaily(db, usageDailyBuffer.days));
       usageDailyBuffer.days.clear();
     }
   } catch {}
 };
 
-process.on("beforeExit", _shutdownUsageFlush);
-process.on("SIGINT", _shutdownUsageFlush);
-process.on("SIGTERM", _shutdownUsageFlush);
-process.on("exit", _shutdownUsageFlush);
+// HMR re-imports this module; guard so the listeners never stack.
+if (!global._usageFlushListeners) {
+  global._usageFlushListeners = true;
+  process.on("beforeExit", _shutdownUsageFlush);
+  process.on("SIGINT", _shutdownUsageFlush);
+  process.on("SIGTERM", _shutdownUsageFlush);
+  process.on("exit", _shutdownUsageFlush);
+}
+
+// Crash recovery: a SIGKILL/OOM loses only the unflushed in-memory buffer.
+// usageHistory rows past the last flush marker are re-aggregated into
+// usageDaily with the same aggregation code path, so daily totals stay
+// exact. Runs once per process, after migrations (the adapter already ran
+// them when it opened the database).
+export async function reconcileUsageDaily() {
+  if (global._usageDailyReconciled) return;
+  global._usageDailyReconciled = true;
+  try {
+    const db = await getAdapter();
+    const markerRow = db.get(`SELECT value FROM _meta WHERE key = ?`, [FLUSHED_MAX_ID_KEY]);
+    const marker = Number(markerRow?.value) || 0;
+    // Only the tail: rows since the marker. A fresh database has nothing
+    // past 0 either.
+    const rows = db.all(
+      `SELECT timestamp, provider, model, connectionId, apiKey, endpoint, cost, tokens
+       FROM usageHistory WHERE id > ? ORDER BY id ASC`,
+      [marker]
+    );
+    if (!rows.length) return;
+    const maxId = db.get(`SELECT MAX(id) AS m FROM usageHistory`)?.m || 0;
+    const days = new Map();
+    for (const r of rows) {
+      const dateKey = getLocalDateKey(r.timestamp);
+      let day = days.get(dateKey);
+      if (!day) days.set(dateKey, day = getEmptyDay());
+      aggregateEntryToDay(day, {
+        timestamp: r.timestamp, provider: r.provider, model: r.model,
+        connectionId: r.connectionId, apiKey: r.apiKey, endpoint: r.endpoint,
+        cost: r.cost, tokens: parseJson(r.tokens, {}),
+      });
+    }
+    db.transaction(() => {
+      // Fold rows saved between the SELECT above and this write into the
+      // same snapshot, so the marker never skips a row.
+      const late = db.all(
+        `SELECT timestamp, provider, model, connectionId, apiKey, endpoint, cost, tokens
+         FROM usageHistory WHERE id > ? ORDER BY id ASC`, [maxId]);
+      for (const r of late) {
+        const dateKey = getLocalDateKey(r.timestamp);
+        let day = days.get(dateKey);
+        if (!day) days.set(dateKey, day = getEmptyDay());
+        aggregateEntryToDay(day, {
+          timestamp: r.timestamp, provider: r.provider, model: r.model,
+          connectionId: r.connectionId, apiKey: r.apiKey, endpoint: r.endpoint,
+          cost: r.cost, tokens: parseJson(r.tokens, {}),
+        });
+      }
+      mergeSnapshotIntoDaily(db, days);
+    });
+    console.log(`[usageRepo] reconciled ${rows.length} usageHistory rows into usageDaily after restart (marker ${marker})`);
+  } catch (err) {
+    console.error("[usageRepo] usageDaily reconcile failed:", err?.message || err);
+  }
+}
 
 export async function getUsageStats(period = "all") {
   const db = await getAdapter();

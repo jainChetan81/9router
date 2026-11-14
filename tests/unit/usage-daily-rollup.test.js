@@ -131,3 +131,48 @@ describe("usageDaily rollup buffering", () => {
     expect(persisted.byProvider["anthropic"].promptTokens).toBe(3);
   });
 });
+
+describe("usageDaily crash reconcile", () => {
+  it("rebuilds unflushed rows from usageHistory at startup, exactly once", async () => {
+    // Save rows and drop the in-memory buffer without flushing: the crash.
+    await db.saveRequestUsage({
+      timestamp: new Date().toISOString(),
+      provider: "crash-test",
+      model: "m1",
+      tokens: { prompt_tokens: 11, completion_tokens: 22 },
+      status: "ok",
+    });
+    await db.saveRequestUsage({
+      timestamp: new Date().toISOString(),
+      provider: "crash-test",
+      model: "m1",
+      tokens: { prompt_tokens: 5, completion_tokens: 6 },
+      status: "ok",
+    });
+    usageRepo.globalFlushBuffer().clear();
+    // And make it look like the shutdown flush never ran: drop the marker.
+    adapterSync().run(`DELETE FROM _meta WHERE key = 'usageDailyFlushedMaxId'`);
+
+    const rowBefore = adapterSync().get(`SELECT data FROM usageDaily WHERE dateKey = ?`, [TODAY_KEY]);
+    const persistedBefore = JSON.parse(rowBefore.data);
+    expect(persistedBefore.byProvider["crash-test"]).toBeUndefined();
+
+    global._usageDailyReconciled = false;
+    await usageRepo.reconcileUsageDaily();
+
+    const rowAfter = adapterSync().get(`SELECT data FROM usageDaily WHERE dateKey = ?`, [TODAY_KEY]);
+    const persistedAfter = JSON.parse(rowAfter.data);
+    expect(persistedAfter.byProvider["crash-test"].requests).toBe(2);
+    expect(persistedAfter.byProvider["crash-test"].promptTokens).toBe(16);
+    expect(persistedAfter.byProvider["crash-test"].completionTokens).toBe(28);
+
+    // The marker now covers every history row, so a second reconcile is a
+    // no-op: no double counting.
+    const marker = adapterSync().get(`SELECT value FROM _meta WHERE key = 'usageDailyFlushedMaxId'`);
+    const maxId = adapterSync().get(`SELECT MAX(id) AS m FROM usageHistory`).m;
+    expect(Number(marker.value)).toBe(Number(maxId));
+    await usageRepo.reconcileUsageDaily();
+    const rowFinal = adapterSync().get(`SELECT data FROM usageDaily WHERE dateKey = ?`, [TODAY_KEY]);
+    expect(JSON.parse(rowFinal.data).byProvider["crash-test"].requests).toBe(2);
+  });
+});
