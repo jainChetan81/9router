@@ -15,7 +15,9 @@ const SETTINGS_RESPONSE_HEADERS = {
 // Secrets must never be mass-assigned from request body (CWE-915)
 const PROTECTED_SETTING_KEYS = ["password", "mitmSudoEncrypted"];
 
-export async function GET() {
+// `?fields=a,b` returns only those keys of the same response: a page that needs one setting does not
+// download them all. It selects from the already-filtered response, so it can never expose more.
+export async function GET(request) {
   try {
     const settings = await getSettings();
     const { password, oidcClientSecret, ...safeSettings } = settings;
@@ -24,12 +26,19 @@ export async function GET() {
     const enableRequestLogs = process.env.ENABLE_REQUEST_LOGS === "true";
     const enableTranslator = process.env.ENABLE_TRANSLATOR === "true";
     
-    return NextResponse.json({ 
+    const full = {
       ...safeSettings, 
       enableRequestLogs,
       enableTranslator,
       hasPassword: !!password
-    }, { headers: SETTINGS_RESPONSE_HEADERS });
+    };
+    const fields = request?.url ? new URL(request.url).searchParams.get("fields") : null;
+    if (fields) {
+      const slim = {};
+      for (const key of fields.split(",").slice(0, 20)) if (Object.hasOwn(full, key)) slim[key] = full[key];
+      return NextResponse.json(slim, { headers: SETTINGS_RESPONSE_HEADERS });
+    }
+    return NextResponse.json(full, { headers: SETTINGS_RESPONSE_HEADERS });
   } catch (error) {
     console.log("Error getting settings:", error);
     return NextResponse.json({ error: error.message }, { status: 500 });
