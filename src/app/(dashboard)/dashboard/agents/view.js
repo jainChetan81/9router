@@ -132,7 +132,7 @@ export function buildView({ live, sessions, totalSessions, detail, detailsBySess
   const kpis = [
     ["ACTIVE SESSIONS", String(topLevel.length), liveKids ? liveKids + " delegated children" : "child links come from T3 threads", "Sessions with a request in the last 5 minutes." + (liveKids ? " T3 delegated children count under their parent." : " Parent links load from the local T3 SQLite index; sessions without a match show no link."), "var(--acc)", "var(--tx)"],
     ["IN FLIGHT", inFlightKnown ? String(live.inFlight) : "Not tracked yet", inFlightKnown ? `${stateCounts.streaming} streaming · ${stateCounts.thinking} thinking` : "In-flight requests are not available from this server.", "Current requests tracked by the live feed.", "var(--green)", inFlightKnown ? "var(--tx)" : "var(--tx3)"],
-    ["REQUESTS / MIN", (allReq5 / 5).toFixed(1), Math.round(allReq5) + " requests in 5 min", "All agents, background jobs included, over the last 5 minutes.", "var(--blue)", "var(--tx)"],
+    ["REQUESTS / MIN", (allReq5 / 5).toFixed(1), Math.round(allReq5) + " completed in 5 min", "Completed requests per minute over the last 5 minutes, all agents and background jobs. Requests still running are counted under In flight, not here.", "var(--blue)", "var(--tx)"],
     ["TOKENS / S", tpsVals.length ? String(Math.round(med(tpsVals))) : "No samples", "median output speed", "Output speed has no samples in the live feed.", "var(--violet)", tpsVals.length ? "var(--tx)" : "var(--tx3)"],
     ["LATENCY P50", p50Vals.length ? fs(med(p50Vals) / 1000) : "No samples", "start to last token", "Latency has no samples in the live feed.", "var(--tx3)", "var(--tx)"],
     ["SUCCESS RATE", succAvg.toFixed(1) + "%", fails5 + " failed of " + Math.round(allReq5), "Requests in the last 5 minutes that returned a complete response.", succAvg < 95 ? "var(--red)" : "var(--green)", succAvg < 95 ? "var(--red)" : "var(--tx)"],
@@ -430,7 +430,7 @@ export function buildView({ live, sessions, totalSessions, detail, detailsBySess
   v.loadingText = { live: "Connecting to the live feed…", sessions: "Reading sessions and request timings…", roles: "Aggregating " + rangeTitle.toLowerCase() + " by role and model…", tools: "Counting tool calls…" }[tab];
   v.errTitle = tab === "live" ? "Live feed unavailable" : "Couldn't load " + tab;
   v.errBody = ui.errorText || "The request failed. Spend and Usage are unaffected.";
-  v.staleText = tab === "live" ? "Live data may be out of date. Retrying every 2 s." : "Data may be out of date. Requests after the last refresh are not included yet.";
+  v.staleText = tab === "live" ? "Live data may be out of date. The next update retries." : "Data may be out of date. Requests after the last refresh are not included yet.";
   if (ok) {
     if (tab === "live") v.live = mode === "stale" || liveCards.length > 0;
     else if (tab === "sessions") v.sess = true;
@@ -455,11 +455,6 @@ export function buildView({ live, sessions, totalSessions, detail, detailsBySess
   const sessCount = tab === "sessions" && (totalSessions ?? sessList.length) ? String(totalSessions ?? sessList.length) : "";
   const tabs = [["live", "Live", (mode === "ready" || mode === "stale") && topLevel.length ? String(topLevel.length) : "", liveDot], ["sessions", "Sessions", sessCount, ""], ["roles", "Roles", ""], ["tools", "Tools", ""]]
     .map(([k, label, count, dot]) => ({ label, count: count || "", dot: dot || null, on: () => act.tab?.(k), style: { ...seg(tab === k), height: 32, padding: "0 12px", fontSize: 13, display: "flex", alignItems: "center", gap: 8, background: tab === k ? "var(--card)" : "transparent", boxShadow: tab === k ? "0 0 0 1px var(--line2)" : "none" } }));
-  const fresh = mode === "stale" ? { text: "Stale · retrying", c: "var(--amber)", dot: { width: 8, height: 8, borderRadius: "50%", background: "var(--amber)" }, icon: "pause", btn: "Pause" }
-    : mode === "error" ? { text: "Feed closed", c: "var(--red)", dot: { width: 8, height: 8, borderRadius: "50%", background: "var(--red)" }, icon: "pause", btn: "Pause" }
-    : ui.paused ? { text: "Paused · updated " + (ui.ago || 0) + " s ago", c: "var(--tx2)", dot: { width: 8, height: 8, borderRadius: "50%", border: "1.5px solid var(--tx3)", boxSizing: "border-box" }, icon: "play_arrow", btn: "Resume" }
-    : { text: (ui.ago || 0) === 0 ? "Updated just now" : "Updated " + (ui.ago || 0) + " s ago", c: "var(--tx2)", dot: { width: 8, height: 8, borderRadius: "50%", background: "var(--green)", animation: mode === "ready" ? "r9pulse 1.6s infinite" : "none" }, icon: "pause", btn: "Pause" };
-
   // ---------- routing drawer ----------
   let dr = null;
   const dId = ui.drawer;
@@ -562,7 +557,7 @@ export function buildView({ live, sessions, totalSessions, detail, detailsBySess
 
   const sk = (ws, ps) => ws.map((w, i) => ({ w: w + "px", wb: (60 + (i * 13) % 40) + "%", p: (ps ? ps[i] : 0) + "px" }));
   return {
-    status, tabs, fresh, paused: !!ui.paused, togglePause: () => act.pause?.(),
+    status, tabs, paused: !!ui.paused, togglePause: () => act.pause?.(),
     isLiveTab: tab === "live", notLiveTab: tab !== "live", isSessTab: tab === "sessions", isTableTab: tab === "roles" || tab === "tools",
     preset, customLabel: range?.label || shortRange(range), rangeTitle,
     v, live: { kpis, cards: liveCards }, tree, g, sm, noSelText: selId && !selShown ? "The selected session is hidden by the filters." : selShown ? "Loading session…" : "Select a session to see its timeline.", ro, dl: null,

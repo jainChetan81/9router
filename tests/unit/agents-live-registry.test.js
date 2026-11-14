@@ -125,3 +125,37 @@ describe("agents live registry", () => {
     unregister(reqId);
   });
 });
+
+describe("agents live registry topic bumps", () => {
+  it("raises the agents topic on register, first token and unregister, then once more after the row settles", async () => {
+    const { version, subscribe } = await import("@/lib/live/bus.js");
+    const seen = [];
+    // Let a settle bump left pending by the tests above fire first.
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    const stop = subscribe((event) => { if (event.topic === "agents") seen.push(event.v); });
+    vi.useFakeTimers();
+    try {
+      const reqId = `bump-${crypto.randomUUID()}`;
+      const start = version("agents");
+      register(reqId, { session: "0123456789ab", combo: "assistant", model: "m" });
+      expect(version("agents")).toBe(start + 1);
+      markFirstToken(reqId, 5);
+      expect(version("agents")).toBe(start + 2);
+      markFirstToken(reqId, 9); // already streaming: nothing changed, no bump
+      expect(version("agents")).toBe(start + 2);
+      unregister(reqId, "ok");
+      expect(version("agents")).toBe(start + 3);
+      unregister(reqId, "ok"); // already gone
+      expect(version("agents")).toBe(start + 3);
+      // The usage row lands just after unregister; a late bump lets pages pick it up.
+      vi.advanceTimersByTime(1000);
+      expect(version("agents")).toBe(start + 4);
+      vi.advanceTimersByTime(5000);
+      expect(version("agents")).toBe(start + 4);
+      expect(seen).toEqual([start + 1, start + 2, start + 3, start + 4]);
+      // Bumps carry no payload: nothing about the request leaves the registry here.
+      expect(register("", {})).toBe(false);
+      expect(version("agents")).toBe(start + 4);
+    } finally { vi.useRealTimers(); stop(); }
+  });
+});

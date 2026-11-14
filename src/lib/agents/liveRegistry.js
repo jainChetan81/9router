@@ -11,6 +11,7 @@
  */
 
 import { sessionKey } from "./sessionKey.js";
+import { bump } from "../live/bus.js";
 
 const REGISTRY_KEY = Symbol.for("9router.agents.liveRegistry");
 const MAX_ENTRIES = 500;
@@ -20,6 +21,25 @@ const TTL_MS = 10 * 60 * 1000;
 const STREAMING_TTL_MS = 60 * 60 * 1000;
 
 const state = globalThis[REGISTRY_KEY] || (globalThis[REGISTRY_KEY] = { entries: new Map() });
+
+// Every change to the in-flight set raises the "agents" live topic, so open
+// Agents pages refetch /api/agents/live instead of polling. A request leaves
+// the registry just before its usage row is written, so the end of a request
+// is announced twice: now, and once more a second later when the row is there.
+const SETTLE_BUMP_MS = 1000;
+let settleTimer = null;
+
+function announce({ settle = false } = {}) {
+  try {
+    bump("agents");
+    if (!settle || settleTimer) return;
+    settleTimer = setTimeout(() => {
+      settleTimer = null;
+      try { bump("agents"); } catch { /* live updates must fail open */ }
+    }, SETTLE_BUMP_MS);
+    settleTimer.unref?.();
+  } catch { /* live updates must fail open */ }
+}
 
 function monotonicNow() {
   try {
@@ -83,6 +103,7 @@ export function register(reqId, data) {
       firstTokenAt: null,
       registeredAt: now,
     });
+    announce();
     return true;
   } catch {
     return false;
@@ -101,6 +122,7 @@ export function markFirstToken(reqId, at = null) {
     }
     if (entry.firstTokenAt == null) {
       entry.firstTokenAt = Number.isFinite(at) ? at : monotonicNow();
+      announce();
     }
     return true;
   } catch {
@@ -116,7 +138,9 @@ export function unregister(reqId, outcome) {
     // requests leave the in-flight registry and their outcome is stored by the
     // usage-history writer instead.
     void outcome;
-    return state.entries.delete(id);
+    const removed = state.entries.delete(id);
+    if (removed) announce({ settle: true });
+    return removed;
   } catch {
     return false;
   }
