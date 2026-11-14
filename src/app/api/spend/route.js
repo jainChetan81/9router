@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { createHash } from "node:crypto";
 import { getAdapter } from "@/lib/db/driver.js";
 import { DATA_FILE } from "@/lib/db/paths.js";
-import { createReadPool } from "@/lib/db/readPool.js";
+import { spendPool } from "@/lib/spend/pool.js";
 import { getSettings, updateSettings, getPricingForModel } from "@/lib/localDb";
 import { SUBS, aggregateSpend, invalidateSpendCache } from "@/lib/spend/aggregate.js";
 import { HOUR_MS, istMidnightMs } from "@/lib/spend/time.js";
@@ -14,7 +14,6 @@ export const dynamic = "force-dynamic";
 // stays free. Falls back to inline (main-thread) execution when the
 // adapter is not file-backed (sql.js) or the worker itself failed; only a
 // busy read queue (pool or queue full) still answers 503.
-const spendPool = createReadPool({ name: "spend", workerModuleUrl: new URL("./aggregateWorker.js", import.meta.url).href });
 
 async function aggregateOffThread(db, args) {
   try {

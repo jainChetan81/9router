@@ -1,12 +1,10 @@
-import { Worker } from "node:worker_threads";
 import { DATA_FILE } from "./paths.js";
 
 // Generic bounded pool of read-only SQLite worker threads. Same protocol and
-// tuning as the Agents read worker (src/lib/agents/readWorker.mjs), but the
-// worker module is a parameter, so other features (Spend) can reuse the
-// pattern without touching src/lib/agents. The worker module must default-
-// export { methods: { name: (db, args) => result } } and receive workerData
-// { file, driver }.
+// tuning as the Agents read worker (src/lib/agents/readWorker.mjs). The caller
+// passes spawnWorker(workerData) => new Worker(new URL("./entry.mjs",
+// import.meta.url), { workerData }). The entry imports its methods statically
+// and calls startPoolWorker(methods) from ./poolWorker.mjs.
 const FILE_BACKED_DRIVERS = new Set(["better-sqlite3", "node:sqlite", "bun:sqlite"]);
 
 const READ_WORKER_LIMIT = 1;
@@ -25,7 +23,7 @@ export class ReadPoolBusyError extends Error {
 
 export function createReadPool({
   name,
-  workerModuleUrl,
+  spawnWorker,
   workerLimit = READ_WORKER_LIMIT,
   queueLimit = READ_QUEUE_LIMIT,
   jobTimeoutMs = READ_JOB_TIMEOUT_MS,
@@ -77,9 +75,9 @@ export function createReadPool({
   }
 
   function createWorker() {
-    const worker = new Worker(new URL("./poolWorker.mjs", import.meta.url), {
-      workerData: { module: workerModuleUrl, keyPrefix: name, file: DATA_FILE, driver },
-    });
+    // The caller spawns the worker so that `new Worker(new URL(...))` sits next
+    // to its entry file, where webpack can find and bundle it.
+    const worker = spawnWorker({ keyPrefix: name, file: DATA_FILE, driver });
     const slot = { worker, ready: false, retired: false, job: null, idleTimer: null };
     workers.push(slot);
     worker.on("message", (message) => {

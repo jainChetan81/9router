@@ -170,17 +170,27 @@ describe("spend aggregation SQL (N6/B10)", () => {
     expect(after.totals).toEqual(first.totals);
   }, 60_000);
 
+  it("runs the aggregate on the real worker thread with the inline result", async () => {
+    const { spendPool } = await import("../../src/lib/spend/pool.js");
+    const { aggregateSpend } = await import("../../src/lib/spend/aggregate.js");
+    const db = await adapter();
+    const args = { params: { preset: "7D" }, now: Date.now(), fees: {} };
+    // Call the pool directly: the route would hide a worker failure behind
+    // its inline fallback.
+    const viaWorker = await spendPool.run(db, "aggregate", args, { key: "worker-smoke" });
+    const inline = aggregateSpend(db, args);
+    expect(JSON.stringify(viaWorker.totals ?? viaWorker)).toBe(JSON.stringify(inline.totals ?? inline));
+  }, 60_000);
+
   it("falls back to inline aggregation on a worker failure and keeps 503 when busy", async () => {
     const mod = await import("../../src/app/api/spend/route.js");
     // Swap the pool for fakes: one that fails with a plain error (worker
     // crash), then one that fails with the busy code.
-    const { createReadPool } = await import("@/lib/db/readPool.js");
-    const originalCreate = createReadPool;
     const calls = [];
     const fake = { run: async () => { calls.push(1); throw new Error("spend read worker exited"); } };
     const busy = { run: async () => { const e = new Error("spend read queue is busy"); e.code = "busy"; throw e; } };
     // Module-private pool: exercise via module re-import with the pool mocked.
-    vi.doMock("@/lib/db/readPool.js", () => ({ createReadPool: () => fake }));
+    vi.doMock("@/lib/spend/pool.js", () => ({ spendPool: fake }));
     let m = await import("../../src/app/api/spend/route.js?v=inline");
     const params = new URLSearchParams({ preset: "7D" });
     const res = await m.GET(new Request(`http://x/api/spend?${params}`));
@@ -188,12 +198,11 @@ describe("spend aggregation SQL (N6/B10)", () => {
     expect((await res.json()).whatIfTargets).toBeDefined();
     expect(calls.length).toBe(1);
 
-    vi.doMock("@/lib/db/readPool.js", () => ({ createReadPool: () => busy }));
+    vi.doMock("@/lib/spend/pool.js", () => ({ spendPool: busy }));
     m = await import("../../src/app/api/spend/route.js?v=busy");
     const busyRes = await m.GET(new Request(`http://x/api/spend?${params}`));
     expect(busyRes.status).toBe(503);
-    vi.doUnmock("@/lib/db/readPool.js");
-    void originalCreate;
+    vi.doUnmock("@/lib/spend/pool.js");
   }, 60_000);
 
   it("the ETag changes with the rolling time bucket for Today and 24h, not 7D", async () => {

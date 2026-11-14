@@ -1,6 +1,7 @@
-// Generic read-pool worker. Opens the database read-only, then answers
-// { id, method, args } messages by calling methods exported by the target
-// module's default export ({ methods }).
+// Generic read-pool worker core. A worker entry file imports its methods
+// statically and calls startPoolWorker(methods), so webpack bundles the
+// methods into the worker chunk. The worker opens the database read-only,
+// then answers { id, method, args } messages.
 import { parentPort, workerData } from "node:worker_threads";
 
 const emit = process.emit;
@@ -34,12 +35,11 @@ async function openReadOnlyAdapter(file, driver) {
   throw new Error(`Unsupported read pool driver: ${driver}`);
 }
 
+export async function startPoolWorker(methods) {
 let db;
-let methods;
 try {
+  if (!methods) throw new Error("startPoolWorker needs a methods object");
   db = await openReadOnlyAdapter(workerData.file, workerData.driver);
-  methods = (await import(workerData.module)).default.methods;
-  if (!methods) throw new Error("read pool module must default-export { methods }");
   parentPort.postMessage({ ready: true, driver: workerData.driver });
 } catch (error) {
   parentPort.postMessage({ ready: false, error: { message: error?.message || String(error), stack: error?.stack } });
@@ -67,4 +67,5 @@ if (db && methods) {
     }
   });
   resetIdleTimer();
+}
 }
