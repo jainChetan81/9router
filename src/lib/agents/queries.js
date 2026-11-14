@@ -2,9 +2,9 @@ import { Worker } from "node:worker_threads";
 import { getAdapter } from "../db/driver.js";
 import { DATA_FILE } from "../db/paths.js";
 import { parseJson } from "../db/helpers/jsonCol.js";
-import { hasSessionColumn, sessionSql, sessionMatchSql, statusSql, roleSql } from "./dbColumns.js";
+import { hasSessionColumn, sessionBackfilled, sessionSql, sessionMatchSql, sessionMatchParams, statusSql, roleSql } from "./dbColumns.js";
 import { parseMeta, roleOf, clientOfUa, clientVersionOf, latencyOf, statusOf, bgRole, effectiveRole, resolveRoleName, isErrorStatus } from "./meta.js";
-import { enrichSession } from "./enrichment.js";
+import { enrichSession, enrichSessions } from "./enrichment.js";
 import { num } from "./value.js";
 import { percentile } from "./percentiles.js";
 import { snapshot as liveSnapshot } from "./liveRegistry.js";
@@ -33,6 +33,14 @@ class AgentsReadBusyError extends Error {
 
 function jobKey(db, method, args) {
   return JSON.stringify([DATA_FILE, db.driver, method, args]);
+}
+
+// Session expression for this database: the plain column once the backfill
+// (migration 003) is done, the COALESCE with meta JSON until then.
+function sessionExpr(db) {
+  const has = hasSessionColumn(db);
+  const filled = has && sessionBackfilled(db);
+  return { has, filled, sExpr: sessionSql(has, filled) };
 }
 
 function settleReadJob(job, error, result) {
@@ -144,9 +152,12 @@ function drainReadJobs() {
   }
 }
 
-function runReadWorker(db, method, args, inline) {
+// `keyArgs` is what identifies a job for in-flight dedupe. It defaults to the
+// arguments; callers pass less when an argument (a clock reading) should not
+// split otherwise identical reads.
+function runReadWorker(db, method, args, inline, keyArgs = args) {
   if (!FILE_BACKED_DRIVERS.has(db?.driver)) return inline();
-  const key = jobKey(db, method, args);
+  const key = jobKey(db, method, keyArgs);
   const current = inFlightReadJobs.get(key);
   if (current) return current.promise;
   if (pendingReadJobs.length >= READ_QUEUE_LIMIT) {
@@ -324,7 +335,7 @@ function normalizeSpan(row) {
 }
 
 function loadSessionSpans(db, fromIso, toIso, { apiKey = null, cap = SESSION_CAP } = {}) {
-  const sExpr = sessionSql(hasSessionColumn(db));
+  const { sExpr } = sessionExpr(db);
   const roleCase = roleSql();
   const params = [fromIso, toIso];
   const keyFilter = apiKey ? "AND apiKey = ?" : "";
@@ -465,8 +476,7 @@ export function listSessionsPage(db, fromIso, toIso, options = {}) {
 }
 
 async function listSessionsPageInline(db, fromIso, toIso, { limit = 100, cursor = null } = {}) {
-  const has = hasSessionColumn(db);
-  const sExpr = sessionSql(has);
+  const { sExpr } = sessionExpr(db);
   const statusExpr = statusSql();
   const pageLimit = Math.max(1, Math.min(Number.isInteger(limit) ? limit : 100, 500));
   const spanResult = loadSessionSpans(db, fromIso, toIso);
@@ -512,12 +522,11 @@ async function listSessionsPageInline(db, fromIso, toIso, { limit = 100, cursor 
   const pageOrder = new Map(selected.map((span, index) => [span.session, index]));
 
   // T3 enrichment plus real parent links. Guessed links come first; a real T3
-  // parent (inferred:false, parentGuessed:false) wins over a guess.
+  // parent (inferred:false, parentGuessed:false) wins over a guess. The whole
+  // page shares one T3 connection.
   let enrichmentBySession = new Map();
   try {
-    const hashes = selected.map((span) => span.session).filter(isHexId);
-    const settled = await Promise.allSettled(hashes.map((h) => enrichSession(h)));
-    enrichmentBySession = new Map(hashes.map((h, i) => [h, settled[i].status === "fulfilled" ? settled[i].value : null]));
+    enrichmentBySession = await enrichSessions(selected.map((span) => span.session).filter(isHexId));
   } catch { enrichmentBySession = new Map(); }
 
   const results = sessions.map((s) => {
@@ -549,10 +558,9 @@ export function getSessionDetail(db, sessionId) {
 }
 
 async function getSessionDetailInline(db, sessionId) {
-  const has = hasSessionColumn(db);
-  const sExpr = sessionSql(has);
-  const whereSql = sessionMatchSql(has);
-  const params = has ? [sessionId, sessionId] : [sessionId];
+  const { has, filled, sExpr } = sessionExpr(db);
+  const whereSql = sessionMatchSql(has, filled);
+  const params = sessionMatchParams(sessionId, has, filled);
   const fetchedRows = db.all(
     `SELECT id, timestamp, provider, model, apiKey, promptTokens, completionTokens, cost, status, meta${has ? ", session" : ""}
      FROM usageHistory
@@ -588,10 +596,8 @@ async function getSessionDetailInline(db, sessionId) {
   try {
     const apiKey = norm.find((row) => row.apiKey)?.apiKey || null;
     if (apiKey) {
-      const spanParams = has ? [sessionId, sessionId, apiKey] : [sessionId, apiKey];
-      const spanWhere = has
-        ? "((session = ? OR (session IS NULL AND json_extract(meta,'$.session') = ?)) AND apiKey = ?)"
-        : "(json_extract(meta,'$.session') = ? AND apiKey = ?)";
+      const spanParams = [...params, apiKey];
+      const spanWhere = `(${whereSql} AND apiKey = ?)`;
       const roleCase = roleSql();
       const span = db.get(
         `SELECT ${sExpr} AS sess, MIN(apiKey) AS apiKey,
@@ -707,7 +713,7 @@ export function getAnalytics(db, fromIso, toIso) {
 }
 
 async function getAnalyticsInline(db, fromIso, toIso) {
-  const sExpr = sessionSql(hasSessionColumn(db));
+  const { sExpr } = sessionExpr(db);
   const statusExpr = statusSql();
   const roleCase = roleSql();
 
@@ -863,19 +869,23 @@ async function getAnalyticsInline(db, fromIso, toIso) {
 }
 
 // ---------- live ----------
+// The dedupe key leaves `nowMs` out: two polls that arrive while one read is
+// in flight share it. The shared rows are at most one read old, and each
+// caller still merges the in-flight registry with its own clock.
 export function getLive(db, nowMs = Date.now()) {
-  return Promise.resolve(runReadWorker(db, "getLive", [nowMs], () => getLiveInline(db, nowMs)))
+  return Promise.resolve(runReadWorker(db, "getLive", [nowMs], () => getLiveInline(db, nowMs), []))
     .then((result) => mergeLiveSnapshot(result, liveSnapshot(), nowMs))
     .then(addLiveTitles);
 }
 
 // Live cards show the T3 thread title under the session ID (Agents r1).
+// One enrichment call covers every session, so a poll opens T3 at most once.
 async function addLiveTitles(result) {
   const list = result?.sessions;
   if (!Array.isArray(list) || !list.length) return result;
   try {
-    const titles = await Promise.all(list.map((s) => (isHexId(s.session) ? enrichSession(s.session).then((en) => en?.title || null, () => null) : null)));
-    return { ...result, sessions: list.map((s, i) => (titles[i] ? { ...s, title: titles[i] } : s)) };
+    const enriched = await enrichSessions(list.map((s) => s.session).filter(isHexId));
+    return { ...result, sessions: list.map((s) => { const title = enriched.get(s.session)?.title; return title ? { ...s, title } : s; }) };
   } catch { return result; }
 }
 
@@ -892,6 +902,8 @@ function mergeLiveSnapshot(result, activeBySession, nowMs) {
           session: sessionId,
           client: "Unknown",
           lastTs: nowIso,
+          // Completed requests per minute over the last 5 minutes. In-flight
+          // requests are counted in `inFlight`, never added to this rate.
           reqPerMin: 0,
           tpsRecent: null,
           p50TotalMs: null,
@@ -928,7 +940,6 @@ function mergeLiveSnapshot(result, activeBySession, nowMs) {
       session.inFlight = (session.inFlight || 0) + count;
       session.lastActivityMs = nowMs;
       session.pulsing = true;
-      session.reqPerMin = ((session.reqPerMin || 0) * 5 + count) / 5;
       if (!session.lastTs || session.lastTs < nowIso) session.lastTs = nowIso;
     }
     sessions.sort((a, b) => String(b.lastTs || "").localeCompare(String(a.lastTs || "")));
@@ -1031,76 +1042,67 @@ export function getTools(db, fromIso, toIso) {
 }
 
 async function getLiveInline(db, nowMs = Date.now()) {
-  const has = hasSessionColumn(db);
-  const sExpr = sessionSql(has);
+  const { sExpr } = sessionExpr(db);
   const statusExpr = statusSql();
   const roleCase = roleSql();
   const fiveMinAgo = new Date(nowMs - 5 * 60 * 1000).toISOString();
-  const recentCte = `WITH recent AS (
-       SELECT id, timestamp, ${sExpr} AS sess, model, completionTokens, status, meta
-       FROM usageHistory
-       WHERE timestamp >= ? AND ${sExpr} IS NOT NULL
-       ORDER BY timestamp DESC, id DESC
-       LIMIT ?
-     )`;
-  const summaryRows = db.all(
-    `${recentCte}
-     SELECT sess, MAX(timestamp) AS lastTs,
-            MIN(json_extract(meta, '$.ua')) AS ua,
-            COUNT(*) AS requests,
-            SUM(CASE WHEN ${statusExpr} = 'ok' THEN 1 ELSE 0 END) AS oks
-     FROM recent
-     GROUP BY sess
-     ORDER BY lastTs DESC, sess DESC
-     LIMIT ?`,
-    [fiveMinAgo, LIVE_ROW_CAP, LIVE_SESSION_CAP + 1]
-  );
-  if (!summaryRows.length) return { sessions: [], sampled: { rows: 0, cap: LIVE_ROW_CAP } };
-
-  const sessionTruncated = summaryRows.length > LIVE_SESSION_CAP;
-  const selectedSummaryRows = summaryRows.slice(0, LIVE_SESSION_CAP);
-  const sessionIds = selectedSummaryRows.map((row) => row.sess);
-  const placeholders = sessionIds.map(() => "?").join(",");
-  const roleRows = db.all(
-    `${recentCte}
-     SELECT sess, ${roleCase} AS role, COALESCE(model, 'unknown') AS model,
-            COUNT(*) AS requests, MAX(timestamp) AS lastTs
-     FROM recent
-     WHERE sess IN (${placeholders})
-     GROUP BY sess, role, model`,
-    [fiveMinAgo, LIVE_ROW_CAP, ...sessionIds]
-  );
-  const latencyRows = db.all(
-    `${recentCte}
-     SELECT sess, ${roleCase} AS role,
+  // One pass over the last 5 minutes. Sessions, roles and latency samples are
+  // grouped below in JS; the window holds a few hundred rows at most.
+  const rows = db.all(
+    `SELECT ${sExpr} AS sess, timestamp,
+            ${roleCase} AS role,
+            COALESCE(model, 'unknown') AS model,
+            CASE WHEN ${statusExpr} = 'ok' THEN 1 ELSE 0 END AS ok,
+            json_extract(meta, '$.ua') AS ua,
+            json_extract(meta, '$.latency') IS NOT NULL AS hasLatency,
             json_extract(meta, '$.latency.totalMs') AS totalMs,
             json_extract(meta, '$.latency.ttftMs') AS ttftMs,
             json_extract(meta, '$.latency.stream') AS stream,
             COALESCE(completionTokens, 0) AS completionTokens
-     FROM recent
-     WHERE sess IN (${placeholders}) AND json_extract(meta, '$.latency') IS NOT NULL
+     FROM usageHistory
+     WHERE timestamp >= ? AND ${sExpr} IS NOT NULL
+     ORDER BY timestamp DESC, id DESC
      LIMIT ?`,
-    [fiveMinAgo, LIVE_ROW_CAP, ...sessionIds, LIVE_ROW_CAP]
+    [fiveMinAgo, LIVE_ROW_CAP]
   );
+  if (!rows.length) return { sessions: [], sampled: { rows: 0, cap: LIVE_ROW_CAP } };
+
+  const summaryBySession = new Map();
+  for (const row of rows) {
+    let summary = summaryBySession.get(row.sess);
+    if (!summary) {
+      summary = { sess: row.sess, lastTs: row.timestamp, ua: null, requests: 0, oks: 0 };
+      summaryBySession.set(row.sess, summary);
+    }
+    summary.requests += 1;
+    summary.oks += row.ok ? 1 : 0;
+    if (row.timestamp > summary.lastTs) summary.lastTs = row.timestamp;
+    if (row.ua != null && (summary.ua == null || row.ua < summary.ua)) summary.ua = row.ua;
+  }
+  const summaryRows = [...summaryBySession.values()]
+    .sort((a, b) => (a.lastTs < b.lastTs ? 1 : a.lastTs > b.lastTs ? -1 : a.sess < b.sess ? 1 : a.sess > b.sess ? -1 : 0))
+    .slice(0, LIVE_SESSION_CAP + 1);
+  const sessionTruncated = summaryRows.length > LIVE_SESSION_CAP;
+  const selectedSummaryRows = summaryRows.slice(0, LIVE_SESSION_CAP);
+  const selectedIds = new Set(selectedSummaryRows.map((row) => row.sess));
 
   const rolesBySession = new Map();
-  for (const row of roleRows) {
-    let roles = rolesBySession.get(row.sess);
-    if (!roles) { roles = new Map(); rolesBySession.set(row.sess, roles); }
-    let role = roles.get(row.role);
-    if (!role) {
-      role = { role: row.role, model: row.model, requests: 0, _lastTs: row.lastTs };
-      roles.set(row.role, role);
-    }
-    role.requests += Number(row.requests || 0);
-    if (row.lastTs > role._lastTs) {
-      role.model = row.model;
-      role._lastTs = row.lastTs;
-    }
-  }
   const latencyBySession = new Map();
   const latencyBySessionRole = new Map();
-  for (const row of latencyRows) {
+  for (const row of rows) {
+    if (!selectedIds.has(row.sess)) continue;
+    let roles = rolesBySession.get(row.sess);
+    if (!roles) { roles = new Map(); rolesBySession.set(row.sess, roles); }
+    // Rows arrive newest first, so the first row of a role carries its
+    // latest model and timestamp.
+    let role = roles.get(row.role);
+    if (!role) {
+      role = { role: row.role, model: row.model, requests: 0, _lastTs: row.timestamp };
+      roles.set(row.role, role);
+    }
+    role.requests += 1;
+
+    if (!row.hasLatency) continue;
     let samples = latencyBySession.get(row.sess);
     if (!samples) { samples = { totals: [], tps: [] }; latencyBySession.set(row.sess, samples); }
     const roleKey = `${row.sess}\u0000${row.role || "direct"}`;

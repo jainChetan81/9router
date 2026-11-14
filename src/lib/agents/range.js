@@ -27,7 +27,23 @@ export function resolveRange(params, now, firstMs) {
   return { preset: PRESET_DAYS[preset] ? preset : "30D", hourly: false, from: today0 - (n - 1) * DAY, to: today0 + DAY };
 }
 
-export async function distinctFirstMs(db) {
-  const r = db.get("SELECT MIN(timestamp) AS t FROM usageHistory");
-  return r?.t ? Date.parse(r.t) : Date.now();
+// The oldest row changes only when history is pruned, so its timestamp is
+// kept for 10 minutes instead of being re-read by every range request.
+const FIRST_MS_TTL = 10 * 60_000;
+let firstMsCache = null; // { db, at, value }
+
+export function cachedFirstMs(db, now = Date.now()) {
+  return firstMsCache && firstMsCache.db === db && now - firstMsCache.at < FIRST_MS_TTL ? firstMsCache.value : undefined;
 }
+
+export async function distinctFirstMs(db) {
+  const now = Date.now();
+  const hit = cachedFirstMs(db, now);
+  if (hit !== undefined) return hit;
+  const r = db.get("SELECT MIN(timestamp) AS t FROM usageHistory");
+  const value = r?.t ? Date.parse(r.t) : now;
+  firstMsCache = { db, at: now, value };
+  return value;
+}
+
+export function resetFirstMsCache() { firstMsCache = null; }

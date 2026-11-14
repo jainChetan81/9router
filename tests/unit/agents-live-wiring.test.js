@@ -51,7 +51,8 @@ describe("agents live request wiring", () => {
       inFlight: 1,
       lastActivityMs: expect.any(Number),
       pulsing: true,
-      reqPerMin: 0.2,
+      // In-flight requests are reported in inFlight, never in the completed rate.
+      reqPerMin: 0,
     });
     expect(result.sessions[0].roles).toEqual([
       expect.objectContaining({
@@ -70,18 +71,18 @@ describe("agents live request wiring", () => {
       driver: "sql.js",
       all(sql) {
         if (sql === "PRAGMA table_info(usageHistory)") return [{ name: "session" }];
-        if (sql.includes("GROUP BY sess") && sql.includes("ORDER BY lastTs")) {
-          return [{ sess: session, lastTs: oldTs, ua: "Claude Code", requests: 2, oks: 2 }];
-        }
-        if (sql.includes("GROUP BY sess, role, model")) {
-          return [{ sess: session, role: "assistant", model: "openai/previous", requests: 2, lastTs: oldTs }];
+        // One pass over the live window: one row per completed request.
+        if (sql.includes("FROM usageHistory") && sql.includes("ORDER BY timestamp DESC")) {
+          const row = { sess: session, timestamp: oldTs, role: "assistant", model: "openai/previous", ok: 1, ua: "Claude Code", hasLatency: 0, totalMs: null, ttftMs: null, stream: null, completionTokens: 0 };
+          return [row, { ...row }];
         }
         return [];
       },
     };
 
     const result = await getLive(db, Date.now());
-    expect(result.sessions[0]).toMatchObject({ session, inFlight: 1, pulsing: true, reqPerMin: 0.6 });
+    // 2 completed requests in 5 minutes = 0.4/min; the running one is not mixed in.
+    expect(result.sessions[0]).toMatchObject({ session, inFlight: 1, pulsing: true, reqPerMin: 0.4 });
     expect(result.sessions[0].roles[0]).toMatchObject({
       role: "assistant",
       model: "openai/current",
@@ -89,5 +90,37 @@ describe("agents live request wiring", () => {
       inFlight: 1,
       pulsing: true,
     });
+  });
+
+  it("reads the live window with a single SQL pass and groups it in JS", async () => {
+    const a = "aaaaaaaaaaaa", b = "bbbbbbbbbbbb";
+    const now = Date.now();
+    const ts = (agoMs) => new Date(now - agoMs).toISOString();
+    const base = { ok: 1, ua: "claude-cli/2.1", hasLatency: 1, ttftMs: 1000, stream: 1, completionTokens: 100 };
+    let liveQueries = 0;
+    const db = {
+      driver: "sql.js",
+      all(sql) {
+        if (sql === "PRAGMA table_info(usageHistory)") return [{ name: "session" }];
+        liveQueries++;
+        // Newest first, as the query orders them.
+        return [
+          { ...base, sess: a, timestamp: ts(1000), role: "implementer", model: "m-new", totalMs: 3000 },
+          { ...base, sess: b, timestamp: ts(2000), role: "direct", model: "m-b", totalMs: 2000, ok: 0 },
+          { ...base, sess: a, timestamp: ts(3000), role: "implementer", model: "m-old", totalMs: 5000 },
+          { ...base, sess: a, timestamp: ts(4000), role: "scout", model: "m-scout", hasLatency: 0, totalMs: null, ttftMs: null },
+        ];
+      },
+    };
+    const result = await getLive(db, now);
+    expect(liveQueries).toBe(1);
+    expect(result.sessions.map((s) => s.session)).toEqual([a, b]);
+    const first = result.sessions[0];
+    expect(first).toMatchObject({ reqPerMin: 3 / 5, successRate: 1, p50TotalMs: 3000, inFlight: 0 });
+    // The newest row of a role names its model.
+    expect(first.roles.find((r) => r.role === "implementer")).toMatchObject({ model: "m-new", requests: 2, p50Ms: 3000 });
+    expect(first.roles.find((r) => r.role === "scout")).toMatchObject({ model: "m-scout", requests: 1, p50Ms: null });
+    expect(result.sessions[1]).toMatchObject({ reqPerMin: 1 / 5, successRate: 0 });
+    expect(result.sampled.rows).toBe(4);
   });
 });

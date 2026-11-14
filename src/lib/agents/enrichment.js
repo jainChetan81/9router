@@ -24,6 +24,9 @@ const T3_DB = () => (process.env?.T3_STATE_DB
 
 const CACHE_TTL_MS = 60_000;
 
+const FACTS_CACHE_MAX = 2000;
+
+const factsCache = new Map(); // threadId -> { at, facts: {title, project, directory} }
 let cache = null; // { builtAt, byHash: Map(hash -> {threadId}), threadNative: Map(threadId -> hash), threadParent: Map(threadId -> parentThreadId) }
 
 function sha(s) {
@@ -42,28 +45,42 @@ function hashForProvider(provider, nativeId) {
 
 function isHex12(value) { return typeof value === "string" && /^[0-9a-f]{12}$/.test(value); }
 
-function buildIndex() {
-  const db = new DatabaseSync(T3_DB(), { readOnly: true });
+// Every T3 read in one enrichment call shares one read-only handle, opened
+// on first use and closed when the call ends. A call that is served from
+// the caches opens nothing.
+function t3Session() {
+  let db = null;
+  return {
+    get() {
+      if (!db) db = new DatabaseSync(T3_DB(), { readOnly: true });
+      return db;
+    },
+    close() {
+      if (!db) return;
+      try { db.close(); } catch { /* already closed */ }
+      db = null;
+    },
+  };
+}
+
+function buildIndex(db) {
   const byHash = new Map();
   const threadNative = new Map();
   const threadParent = new Map(); // child thread id -> real parent thread id
 
   // Provider thread rows: threadId -> session hash of one native id. Some
   // payload paths replaced deprecated ones; both are read from the same row.
+  // SQLite extracts the id, so the payload itself never reaches JS.
   const pts = db.prepare(
-    `SELECT thread_id, provider, payload_json
+    `SELECT thread_id, provider,
+            COALESCE(json_extract(payload_json, '$.nativeThreadRef.nativeId'),
+                     json_extract(payload_json, '$.nativeConversationHeadRef.nativeId'),
+                     json_extract(payload_json, '$.appThreadId')) AS nativeId
      FROM orchestration_v2_projection_provider_threads
-     WHERE payload_json IS NOT NULL`
+     WHERE payload_json IS NOT NULL AND json_valid(payload_json)`
   ).all();
   for (const row of pts) {
-    let payload = null;
-    try { payload = JSON.parse(row.payload_json); } catch { continue; }
-    if (!payload || typeof payload !== "object") continue;
-    const nativeId = payload?.nativeThreadRef?.nativeId
-      ?? payload?.nativeConversationHeadRef?.nativeId
-      ?? payload?.appThreadId
-      ?? null;
-    const hash = hashForProvider(row.provider, nativeId);
+    const hash = hashForProvider(row.provider, row.nativeId);
     if (!isHex12(hash)) continue;
     if (!threadNative.has(row.thread_id)) threadNative.set(row.thread_id, hash);
     if (!byHash.has(hash)) byHash.set(hash, row.thread_id);
@@ -106,14 +123,13 @@ function buildIndex() {
     }
   } catch { /* subagent table optional */ }
 
-  try { db.close(); } catch { /* already closed */ }
   return { byHash, threadNative, threadParent };
 }
 
-function t3Index() {
+function t3Index(t3) {
   const now = Date.now();
   if (cache && now - cache.builtAt < CACHE_TTL_MS) return cache;
-  cache = { builtAt: now, ...buildIndex() };
+  cache = { builtAt: now, ...buildIndex(t3.get()) };
   return cache;
 }
 
@@ -160,38 +176,51 @@ export async function deviceName() {
   return os.hostname() || "local";
 }
 
-function threadFacts(threadId, index) {
+const NO_FACTS = Object.freeze({ title: null, project: null, directory: null });
+
+function readThreadFacts(db, threadId) {
   // title, project, worktree directory for one thread. Only these columns.
-  try {
-    const db = new DatabaseSync(T3_DB(), { readOnly: true });
-    const facts = { title: null, project: null, directory: null };
-    const row = db.prepare(
-      `SELECT t.title AS title, p.title AS project,
-              json_extract(t.payload_json, '$.worktreePath') AS worktreePath
-       FROM orchestration_v2_projection_threads t
-       LEFT JOIN projection_projects p ON p.project_id = t.project_id
-       WHERE t.thread_id = ? LIMIT 1`
-    ).get(threadId);
-    if (row) {
-      facts.title = typeof row.title === "string" && row.title ? row.title : null;
-      facts.project = typeof row.project === "string" && row.project ? row.project : null;
-      facts.directory = typeof row.worktreePath === "string" && row.worktreePath ? row.worktreePath : null;
-    }
-    if (!facts.directory) {
-      // Fall back to the cwd recorded on a provider session bound to the thread.
-      try {
-        const cwdRow = db.prepare(
-          `SELECT json_extract(ps.payload_json, '$.cwd') AS cwd
-           FROM orchestration_v2_projection_provider_sessions ps
-           WHERE ps.thread_id = ? AND ps.payload_json IS NOT NULL
-           ORDER BY ps.provider_session_id LIMIT 1`
-        ).get(threadId);
-        if (typeof cwdRow?.cwd === "string" && cwdRow.cwd) facts.directory = cwdRow.cwd;
-      } catch { /* provider sessions optional */ }
-    }
-    try { db.close(); } catch { /* already closed */ }
-    return facts;
-  } catch { return { title: null, project: null, directory: null }; }
+  const facts = { title: null, project: null, directory: null };
+  const row = db.prepare(
+    `SELECT t.title AS title, p.title AS project,
+            json_extract(t.payload_json, '$.worktreePath') AS worktreePath
+     FROM orchestration_v2_projection_threads t
+     LEFT JOIN projection_projects p ON p.project_id = t.project_id
+     WHERE t.thread_id = ? LIMIT 1`
+  ).get(threadId);
+  if (row) {
+    facts.title = typeof row.title === "string" && row.title ? row.title : null;
+    facts.project = typeof row.project === "string" && row.project ? row.project : null;
+    facts.directory = typeof row.worktreePath === "string" && row.worktreePath ? row.worktreePath : null;
+  }
+  if (!facts.directory) {
+    // Fall back to the cwd recorded on a provider session bound to the thread.
+    try {
+      const cwdRow = db.prepare(
+        `SELECT json_extract(ps.payload_json, '$.cwd') AS cwd
+         FROM orchestration_v2_projection_provider_sessions ps
+         WHERE ps.thread_id = ? AND ps.payload_json IS NOT NULL
+         ORDER BY ps.provider_session_id LIMIT 1`
+      ).get(threadId);
+      if (typeof cwdRow?.cwd === "string" && cwdRow.cwd) facts.directory = cwdRow.cwd;
+    } catch { /* provider sessions optional */ }
+  }
+  return facts;
+}
+
+// Facts are cached per thread id for as long as the index (CACHE_TTL_MS), so
+// a poll over the same live sessions reads T3 at most once a minute.
+function threadFacts(threadId, t3) {
+  const now = Date.now();
+  const hit = factsCache.get(threadId);
+  if (hit && now - hit.at < CACHE_TTL_MS) return hit.facts;
+  let facts;
+  try { facts = readThreadFacts(t3.get(), threadId); }
+  catch { return NO_FACTS; } // not cached: the next call retries
+  factsCache.delete(threadId);
+  factsCache.set(threadId, { at: now, facts });
+  while (factsCache.size > FACTS_CACHE_MAX) factsCache.delete(factsCache.keys().next().value);
+  return facts;
 }
 
 function parentHashOf(threadId, index) {
@@ -201,31 +230,54 @@ function parentHashOf(threadId, index) {
 }
 
 /**
- * Enrichment for one session hash. Returns allowed fields only, or null.
- * `parent` is a real T3 link (`inferred:false, parentGuessed:false`) or null;
- * guessed links are produced by `inferParents()` in queries.js, never here.
+ * Enrichment for many session hashes with at most one T3 connection.
+ * Returns Map(hash -> allowed fields | null). `parent` is a real T3 link
+ * (`inferred:false, parentGuessed:false`) or null; guessed links are produced
+ * by `inferParents()` in queries.js, never here.
  */
+export async function enrichSessions(sessionHashes) {
+  const out = new Map();
+  const hashes = [...new Set((Array.isArray(sessionHashes) ? sessionHashes : []).filter(isHex12))];
+  if (!hashes.length) return out;
+  const t3 = t3Session();
+  const matched = [];
+  try {
+    let index;
+    try { index = t3Index(t3); }
+    catch { // T3 DB unreadable -> no enrichment
+      for (const hash of hashes) out.set(hash, null);
+      return out;
+    }
+    for (const hash of hashes) {
+      const threadId = index.byHash.get(hash);
+      if (!threadId) { out.set(hash, null); continue; }
+      matched.push({ hash, facts: threadFacts(threadId, t3), parent: parentHashOf(threadId, index) });
+    }
+  } finally { t3.close(); }
+  if (!matched.length) return out;
+  const dev = await deviceName().catch(() => null);
+  for (const { hash, facts, parent } of matched) {
+    out.set(hash, {
+      title: facts.title,
+      project: facts.project,
+      directory: facts.directory,
+      device: dev,
+      parent: parent ? { session: parent, inferred: false, parentGuessed: false } : null,
+    });
+  }
+  return out;
+}
+
+/** Enrichment for one session hash. Returns allowed fields only, or null. */
 export async function enrichSession(sessionHash) {
   if (!isHex12(sessionHash)) return null;
-  let index;
-  try { index = t3Index(); } catch { return null; } // T3 DB unreadable -> no enrichment
-  const threadId = index.byHash.get(sessionHash);
-  if (!threadId) return null;
-  const facts = threadFacts(threadId, index);
-  const parent = parentHashOf(threadId, index);
-  const dev = await deviceName().catch(() => null);
-  return {
-    title: facts.title,
-    project: facts.project,
-    directory: facts.directory,
-    device: dev,
-    parent: parent ? { session: parent, inferred: false, parentGuessed: false } : null,
-  };
+  return (await enrichSessions([sessionHash])).get(sessionHash) || null;
 }
 
 /** Reset cached state (tests). */
 export function resetEnrichmentCache() {
   cache = null;
+  factsCache.clear();
   tsDeviceCache = { at: 0, name: null };
   tsProbeInFlight = null;
 }
