@@ -7,6 +7,7 @@ import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { USAGE_APIKEY_PROVIDERS } from "@/shared/constants/providers";
 import { normalizeQuotaRow, sortQuotaRows } from "@/lib/spend/quotaRunway.js";
 import { createRefreshDeduper, quotaUsageRows } from "@/lib/spend/quotaSnapshot.js";
+import { version as quotaVersion } from "@/lib/live/bus.js";
 
 export const dynamic = "force-dynamic";
 const TTL = 60000, TIMEOUT = 8000;
@@ -14,6 +15,9 @@ let cached = null;
 let inFlight = null;
 const refreshConnection = createRefreshDeduper();
 
+// Stale-while-revalidate: GET returns the last snapshot at once with its
+// "as of" time and starts a background refresh when the snapshot is older
+// than TTL. The page never waits on provider APIs.
 async function readConnection(connection, now) {
   let timer;
   const deadline = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Usage request timed out")), TIMEOUT); });
@@ -52,14 +56,23 @@ async function fetchQuotaSnapshot() {
   } catch (error) { throw error; }
 }
 
-export async function GET() {
-  if (cached && cached.expiresAt > Date.now()) return NextResponse.json(cached.body, { headers: { "Cache-Control": "no-store" } });
+export async function GET(request) {
+  const etag = `"q${quotaVersion("quota")}-${cached ? Math.floor(cached.expiresAt / TTL) : "none"}"`;
+  if (request.headers.get("if-none-match") === etag) {
+    return new NextResponse(null, { status: 304, headers: { ETag: etag, "Cache-Control": "no-store" } });
+  }
+  const fresh = cached && cached.expiresAt > Date.now();
+  if (fresh) return NextResponse.json(cached.body, { headers: { ETag: etag, "Cache-Control": "no-store" } });
   if (!inFlight) {
     inFlight = fetchQuotaSnapshot().then(({ rows, hasSuccess }) => {
-      const body = { rows };
+      const body = { rows, asOf: Date.now() };
       if (hasSuccess) cached = { body, expiresAt: Date.now() + (rows.some((row) => row.error) ? 15000 : TTL) };
       return body;
     }).finally(() => { inFlight = null; });
+  }
+  if (cached) {
+    // Serve the stale snapshot at once; the refresh lands on a later request.
+    return NextResponse.json(cached.body, { headers: { ETag: etag, "Cache-Control": "no-store" } });
   }
   try { return NextResponse.json(await inFlight, { headers: { "Cache-Control": "no-store" } }); }
   catch (error) { return NextResponse.json({ error: error.message }, { status: 500 }); }
