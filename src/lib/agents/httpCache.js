@@ -58,12 +58,30 @@ export function responseHeaders(etag) {
  */
 export async function cachedResult(queryKey, etag, { floorMs = 0, ttlMs = 60_000, etagOf = null }, compute) {
   const hit = cacheGet(queryKey);
-  if (hit && (hit.etag === etag || Date.now() - hit.at < floorMs)) return hit;
+  if (hit) {
+    if (hit.etag === etag) return hit;
+    if (Date.now() - hit.at < floorMs) {
+      // A floor hit whose ETag moved: the stored body predates the current
+      // version. Serving it under the current ETag would pin it on the
+      // client until the next bump or the 60 s TTL, so label the answer
+      // with the stale ETag (the client's If-None-Match no longer matches
+      // it) and ask for one trailing refetch after the floor ends.
+      return { ...hit, etag: hit.etag, retryAfterMs: Math.max(0, floorMs - (Date.now() - hit.at)) };
+    }
+  }
   const at = Date.now();
   const data = await compute();
   const entry = { data, etag: etagOf ? etagOf(data) : etag, at };
   cacheSet(queryKey, entry, ttlMs);
   return entry;
+}
+
+/** Cache headers for a cachedResult answer. A floor hit with a moved ETag
+ *  carries `x-9r-retry-after-ms`, and the client refetches once after that. */
+export function cacheHeaders(entry) {
+  const headers = responseHeaders(entry.etag);
+  if (entry.retryAfterMs != null) headers["x-9r-retry-after-ms"] = String(entry.retryAfterMs);
+  return headers;
 }
 
 export function busyResponse() {

@@ -3,7 +3,7 @@
 // compute once per live version and share the result between clients.
 import { getAdapter } from "../db/driver.js";
 import { resolveRange, distinctFirstMs, cachedFirstMs } from "./range.js";
-import { etagFor, notModified, responseHeaders, cachedResult, busyResponse } from "./httpCache.js";
+import { etagFor, notModified, responseHeaders, cacheHeaders, cachedResult, busyResponse } from "./httpCache.js";
 import { scheduleSessionBackfill } from "./sessionBackfill.js";
 
 /**
@@ -37,7 +37,7 @@ export async function handleRangeGet(request, name, { floorMs, ttlMs, keyOf = ()
     const result = await cachedResult(queryKey, etag, { floorMs, ttlMs }, () => compute(db, fromIso, toIso, params));
     return Response.json(
       shape({ preset: range.preset, from: range.from, to: range.to }, result.data),
-      { headers: responseHeaders(result.etag) }
+      { headers: cacheHeaders(result) }
     );
   } catch (error) {
     if (error?.code === "busy" || error?.status === 503) return busyResponse();

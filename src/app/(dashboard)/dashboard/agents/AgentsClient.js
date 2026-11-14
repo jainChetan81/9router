@@ -24,7 +24,22 @@ const overrideRequestIds = new Map();
 const etagStore = new Map();
 const ETAG_STORE_MAX = 24;
 
+// A floor window can serve an older body under a moved ETag; the route then
+// answers with `x-9r-retry-after-ms` and the client refetches once after it.
+const retryTimers = new Map();
+
+function scheduleRetry(url, delayMs, refetch) {
+  clearTimeout(retryTimers.get(url));
+  retryTimers.set(url, setTimeout(() => { retryTimers.delete(url); refetch(); }, delayMs));
+}
+
+export function cancelRetries() {
+  for (const t of retryTimers.values()) clearTimeout(t);
+  retryTimers.clear();
+}
+
 async function getJson(url) {
+  clearTimeout(retryTimers.get(url)); retryTimers.delete(url);
   const known = etagStore.get(url);
   const res = await fetch(url, { cache: "no-store", headers: known ? { "If-None-Match": known.etag } : undefined });
   if (res.status === 304 && known) return known.body;
@@ -35,6 +50,10 @@ async function getJson(url) {
     etagStore.delete(url);
     etagStore.set(url, { etag, body });
     while (etagStore.size > ETAG_STORE_MAX) etagStore.delete(etagStore.keys().next().value);
+  }
+  const retryAfter = parseInt(res.headers.get("x-9r-retry-after-ms"), 10);
+  if (Number.isFinite(retryAfter) && retryAfter > 0) {
+    scheduleRetry(url, retryAfter, () => getJson(url).catch(() => {}));
   }
   return body;
 }
@@ -376,7 +395,7 @@ export default function AgentsClient() {
     refetchers.current = r;
     // First paint: one live fetch on any tab, for the header's live count.
     r.live.force();
-    return () => { r.live.cancel(); r.range.cancel(); refetchers.current = null; };
+    return () => { r.live.cancel(); r.range.cancel(); refetchers.current = null; cancelRetries(); };
   }, []);
   // A live topic moved (also after the tab becomes visible again).
   const seenVersion = useRef(liveVersion);

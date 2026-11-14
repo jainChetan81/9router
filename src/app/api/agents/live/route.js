@@ -1,6 +1,6 @@
 import { getAdapter } from "@/lib/db/driver.js";
 import { getLive } from "@/lib/agents/queries.js";
-import { etagFor, liveVersionTag, notModified, responseHeaders, cachedResult, busyResponse } from "@/lib/agents/httpCache.js";
+import { etagFor, liveVersionTag, notModified, responseHeaders, cacheHeaders, cachedResult, busyResponse } from "@/lib/agents/httpCache.js";
 import { scheduleSessionBackfill } from "@/lib/agents/sessionBackfill.js";
 
 export const dynamic = "force-dynamic";
@@ -37,7 +37,7 @@ export async function GET(request) {
       // the feed goes idle (or wakes up) already holds the right ETag.
       etagOf: (data) => { hot.value = isHot(data); return etagWhen(hot.value); },
     }, () => getLive(db, now));
-    return Response.json(result.data, { headers: responseHeaders(result.etag) });
+    return Response.json(result.data, { headers: cacheHeaders(result) });
   } catch (error) {
     if (error?.code === "busy") return busyResponse();
     return Response.json({ error: error.message }, { status: 500 });

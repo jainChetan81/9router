@@ -105,6 +105,37 @@ describe("agents routes ETag", () => {
     expect(res.headers.get("etag")).toMatch(/^W\/"[0-9a-f.]+"$/);
   });
 
+  it("a floor-window answer after a bump keeps its old ETag and asks for one trailing refetch", async () => {
+    // First answer with no client ETag: stored under the current version.
+    const first = await get(sessions, "/api/agents/sessions?preset=7D");
+    expect(first.status).toBe(200);
+    expect(first.headers.get("x-9r-retry-after-ms")).toBe(null);
+
+    // A bump inside the floor window: the stale body is served under its old
+    // ETag, so the client's If-None-Match will no longer match it, and the
+    // route names the remaining floor time for one trailing refetch.
+    bump("usage");
+    const reused = await get(sessions, "/api/agents/sessions?preset=7D");
+    expect(reused.status).toBe(200);
+    expect(reused.headers.get("etag")).toBe(first.headers.get("etag"));
+    const retryAfter = parseInt(reused.headers.get("x-9r-retry-after-ms"), 10);
+    expect(retryAfter).toBeGreaterThan(0);
+    expect(retryAfter).toBeLessThanOrEqual(5000);
+
+    // The old ETag no longer answers 304 (the client must refetch), and after
+    // the window the answer is computed fresh under the current ETag with no
+    // retry marker.
+    expect((await get(sessions, "/api/agents/sessions?preset=7D", first.headers.get("etag"))).status).toBe(200);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.now() + 31_000);
+      const fresh = await get(sessions, "/api/agents/sessions?preset=7D");
+      expect(fresh.status).toBe(200);
+      expect(fresh.headers.get("etag")).not.toBe(first.headers.get("etag"));
+      expect(fresh.headers.get("x-9r-retry-after-ms")).toBe(null);
+    } finally { vi.useRealTimers(); }
+  });
+
   it("reads the oldest row at most once for the All preset", async () => {
     let minReads = 0;
     const original = fakeDb.get;
