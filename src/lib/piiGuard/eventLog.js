@@ -96,6 +96,16 @@ export async function scanForward(handle, start, size, onEvent) {
 /** Events with `ts >= fromMs`, newest first, each merged with its last routing record (which follows it in
  *  the file, so it is read first). `visit(event, ts)` returns false to stop; only the chunks needed are read.
  *  Returns { truncated }: the scan cap stopped the read before `fromMs`. */
+// Routing records whose event is not reached stay in the map; a very old
+// fromMs over a huge file could otherwise hold every request id. Bound it and
+// drop the oldest: a routing record older than the events already visited is
+// of no use.
+const ROUTING_CAP = 50_000;
+// The cap is a constant in normal use; tests set it lower to exercise the
+// eviction without a 50k-row fixture.
+let routingCap = ROUTING_CAP;
+export function setRoutingCap(n) { routingCap = Number.isInteger(n) && n > 0 ? n : ROUTING_CAP; }
+
 export async function scanBackward(handle, size, fromMs, visit) {
   const routing = new Map();
   let end = size, want = CHUNK, first = true;
@@ -115,7 +125,9 @@ export async function scanBackward(handle, size, fromMs, visit) {
         const e = parse(lines[i]);
         if (!e) continue;
         if (e.kind === "routing") {
+          // Backward order meets the newest routing record for an id first.
           if (typeof e.requestId === "string" && !routing.has(e.requestId)) routing.set(e.requestId, routingFields(e));
+          if (routing.size > routingCap) routing.delete(routing.keys().next().value);
           continue;
         }
         const ts = Date.parse(e.ts);

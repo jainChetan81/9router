@@ -63,6 +63,25 @@ describe("event log reader", () => {
     } finally { await handle.close(); }
   });
 
+  it("bounds the routing map so an old range cannot hold every request id", async () => {
+    const now = Date.now(), lines = log(3000, now);
+    await writeFile(paths.file, lines.join("\n") + "\n");
+    const handle = await open(paths.file, "r");
+    try {
+      const { size } = await handle.stat();
+      const { routingCap, setRoutingCap } = await import("../../src/lib/piiGuard/eventLog.js");
+      setRoutingCap(10);
+      try {
+        // Scanning from the very start (a very old fromMs) still resolves the
+        // routing of the newest events: each chunk's routing is fresh, and the
+        // cap only drops ids older than the last ones visited.
+        const got = [];
+        await scanBackward(handle, size, 0, (e) => { got.push(e); return got.length < 3; });
+        expect(got[0]).toMatchObject({ requestId: "req-2999", provider: "p3" });
+      } finally { setRoutingCap(routingCap); }
+    } finally { await handle.close(); }
+  });
+
   it("reads newest first across chunks, merges later routing and stops when told", async () => {
     const now = Date.now(), lines = log(3000, now);
     await writeFile(paths.file, lines.join("\n") + "\n");
