@@ -1,71 +1,130 @@
-import { getUsageStats, statsEmitter, getActiveRequests } from "@/lib/usageDb";
+import { statsEmitter, getSlimUsageStats } from "@/lib/db/repos/usageRepo.js";
 
 export const dynamic = "force-dynamic";
 
-export async function GET() {
-  const encoder = new TextEncoder();
-  const state = { closed: false, keepalive: null, send: null, sendPending: null, cachedStats: null };
+const encoder = new TextEncoder();
+const clients = new Set();
+const MAX_CONNECTIONS = 20;
+
+let lastBroadcastTime = 0;
+let broadcastTimer = null;
+let cachedPayload = null;
+let isBroadcasting = false;
+let keepaliveTimer = null;
+
+async function doBroadcast() {
+  if (clients.size === 0 || isBroadcasting) return;
+  isBroadcasting = true;
+  lastBroadcastTime = Date.now();
+  try {
+    const slim = await getSlimUsageStats();
+    cachedPayload = encoder.encode(`data: ${JSON.stringify(slim)}\n\n`);
+    for (const client of clients) {
+      try {
+        client.controller.enqueue(cachedPayload);
+      } catch {
+        client.cleanup();
+      }
+    }
+  } catch (err) {
+    console.error("[usage/stream] broadcast error:", err);
+  } finally {
+    isBroadcasting = false;
+  }
+}
+
+function triggerBroadcast() {
+  if (clients.size === 0) return;
+
+  const now = Date.now();
+  const elapsed = now - lastBroadcastTime;
+
+  if (elapsed >= 1000) {
+    if (broadcastTimer) {
+      clearTimeout(broadcastTimer);
+      broadcastTimer = null;
+    }
+    doBroadcast();
+  } else if (!broadcastTimer) {
+    broadcastTimer = setTimeout(() => {
+      broadcastTimer = null;
+      doBroadcast();
+    }, 1000 - elapsed);
+    broadcastTimer?.unref?.();
+  }
+}
+
+// Subscribe once to statsEmitter for shared broadcast
+if (!global._usageStreamWired) {
+  global._usageStreamWired = true;
+  statsEmitter.on("update", triggerBroadcast);
+  statsEmitter.on("pending", triggerBroadcast);
+}
+
+function ensureKeepalive() {
+  if (keepaliveTimer) return;
+  keepaliveTimer = setInterval(() => {
+    if (clients.size === 0) {
+      clearInterval(keepaliveTimer);
+      keepaliveTimer = null;
+      return;
+    }
+    const ping = encoder.encode(": ping\n\n");
+    for (const c of clients) {
+      try {
+        c.controller.enqueue(ping);
+      } catch {
+        c.cleanup();
+      }
+    }
+  }, 25000);
+  keepaliveTimer?.unref?.();
+}
+
+export async function GET(request) {
+  if (clients.size >= MAX_CONNECTIONS) {
+    return new Response("Too many usage stream connections", {
+      status: 429,
+      headers: { "Retry-After": "5" },
+    });
+  }
+
+  const client = { controller: null, closed: false, cleanup: null };
+
+  const cleanup = () => {
+    if (client.closed) return;
+    client.closed = true;
+    clients.delete(client);
+    if (clients.size === 0 && keepaliveTimer) {
+      clearInterval(keepaliveTimer);
+      keepaliveTimer = null;
+    }
+  };
+  client.cleanup = cleanup;
+
+  request?.signal?.addEventListener?.("abort", cleanup, { once: true });
 
   const stream = new ReadableStream({
     async start(controller) {
-      // Full stats refresh (heavy) + immediate lightweight push
-      state.send = async () => {
-        if (state.closed) return;
-        try {
-          // Push lightweight update immediately so UI reflects changes fast
-          if (state.cachedStats) {
-            const { activeRequests, recentRequests, errorProvider } = await getActiveRequests();
-            const quickStats = { ...state.cachedStats, activeRequests, recentRequests, errorProvider };
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify(quickStats)}\n\n`));
-          }
-          // Then do full recalc and update cache
-          const stats = await getUsageStats();
-          state.cachedStats = stats;
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify(stats)}\n\n`));
-        } catch {
-          state.closed = true;
-          statsEmitter.off("update", state.send);
-          statsEmitter.off("pending", state.sendPending);
-          clearInterval(state.keepalive);
+      client.controller = controller;
+      clients.add(client);
+
+      try {
+        if (!cachedPayload) {
+          const slim = await getSlimUsageStats();
+          cachedPayload = encoder.encode(`data: ${JSON.stringify(slim)}\n\n`);
         }
-      };
+        controller.enqueue(cachedPayload);
+      } catch {
+        cleanup();
+        return;
+      }
 
-      // Lightweight push: only refresh activeRequests + recentRequests on pending changes
-      state.sendPending = async () => {
-        if (state.closed || !state.cachedStats) return;
-        try {
-          const { activeRequests, recentRequests, errorProvider } = await getActiveRequests();
-          const stats = { ...state.cachedStats, activeRequests, recentRequests, errorProvider };
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify(stats)}\n\n`));
-        } catch {
-          state.closed = true;
-          statsEmitter.off("update", state.send);
-          statsEmitter.off("pending", state.sendPending);
-          clearInterval(state.keepalive);
-        }
-      };
-
-      await state.send();
-
-      statsEmitter.on("update", state.send);
-      statsEmitter.on("pending", state.sendPending);
-
-      state.keepalive = setInterval(() => {
-        if (state.closed) { clearInterval(state.keepalive); return; }
-        try {
-          controller.enqueue(encoder.encode(": ping\n\n"));
-        } catch {
-          state.closed = true;
-          clearInterval(state.keepalive);
-        }
-      }, 25000);
+      ensureKeepalive();
     },
 
     cancel() {
-      state.closed = true;
-      statsEmitter.off("update", state.send);
-      statsEmitter.off("pending", state.sendPending);
-      clearInterval(state.keepalive);
+      cleanup();
     },
   });
 
@@ -73,7 +132,7 @@ export async function GET() {
     headers: {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
-      Connection: "keep-alive",
+      "Connection": "keep-alive",
     },
   });
 }
