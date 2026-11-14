@@ -87,3 +87,60 @@ describe("quota route SWR (WP3)", () => {
     await new Promise((r) => setTimeout(r, 50));
   }, 30_000);
 });
+
+describe("quota route SWR resilience", () => {
+  let mod;
+  beforeEach(async () => {
+    vi.resetModules();
+    usageNow = 10;
+    conns.length = 0;
+    conns.push(CONN);
+    mod = await import("../../src/app/api/spend/quota/route.js");
+  });
+
+  // Warm the cache with real time, then shift the clock past the 60 s TTL so
+  // the next GET takes the stale-while-revalidate path.
+  async function goStale() {
+    await mod.GET(new Request("http://x/api/spend/quota"));
+    const realNow = Date.now;
+    Date.now = () => realNow() + 61_000;
+    return () => { Date.now = realNow; };
+  }
+
+  it("marks a stale body with refreshing while a refresh runs", async () => {
+    const restore = await goStale();
+    try {
+      conns.length = 0;
+      const { getProviderConnections } = await import("@/lib/localDb");
+      // The refresh hangs long enough for GET to answer first.
+      getProviderConnections.mockImplementationOnce(() => new Promise(() => {}));
+      const stale = await mod.GET(new Request("http://x/api/spend/quota"));
+      const body = await stale.json();
+      expect(body.rows).toHaveLength(1);
+      expect(body.refreshing).toBe(true);
+      expect(body.asOf).toBeGreaterThan(0);
+    } finally { restore(); }
+    await new Promise((r) => setTimeout(r, 20));
+  }, 30_000);
+
+  it("a rejected background refresh is caught, logged, and a stale body still serves", async () => {
+    const restore = await goStale();
+    const errors = [];
+    const spy = vi.spyOn(console, "error").mockImplementation((...a) => errors.push(a.join(" ")));
+    try {
+      conns.length = 0;
+      const { getProviderConnections } = await import("@/lib/localDb");
+      getProviderConnections.mockRejectedValueOnce(new Error("connections store unavailable"));
+      const stale = await mod.GET(new Request("http://x/api/spend/quota"));
+      const body = await stale.json();
+      expect(body.rows).toHaveLength(1);
+      expect(body.refreshing).toBe(true);
+      await new Promise((r) => setTimeout(r, 30));
+      expect(errors.some((e) => e.includes("connections store unavailable"))).toBe(true);
+      // The failed refresh released the slot, so a later request retries.
+      const again = await mod.GET(new Request("http://x/api/spend/quota"));
+      expect((await again.json()).refreshing).toBe(true);
+    } finally { spy.mockRestore(); restore(); }
+    await new Promise((r) => setTimeout(r, 20));
+  }, 30_000);
+});

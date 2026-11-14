@@ -68,11 +68,17 @@ export async function GET(request) {
       const body = { rows, asOf: Date.now() };
       if (hasSuccess) cached = { body, expiresAt: Date.now() + (rows.some((row) => row.error) ? 15000 : TTL) };
       return body;
+    }).catch((error) => {
+      // The refresh runs detached behind a stale body; a rejection must never
+      // surface as an unhandled rejection (it can kill the process). Keep
+      // serving the last snapshot; a later request retries.
+      console.error("[quota] background refresh failed:", error?.message || error);
+      return null;
     }).finally(() => { inFlight = null; });
   }
   if (cached) {
     // Serve the stale snapshot at once; the refresh lands on a later request.
-    return NextResponse.json(cached.body, { headers: { ETag: etag, "Cache-Control": "no-store" } });
+    return NextResponse.json({ ...cached.body, refreshing: true }, { headers: { ETag: etag, "Cache-Control": "no-store" } });
   }
   try { return NextResponse.json(await inFlight, { headers: { "Cache-Control": "no-store" } }); }
   catch (error) { return NextResponse.json({ error: error.message }, { status: 500 }); }
