@@ -170,6 +170,45 @@ describe("spend aggregation SQL (N6/B10)", () => {
     expect(after.totals).toEqual(first.totals);
   }, 60_000);
 
+  it("falls back to inline aggregation on a worker failure and keeps 503 when busy", async () => {
+    const mod = await import("../../src/app/api/spend/route.js");
+    // Swap the pool for fakes: one that fails with a plain error (worker
+    // crash), then one that fails with the busy code.
+    const { createReadPool } = await import("@/lib/db/readPool.js");
+    const originalCreate = createReadPool;
+    const calls = [];
+    const fake = { run: async () => { calls.push(1); throw new Error("spend read worker exited"); } };
+    const busy = { run: async () => { const e = new Error("spend read queue is busy"); e.code = "busy"; throw e; } };
+    // Module-private pool: exercise via module re-import with the pool mocked.
+    vi.doMock("@/lib/db/readPool.js", () => ({ createReadPool: () => fake }));
+    let m = await import("../../src/app/api/spend/route.js?v=inline");
+    const params = new URLSearchParams({ preset: "7D" });
+    const res = await m.GET(new Request(`http://x/api/spend?${params}`));
+    expect(res.status).toBe(200);
+    expect((await res.json()).whatIfTargets).toBeDefined();
+    expect(calls.length).toBe(1);
+
+    vi.doMock("@/lib/db/readPool.js", () => ({ createReadPool: () => busy }));
+    m = await import("../../src/app/api/spend/route.js?v=busy");
+    const busyRes = await m.GET(new Request(`http://x/api/spend?${params}`));
+    expect(busyRes.status).toBe(503);
+    vi.doUnmock("@/lib/db/readPool.js");
+    void originalCreate;
+  }, 60_000);
+
+  it("the ETag changes with the rolling time bucket for Today and 24h, not 7D", async () => {
+    const { etagBucketFor } = await import("../../src/app/api/spend/route.js");
+    const now = Date.parse("2026-11-09T21:00:00.000Z");
+    const { istMidnightMs } = await import("../../src/lib/spend/time.js");
+    const today = etagBucketFor({ preset: "Today" }, now);
+    expect(today).toBe(istMidnightMs(now));
+    const h24 = etagBucketFor({ preset: "24h" }, now);
+    expect(h24).toBe(Math.floor(now / 36e5) * 36e5);
+    expect(etagBucketFor({ preset: "7D" }, now)).toBe("");
+    // Rollover changes the bucket.
+    expect(etagBucketFor({ preset: "24h" }, now + 36e5)).not.toBe(h24);
+  });
+
   it("rejects invalid fee payloads on PATCH /api/spend (S1 server side)", async () => {
     // Route handler test would need Next runtime; assert the module's guard instead.
     const mod = await import("../../src/app/api/spend/route.js");

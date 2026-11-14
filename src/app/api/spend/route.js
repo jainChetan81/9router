@@ -5,14 +5,16 @@ import { DATA_FILE } from "@/lib/db/paths.js";
 import { createReadPool } from "@/lib/db/readPool.js";
 import { getSettings, updateSettings, getPricingForModel } from "@/lib/localDb";
 import { SUBS, aggregateSpend, invalidateSpendCache } from "@/lib/spend/aggregate.js";
+import { HOUR_MS, istMidnightMs } from "@/lib/spend/time.js";
 import { version as usageVersion } from "@/lib/live/bus.js";
 
 export const dynamic = "force-dynamic";
 
 // Aggregate runs on a read-only worker thread so the gateway event loop
 // stays free. Falls back to inline (main-thread) execution when the
-// adapter is not file-backed (sql.js).
-const spendPool = createReadPool({ name: "spend", workerModuleUrl: new URL("@/lib/spend/aggregateWorker.js", import.meta.url).href });
+// adapter is not file-backed (sql.js) or the worker itself failed; only a
+// busy read queue (pool or queue full) still answers 503.
+const spendPool = createReadPool({ name: "spend", workerModuleUrl: new URL("./aggregateWorker.js", import.meta.url).href });
 
 async function aggregateOffThread(db, args) {
   try {
@@ -21,10 +23,19 @@ async function aggregateOffThread(db, args) {
     });
   } catch (error) {
     if (error?.code === "busy") throw error;
-    // Non-file-backed driver or worker failure: run inline as before.
-    if (String(error?.message).includes("file-backed")) return aggregateSpend(db, args);
-    throw error;
+    // Worker failure, worker crash, timeout, or a non-file-backed driver:
+    // run inline so the request still answers.
+    return aggregateSpend(db, args);
   }
+}
+
+// Current time bucket for rolling presets, so a 304 can never outlive the
+// window it names. Today rolls at IST midnight, 24h at the top of the hour.
+export function etagBucketFor(params, now) {
+  const preset = (typeof params?.get === "function" ? params.get("preset") : params?.preset) || "30D";
+  if (preset === "Today") return istMidnightMs(now);
+  if (preset === "24h") return Math.floor(now / HOUR_MS) * HOUR_MS;
+  return "";
 }
 
 // What-if targets: every provider/model pair seen in the last 60 days, with
@@ -63,7 +74,8 @@ export async function GET(request) {
     const settings = await getSettings();
     const fees = settings.spendFees || {};
     const v = usageVersion("usage");
-    const etag = `"${createHash("sha1").update(`${v}|${params.toString()}|${JSON.stringify(fees)}`).digest("hex").slice(0, 20)}"`;
+    const bucket = etagBucketFor(params, Date.now());
+    const etag = `"${createHash("sha1").update(`${v}|${params.toString()}|${JSON.stringify(fees)}|${bucket}`).digest("hex").slice(0, 20)}"`;
     if (request.headers.get("if-none-match") === etag) {
       return new NextResponse(null, { status: 304, headers: { ETag: etag, "Cache-Control": "no-store" } });
     }
@@ -71,6 +83,9 @@ export async function GET(request) {
     const whatIfTargets = await resolveWhatIfTargets(db);
     return NextResponse.json({ ...payload, whatIfTargets }, { headers: { ETag: etag, "Cache-Control": "no-store" } });
   } catch (error) {
+    if (error?.code === "busy") {
+      return NextResponse.json({ error: "busy" }, { status: 503, headers: { "Retry-After": "1" } });
+    }
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 }
