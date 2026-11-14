@@ -58,7 +58,9 @@ export function buildView({ data, quota, ui, set, fit, range, feeRefs, saveFees,
   const ratio = feesPro ? valueFeed / feesPro : 0;
 
   const rangeTitle = { Today: "Today", "24h": "Last 24 hours", "7D": "Last 7 days", "30D": "Last 30 days", "60D": "Last 60 days", All: "All time", Custom: range.label || "Custom range" }[preset];
-  const rangeSub = hourly ? `${data.range.first} – ${data.range.last} IST · hourly` : `${data.range.first} – ${data.range.last} · ${bars.length} days · fees prorated`;
+  const rangeSub = preset === "24h"
+    ? `Rolling 24h: ${data.range.first} – ${data.range.last} IST, ending on the next full hour · hourly`
+    : hourly ? `${data.range.first} – ${data.range.last} IST · hourly` : `${data.range.first} – ${data.range.last} · ${bars.length} days · fees prorated`;
 
   // Chart
   const mx = Math.max(...bars.map((b) => b.val + b.real), 0.01);

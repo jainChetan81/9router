@@ -15,7 +15,7 @@ const STATE = { padding: "26px 12px", textAlign: "center", borderTop: "1px solid
 const BTN = { border: "1px solid var(--line2)", background: "var(--card)", color: "var(--tx)", borderRadius: "7px", height: "28px", padding: "0 12px", fontSize: "12px", cursor: "pointer" };
 
 export default function QuotaRunway({ syncNonce = 0 }) {
-  const [res, setRes] = useState({ state: "loading", rows: [], at: null });
+  const [res, setRes] = useState({ state: "loading", rows: [], at: null, refreshing: false });
   const [all, setAll] = useState(false), [agOpen, setAgOpen] = useState(false), [now, setNow] = useState(() => Date.now());
   const [ref, w] = useWidth();
   const narrow = w < 640;
@@ -27,6 +27,10 @@ export default function QuotaRunway({ syncNonce = 0 }) {
       if (c) setRes(c);
       if (isFresh(cacheGet(QUOTA_URL), QUOTA_TTL)) return;
     }
+    // A quiet refresh (sync button, stale data) keeps the current rows on
+    // screen and only marks the header as refreshing; the SWR server path
+    // also returns instantly, so "as of" stays truthful while upstreams are
+    // still being polled.
     if (!quiet) setRes((r) => (r.state === "live" ? r : { ...r, state: "loading" }));
     try {
       const r = await fetch("/api/spend/quota", { cache: "no-store" });
@@ -34,11 +38,18 @@ export default function QuotaRunway({ syncNonce = 0 }) {
       if (!r.ok) throw new Error(body.error || r.statusText);
       const rows = Array.isArray(body.rows) ? body.rows : [];
       cacheSet(QUOTA_URL, rows);
-      setRes({ state: rows.length ? "live" : "empty", rows, at: Date.now(), stale: false });
+      // asOf is the server's snapshot time; fall back to the fetch time.
+      setRes({ state: rows.length ? "live" : "empty", rows, at: body.asOf || Date.now(), stale: false, refreshing: false });
     } catch { setRes((r) => (quiet && r.state === "live" ? { ...r, stale: true } : { state: "error", rows: [], at: null })); }
   }, []);
   useEffect(() => { const t = setTimeout(() => load({ quiet: !!cacheGet(QUOTA_URL), useCache: true }), 0); return () => clearTimeout(t); }, [load]);
-  useEffect(() => { const iv = setInterval(() => setNow(Date.now()), 30000); return () => clearInterval(iv); }, []);
+  // "Resets in" ticks every 30 s, but only while the tab is visible.
+  useEffect(() => {
+    const iv = setInterval(() => { if (!document.hidden) setNow(Date.now()); }, 30000);
+    const vis = () => { if (!document.hidden) setNow(Date.now()); };
+    document.addEventListener("visibilitychange", vis);
+    return () => { clearInterval(iv); document.removeEventListener("visibilitychange", vis); };
+  }, []);
   // No polling: the page Sync button bumps syncNonce for a fresh read.
   useEffect(() => {
     if (!syncNonce) return;
@@ -80,7 +91,9 @@ export default function QuotaRunway({ syncNonce = 0 }) {
           <span style={{ fontSize: "11.5px", fontWeight: "600", letterSpacing: ".05em", color: "var(--tx2)", textTransform: "uppercase" }}>Quota runway</span>
           <span style={{ display: "inline-flex", alignItems: "center", gap: "6px", fontSize: "11px", color: "var(--tx3)" }}>
             <span style={{ width: "7px", height: "7px", borderRadius: "50%", background: res.state === "error" ? "var(--red)" : res.stale ? "var(--amber)" : "var(--green)" }}></span>
-            {res.stale ? "Refresh failed, showing data from " + fTime(res.at) + " IST" : "Live, not affected by range" + (res.at ? " · updated " + fTime(res.at) + " IST" : "")}
+            {res.stale ? "Refresh failed, showing data from " + fTime(res.at) + " IST"
+              : res.refreshing ? "Refreshing… data as of " + (res.at ? fTime(res.at) + " IST" : "—")
+              : "Live, not affected by range" + (res.at ? " · updated " + fTime(res.at) + " IST" : "")}
             {res.stale && <button onClick={() => load()} style={{ border: "0", background: "transparent", color: "var(--acc)", fontSize: "11px", cursor: "pointer", padding: "0" }}>Retry</button>}
           </span>
         </div>
