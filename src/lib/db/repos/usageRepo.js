@@ -404,6 +404,13 @@ export async function saveRequestUsage(entry) {
         ]
       );
 
+      // Remember the first row this process saves. Rows from that id on reach
+      // usageDaily through the in-memory buffer, so the startup reconcile must
+      // stop before it.
+      if (global._usageFirstSavedId == null) {
+        global._usageFirstSavedId = Number(db.get(`SELECT last_insert_rowid() AS id`)?.id) || null;
+      }
+
       // Atomic counter increment in same transaction.
       const cur = db.get(`SELECT value FROM _meta WHERE key = 'totalRequestsLifetime'`);
       const next = (cur ? parseInt(cur.value, 10) : 0) + 1;
@@ -530,17 +537,27 @@ export async function reconcileUsageDaily() {
   global._usageDailyReconciled = true;
   try {
     const db = await getAdapter();
+    // Everything below is synchronous, so no save or flush interleaves with it.
     const markerRow = db.get(`SELECT value FROM _meta WHERE key = ?`, [FLUSHED_MAX_ID_KEY]);
-    const marker = Number(markerRow?.value) || 0;
-    // Only the tail: rows since the marker. A fresh database has nothing
-    // past 0 either.
+    const maxId = Number(db.get(`SELECT MAX(id) AS m FROM usageHistory`)?.m) || 0;
+    if (!markerRow) {
+      // No marker yet: this is the first start with the buffered rollup.
+      // Earlier builds wrote usageDaily on every save, so the table is already
+      // complete. Folding history in now would count every row twice.
+      if (maxId) db.transaction(() => setMetaSync(db, FLUSHED_MAX_ID_KEY, maxId));
+      return;
+    }
+    const marker = Number(markerRow.value) || 0;
+    // Rows this process saved are in the buffer already; stop before them.
+    const firstSaved = Number(global._usageFirstSavedId) || 0;
+    const upper = firstSaved ? firstSaved - 1 : maxId;
+    if (upper <= marker) return;
     const rows = db.all(
       `SELECT timestamp, provider, model, connectionId, apiKey, endpoint, cost, tokens
-       FROM usageHistory WHERE id > ? ORDER BY id ASC`,
-      [marker]
+       FROM usageHistory WHERE id > ? AND id <= ? ORDER BY id ASC`,
+      [marker, upper]
     );
     if (!rows.length) return;
-    const maxId = db.get(`SELECT MAX(id) AS m FROM usageHistory`)?.m || 0;
     const days = new Map();
     for (const r of rows) {
       const dateKey = getLocalDateKey(r.timestamp);
@@ -552,23 +569,17 @@ export async function reconcileUsageDaily() {
         cost: r.cost, tokens: parseJson(r.tokens, {}),
       });
     }
+    // Merge the lost tail. The marker moves to `upper` only if no buffered
+    // flush has moved it further already.
     db.transaction(() => {
-      // Fold rows saved between the SELECT above and this write into the
-      // same snapshot, so the marker never skips a row.
-      const late = db.all(
-        `SELECT timestamp, provider, model, connectionId, apiKey, endpoint, cost, tokens
-         FROM usageHistory WHERE id > ? ORDER BY id ASC`, [maxId]);
-      for (const r of late) {
-        const dateKey = getLocalDateKey(r.timestamp);
-        let day = days.get(dateKey);
-        if (!day) days.set(dateKey, day = getEmptyDay());
-        aggregateEntryToDay(day, {
-          timestamp: r.timestamp, provider: r.provider, model: r.model,
-          connectionId: r.connectionId, apiKey: r.apiKey, endpoint: r.endpoint,
-          cost: r.cost, tokens: parseJson(r.tokens, {}),
-        });
+      for (const [dateKey, delta] of days) {
+        const row = db.get(`SELECT data FROM usageDaily WHERE dateKey = ?`, [dateKey]);
+        const day = row ? parseJson(row.data, getEmptyDay()) : getEmptyDay();
+        mergeDay(day, delta);
+        db.run(`INSERT INTO usageDaily(dateKey, data) VALUES(?, ?) ON CONFLICT(dateKey) DO UPDATE SET data = excluded.data`, [dateKey, stringifyJson(day)]);
       }
-      mergeSnapshotIntoDaily(db, days);
+      const cur = Number(db.get(`SELECT value FROM _meta WHERE key = ?`, [FLUSHED_MAX_ID_KEY])?.value) || 0;
+      if (upper > cur) setMetaSync(db, FLUSHED_MAX_ID_KEY, upper);
     });
     console.log(`[usageRepo] reconciled ${rows.length} usageHistory rows into usageDaily after restart (marker ${marker})`);
   } catch (err) {
