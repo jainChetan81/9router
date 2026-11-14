@@ -2,8 +2,15 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { existsSync } from "node:fs";
 
-const library = await import("/home/chetan/Projects/pii-guard/dist/index.js");
+// The scanner library lives in the separate pii-guard repo. Resolve it from
+// PII_GUARD_MODULE, else this checkout's default build path; skip the suite
+// (a cold CI or a fresh clone) when it is not present.
+const libraryPath = process.env.PII_GUARD_MODULE || "/home/chetan/Projects/pii-guard/dist/index.js";
+const describeIfLibrary = existsSync(libraryPath) ? describe : describe.skip;
+
+const library = await import(libraryPath);
 const P = await import("../../src/lib/piiGuard/prompts.js");
 const D = await import("../../src/lib/piiGuard/promptDb.mjs");
 const detector = library.createDetector({ salt: "abcdef0123456789" });
@@ -15,7 +22,7 @@ let dir, file;
 beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "pii-writer-")); file = join(dir, "prompts.db"); process.env.PII_GUARD_PROMPTS = file; await P._reset(); });
 afterEach(async () => { await P._reset(); delete process.env.PII_GUARD_PROMPTS; delete process.env.PII_GUARD_PROMPTS_WORKER; await rm(dir, { recursive: true, force: true }); });
 
-describe("prompt store batching", () => {
+describeIfLibrary("prompt store batching", () => {
   it("capture never opens the database: nothing exists on disk until the batch is written", async () => {
     expect(capture(["first question"], null)).toBe(1);
     expect(capture(["second question"], "known-later")).toBeGreaterThan(0); // held until its digests load
@@ -52,7 +59,7 @@ describe("prompt store batching", () => {
   });
 });
 
-describe("prompt store retention", () => {
+describeIfLibrary("prompt store retention", () => {
   const fill = (h, n, size, ts = Date.now()) => D.writeOps(h, Array.from({ length: n }, (_, i) => ({ row: { ts: ts + i, requestId: `r${i}`, sessionId: "s", model: null, provider: null, combo: null, account: null, client: null, role: "user", kind: "text", path: "p", text: `w${i} `.repeat(Math.ceil(size / 6)).slice(0, size), cut: 0, hashes: "", digest: `d${i}`, tool: null } })));
   const sum = (h) => Number(h.db.prepare("SELECT COALESCE(SUM(length(CAST(text AS BLOB))), 0) AS n FROM messages").get().n);
 
@@ -99,7 +106,7 @@ describe("prompt store retention", () => {
   });
 });
 
-describe("prompt store writer thread", () => {
+describeIfLibrary("prompt store writer thread", () => {
   it("stores, deduplicates after a restart, searches and sweeps without a main-thread connection", async () => {
     process.env.PII_GUARD_PROMPTS_WORKER = "on";
     capture(["worker one", "worker two"], "ws", "w1");
