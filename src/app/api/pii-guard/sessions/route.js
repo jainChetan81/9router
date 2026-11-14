@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { conversation, message as messageOf, sessions } from "@/lib/piiGuard/prompts.js";
+import { conversationAsync as conversation, sessionsAsync as sessions } from "@/lib/piiGuard/prompts.js";
 
 export const dynamic = "force-dynamic";
 const NO_STORE = { "Cache-Control": "no-store" };
@@ -28,7 +28,7 @@ export async function GET(request) {
     if ([client, provider, combo].some((v) => v && !ID.test(v))) return NextResponse.json({ error: "Invalid filter" }, { status: 400, headers: NO_STORE });
     const findings = p.get("findings") === "1" ? true : p.get("findings") === "0" ? false : null;
     try {
-      return NextResponse.json(sessions({ q, client, provider, combo, hash, findings, ...range, before, limit }), { headers: NO_STORE });
+      return NextResponse.json(await sessions({ q, client, provider, combo, hash, findings, ...range, before, limit }), { headers: NO_STORE });
     } catch {
       return NextResponse.json({ error: "Session list failed" }, { status: 500, headers: NO_STORE });
     }
@@ -40,7 +40,7 @@ export async function GET(request) {
   const after = int("after", 0);
   if (Number.isNaN(after)) return NextResponse.json({ error: "Invalid cursor" }, { status: 400, headers: NO_STORE });
   try {
-    const r = conversation({ sessionId, ...range, after });
+    const r = await conversation({ sessionId, ...range, after });
     if (r.unavailable) return NextResponse.json({ error: "Prompt store unavailable" }, { status: 503, headers: NO_STORE });
     return NextResponse.json(r, { headers: NO_STORE });
   } catch {

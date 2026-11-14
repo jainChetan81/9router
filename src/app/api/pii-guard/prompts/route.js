@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { message, search } from "@/lib/piiGuard/prompts.js";
+import { messageAsync as message, searchAsync as search } from "@/lib/piiGuard/prompts.js";
 
 export const dynamic = "force-dynamic";
 const NO_STORE = { "Cache-Control": "no-store" };
@@ -12,7 +12,7 @@ export async function GET(request) {
   if (p.has("id")) {
     const id = int("id", NaN);
     if (!Number.isFinite(id)) return NextResponse.json({ error: "Invalid id" }, { status: 400, headers: NO_STORE });
-    const m = message(id);
+    const m = await message(id).catch(() => null);
     return m ? NextResponse.json(m, { headers: NO_STORE }) : NextResponse.json({ error: "Not found or expired" }, { status: 404, headers: NO_STORE });
   }
   const q = (p.get("q") || "").slice(0, 200);
@@ -21,7 +21,7 @@ export async function GET(request) {
   const from = int("from", 0), to = int("to", Date.now()), before = int("before", Infinity), limit = int("limit", 50);
   if ([from, to, before, limit].some(Number.isNaN)) return NextResponse.json({ error: "Invalid range" }, { status: 400, headers: NO_STORE });
   try {
-    return NextResponse.json(search({ q, sessionId, requestId, hash, from, to, before, limit }), { headers: NO_STORE });
+    return NextResponse.json(await search({ q, sessionId, requestId, hash, from, to, before, limit }), { headers: NO_STORE });
   } catch {
     return NextResponse.json({ error: "Search failed" }, { status: 500, headers: NO_STORE });
   }

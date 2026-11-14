@@ -4,7 +4,7 @@ const mocks = vi.hoisted(() => ({
   sessions: vi.fn(() => ({ rows: [], next: null })),
   conversation: vi.fn(() => ({ sessionId: "s1" })),
 }));
-vi.mock("@/lib/piiGuard/prompts.js", () => ({ sessions: mocks.sessions, conversation: mocks.conversation, message: vi.fn() }));
+vi.mock("@/lib/piiGuard/prompts.js", () => ({ sessionsAsync: mocks.sessions, conversationAsync: mocks.conversation, messageAsync: vi.fn() }));
 const { sessions, conversation } = mocks;
 
 import { GET } from "../../src/app/api/pii-guard/sessions/route.js";
