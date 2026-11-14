@@ -34,47 +34,68 @@ export function applyIgnoreToSummary(summary, ignore = []) {
   return { ...summary, groups, byAction: nextByAction };
 }
 
-// step/origin: bucket hits into a trend (ms per bucket, start of bucket 0). Off when step is not set.
-export function summarize(events, { since, until, now = Date.now(), ignore = [], step, origin, routing: preRouting, times: preTimes, startIndex = 0 } = {}) {
-  events = Array.isArray(events) ? events : [];
-  const routing = preRouting || routingByRequest(events);
+const sameRoute = (route, raw, key) => (route && (key !== "combo" || Object.hasOwn(route, "combo")) ? route[key] : raw);
+const label = (v) => (typeof v === "string" && v ? v.slice(0, 80) : null);
+const ROUTES_SOFT = 20_000, ROUTES_HARD = 50_000, ROUTES_KEEP = 10_000;
+
+/** Folds events into a summary one at a time, so a caller can stream a log and keep only this state.
+ *  `add(event, ts)` takes events in file order; `route(event)` takes routing records (the last one for a
+ *  request wins, and it may arrive after its event); `finish()` projects the state and can be called again
+ *  after more events. `open: true` takes events with any later timestamp: `finish({ until })` then sets
+ *  the range end. step/origin: bucket hits into a trend (ms per bucket, start of bucket 0). */
+export function createSummarizer({ since, until, now = Date.now(), step, origin, open = false } = {}) {
   const sinceMs = Number.isFinite(since) ? since : now - DAY;
-  const untilMs = Number.isFinite(until) ? until : now;
-  const groups = new Map();
+  const untilMs = open ? Infinity : Number.isFinite(until) ? until : now;
+  const groups = new Map(), routes = new Map();
   const ruleHits = Object.create(null), ruleStuck = Object.create(null), ruleHashes = Object.create(null), ruleSources = Object.create(null), bySource = Object.create(null);
   const leaked = new Set(), blocked = new Set(), unique = new Set();
   let errors24h = 0;
   let requests = 0;
   const actionHits = Object.create(null), ruleTurns = Object.create(null);
-  const nTrend = step > 0 ? Math.min(400, Math.ceil(((Number.isFinite(until) ? until : now) - origin) / step)) : 0;
-  const trend = Array.from({ length: Math.max(0, nTrend) }, () => ({ hits: 0, leaks: 0 }));
-
+  const buckets = new Map();
   const ocrStatus = { scanned: 0, partial: 0, empty: 0, failed: 0, skipped: 0 };
   let cacheHit = 0, cacheMiss = 0, cacheCoalesced = 0, cacheNone = 0;
   const missOcrMs = [];
   let imagesWithHits = 0;
   let totalOcrEvents = 0;
-  const recentOcr = [], reasons = Object.create(null);
+  let recentOcr = [];
+  const reasons = Object.create(null);
 
-  for (let idx = Math.max(0, startIndex); idx < events.length; idx++) {
-    const rawEvent = events[idx];
-    if (!rawEvent || rawEvent.kind === "routing") continue;
-    if (rawEvent.type === "test" || rawEvent.test === true) continue;
-    const ts = preTimes ? preTimes[idx] : Date.parse(rawEvent.ts);
-    if (!Number.isFinite(ts) || ts < sinceMs || ts > untilMs) continue;
-    if (rawEvent.type === "error") { errors24h += Number.isInteger(rawEvent.count) && rawEvent.count > 0 ? rawEvent.count : 1; continue; }
-    if (rawEvent.type === "stats") continue;
+  // Routing records are kept for the requests the summary still shows, plus the most recent ones.
+  function prune() {
+    const used = new Set();
+    for (const g of groups.values()) if (g.routeId) used.add(g.routeId);
+    for (const o of recentOcr) if (o.entry.requestId) used.add(o.entry.requestId);
+    for (const id of routes.keys()) {
+      if (routes.size <= ROUTES_KEEP) break;
+      if (!used.has(id)) routes.delete(id);
+    }
+  }
+  function route(event) {
+    if (event?.kind !== "routing" || typeof event.requestId !== "string") return;
+    const fields = {};
+    for (const key of ["provider", "account", "resolvedModel"]) fields[key] = typeof event[key] === "string" ? event[key] : null;
+    if (typeof event.combo === "string") fields.combo = event.combo;
+    routes.delete(event.requestId); // newest last
+    routes.set(event.requestId, fields);
+    if (routes.size > ROUTES_HARD) prune();
+  }
 
-    const route = typeof rawEvent.requestId === "string" ? routing.get(rawEvent.requestId) : undefined;
-    const evProvider = route ? route.provider : rawEvent.provider;
-    const evCombo = route && Object.hasOwn(route, "combo") ? route.combo : rawEvent.combo;
+  function add(rawEvent, ts = Date.parse(rawEvent?.ts)) {
+    if (!rawEvent || rawEvent.kind === "routing") return;
+    if (rawEvent.type === "test" || rawEvent.test === true) return;
+    if (!Number.isFinite(ts) || ts < sinceMs || ts > untilMs) return;
+    if (rawEvent.type === "error") { errors24h += Number.isInteger(rawEvent.count) && rawEvent.count > 0 ? rawEvent.count : 1; return; }
+    if (rawEvent.type === "stats") return;
+    const routeId = typeof rawEvent.requestId === "string" ? rawEvent.requestId : undefined;
 
     if (rawEvent.type === "ocr") {
       totalOcrEvents++;
       if (rawEvent.reason) reasons[rawEvent.reason] = (reasons[rawEvent.reason] || 0) + 1;
-      recentOcr.push({ ts: rawEvent.ts, requestId: rawEvent.requestId, model: rawEvent.model, endpoint: rawEvent.endpoint, imageIndex: rawEvent.imageIndex, status: rawEvent.status, ...(rawEvent.reason && { reason: rawEvent.reason }), cache: rawEvent.cache, ocrMs: rawEvent.ocrMs, mode: rawEvent.mode, ...(typeof evProvider === "string" && evProvider && { provider: evProvider }), ...(typeof evCombo === "string" && evCombo && { combo: evCombo }), rules: [...new Set((Array.isArray(rawEvent.hits) ? rawEvent.hits : []).filter(hit => hit && hit.action !== "ignored").map(hit => hit.name || hit.rule).filter(Boolean))] });
+      // Provider and combo are resolved in finish(): the routing record may not have been read yet.
+      recentOcr.push({ provider: rawEvent.provider, combo: rawEvent.combo, routeId, entry: { ts: rawEvent.ts, requestId: rawEvent.requestId, model: rawEvent.model, endpoint: rawEvent.endpoint, imageIndex: rawEvent.imageIndex, status: rawEvent.status, ...(rawEvent.reason && { reason: rawEvent.reason }), cache: rawEvent.cache, ocrMs: rawEvent.ocrMs, mode: rawEvent.mode, rules: [...new Set((Array.isArray(rawEvent.hits) ? rawEvent.hits : []).filter(hit => hit && hit.action !== "ignored").map(hit => hit.name || hit.rule).filter(Boolean))] } });
       // Keep only the newest 20; trim in batches so a long range never holds every OCR event.
-      if (recentOcr.length > 200) { recentOcr.sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts)); recentOcr.length = 20; }
+      if (recentOcr.length > 200) { recentOcr.sort((a, b) => Date.parse(b.entry.ts) - Date.parse(a.entry.ts)); recentOcr.length = 20; }
       if (Object.hasOwn(ocrStatus, rawEvent.status)) {
         ocrStatus[rawEvent.status]++;
       }
@@ -102,8 +123,14 @@ export function summarize(events, { since, until, now = Date.now(), ignore = [],
       const action = typeof hit.action === "string" ? hit.action : "observe";
       ruleHits[hit.rule] = (ruleHits[hit.rule] || 0) + 1;
       actionHits[action] = (actionHits[action] || 0) + 1;
-      const bucket = trend[Math.floor((ts - origin) / step)];
-      if (bucket) { bucket.hits++; if (action === "leaked") bucket.leaks++; }
+      if (step > 0) {
+        const at = Math.floor((ts - origin) / step);
+        if (at >= 0 && at < 400) {
+          let bucket = buckets.get(at);
+          if (!bucket) buckets.set(at, bucket = { hits: 0, leaks: 0 });
+          bucket.hits++; if (action === "leaked") bucket.leaks++;
+        }
+      }
       bySource[source] = (bySource[source] || 0) + 1;
       // Warnings count only places Redact cannot rewrite (hit.where is set for those).
       if (typeof hit.where === "string") {
@@ -125,8 +152,7 @@ export function summarize(events, { since, until, now = Date.now(), ignore = [],
       if (isLatest) {
         if (typeof rawEvent.ua === "string") group.ua = rawEvent.ua.slice(0, 80);
         if (typeof rawEvent.model === "string") group.model = rawEvent.model.slice(0, 80); // Latest event wins, even absent: a mixed session clears a stale provider/combo.
-        group.provider = typeof evProvider === "string" && evProvider ? evProvider.slice(0, 80) : null;
-        group.combo = typeof evCombo === "string" && evCombo ? evCombo.slice(0, 80) : null;
+        group.rawProvider = rawEvent.provider; group.rawCombo = rawEvent.combo; group.routeId = routeId;
       }
       if (!group.name && hit.name) group.name = hit.name;
       if (!group.kind && hit.kind) group.kind = hit.kind;
@@ -152,57 +178,83 @@ export function summarize(events, { since, until, now = Date.now(), ignore = [],
     }
   }
 
-  const ignored = new Set(Array.isArray(ignore) ? ignore : []);
-  const outputGroups = [...groups.values()]
-    .sort((a, b) => b.lastMs - a.lastMs)
-    .map(({ actionTs, firstMs, lastMs, ...group }) => ({
-      ...group,
-      turns: group.turns.size,
-      ignored: ignored.has(group.hash),
-      sources: group.sources.sort(),
-      actions: group.actions.sort(),
-    }));
-  const ruleWarnings = Object.create(null);
-  for (const [rule, hits] of Object.entries(ruleHits)) {
-    const share = hits ? (ruleStuck[rule] || 0) / hits : 0;
-    if (share >= 0.5) {
-      const out = Object.entries(ruleSources[rule]).sort((a, b) => b[1] - a[1]);
-      ruleWarnings[rule] = { topSource: out[0][0], share };
+  function finish({ until: end, ignore = [], routing = routes } = {}) {
+    const toMs = open ? (Number.isFinite(end) ? end : now) : untilMs;
+    const nTrend = step > 0 ? Math.min(400, Math.ceil(((open ? toMs : Number.isFinite(until) ? until : now) - origin) / step)) : 0;
+    const trend = Array.from({ length: Math.max(0, nTrend) }, (_, i) => ({ hits: buckets.get(i)?.hits || 0, leaks: buckets.get(i)?.leaks || 0 }));
+    const resolve = (id, raw, key) => sameRoute(id === undefined ? undefined : routing.get(id), raw, key);
+    const ignored = new Set(Array.isArray(ignore) ? ignore : []);
+    const outputGroups = [...groups.values()]
+      .sort((a, b) => b.lastMs - a.lastMs)
+      .map(({ actionTs, firstMs, lastMs, rawProvider, rawCombo, routeId, ...group }) => ({
+        ...group,
+        provider: label(resolve(routeId, rawProvider, "provider")),
+        combo: label(resolve(routeId, rawCombo, "combo")),
+        turns: group.turns.size,
+        ignored: ignored.has(group.hash),
+        sources: [...group.sources].sort(),
+        actions: [...group.actions].sort(),
+        leakedWhere: [...group.leakedWhere],
+      }));
+    const ruleWarnings = Object.create(null);
+    for (const [rule, hits] of Object.entries(ruleHits)) {
+      const share = hits ? (ruleStuck[rule] || 0) / hits : 0;
+      if (share >= 0.5) {
+        const out = Object.entries(ruleSources[rule]).sort((a, b) => b[1] - a[1]);
+        ruleWarnings[rule] = { topSource: out[0][0], share };
+      }
     }
-  }
 
-  const cacheTotal = cacheHit + cacheMiss;
-  const cacheHitRate = cacheTotal > 0 ? cacheHit / cacheTotal : 0;
-  missOcrMs.sort((a, b) => a - b);
-  const p95OcrMs = missOcrMs.length ? missOcrMs[Math.ceil(missOcrMs.length * 0.95) - 1] : 0;
+    const cacheTotal = cacheHit + cacheMiss;
+    const cacheHitRate = cacheTotal > 0 ? cacheHit / cacheTotal : 0;
+    const sortedMs = missOcrMs.slice().sort((a, b) => a - b);
+    const p95OcrMs = sortedMs.length ? sortedMs[Math.ceil(sortedMs.length * 0.95) - 1] : 0;
+    const recent = recentOcr.slice().sort((a, b) => Date.parse(b.entry.ts) - Date.parse(a.entry.ts)).slice(0, 20).map((o) => {
+      const provider = resolve(o.routeId, o.provider, "provider"), combo = resolve(o.routeId, o.combo, "combo");
+      return { ...o.entry, ...(typeof provider === "string" && provider && { provider }), ...(typeof combo === "string" && combo && { combo }) };
+    });
+    if (routing === routes && routes.size > ROUTES_SOFT) prune();
 
-  const ocr = {
-    status: ocrStatus,
-    cache: {
-      hit: cacheHit,
-      miss: cacheMiss,
+    const ocr = {
+      status: { ...ocrStatus },
+      cache: {
+        hit: cacheHit,
+        miss: cacheMiss,
+        coalesced: cacheCoalesced,
+        none: cacheNone,
+        rate: cacheHitRate,
+      },
+      cacheHitRate,
       coalesced: cacheCoalesced,
-      none: cacheNone,
-      rate: cacheHitRate,
-    },
-    cacheHitRate,
-    coalesced: cacheCoalesced,
-    p95OcrMs,
-    imagesWithHits,
-    totalImages: totalOcrEvents,
-    recent: recentOcr.sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts)).slice(0, 20),
-    reasons,
-  };
+      p95OcrMs,
+      imagesWithHits,
+      totalImages: totalOcrEvents,
+      recent,
+      reasons: { ...reasons },
+    };
 
-  return {
-    requests,
-    unique24h: unique.size,
-    byRule: Object.fromEntries(Object.entries(ruleHits).map(([rule, hits]) => [rule, { unique: ruleHashes[rule]?.size || 0, hits }])),
-    bySource, leaked24h: leaked.size, blocked24h: blocked.size, errors24h,
-    groups: outputGroups, ruleWarnings, actionHits, trend, byAction: breakdown(outputGroups, ruleTurns),
-    range: { from: sinceMs, to: untilMs },
-    ocr,
-  };
+    return {
+      requests,
+      unique24h: unique.size,
+      byRule: Object.fromEntries(Object.entries(ruleHits).map(([rule, hits]) => [rule, { unique: ruleHashes[rule]?.size || 0, hits }])),
+      bySource: { ...bySource }, leaked24h: leaked.size, blocked24h: blocked.size, errors24h,
+      groups: outputGroups, ruleWarnings, actionHits: { ...actionHits }, trend, byAction: breakdown(outputGroups, ruleTurns),
+      range: { from: sinceMs, to: toMs },
+      ocr,
+    };
+  }
+  return { add, route, finish };
+}
+
+export function summarize(events, { since, until, now = Date.now(), ignore = [], step, origin, routing: preRouting, times: preTimes, startIndex = 0 } = {}) {
+  events = Array.isArray(events) ? events : [];
+  const routing = preRouting || routingByRequest(events);
+  const summarizer = createSummarizer({ since, until, now, step, origin });
+  for (let idx = Math.max(0, startIndex); idx < events.length; idx++) {
+    const event = events[idx];
+    if (event) summarizer.add(event, preTimes ? preTimes[idx] : Date.parse(event.ts));
+  }
+  return summarizer.finish({ ignore, routing });
 }
 
 
