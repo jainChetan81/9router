@@ -306,7 +306,7 @@ export default function UsageStats({ period: periodProp, setPeriod: setPeriodPro
   }, [fetchStats]);
 
   // Live stream: bump on usage topic version changes (shared EventSource, hidden-aware)
-  const { version: usageLiveVersion } = useLiveTopic("usage");
+  const { version: usageLiveVersion } = useLiveTopic("usage", { throttleMs: 5000 });
 
   // SSE connection - real-time updates for activeRequests + recentRequests only
   useEffect(() => {
