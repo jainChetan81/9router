@@ -1,8 +1,9 @@
 import { EventEmitter } from "events";
-import { getAdapter } from "../driver.js";
+import { getAdapter, getAdapterSync } from "../driver.js";
 import { parseJson, stringifyJson } from "../helpers/jsonCol.js";
 import { getMeta, setMeta } from "../helpers/metaStore.js";
 import { DAY_MS, fmtIstDay, fmtIstHhmm, istDayKey, istDayKeyOffset, istDayKeyToMs, istMidnightMs } from "../../spend/time.js";
+import { bumpCoalesced } from "../../live/bus.js";
 
 function maskApiKey(key) {
   if (!key || typeof key !== "string") return null;
@@ -28,6 +29,7 @@ if (!global._pendingTimers) global._pendingTimers = {};
 if (!global._recentRing) global._recentRing = { items: [], initialized: false };
 if (!global._connectionMapCache) global._connectionMapCache = { map: {}, ts: 0 };
 if (!global._statsEmitTimers) global._statsEmitTimers = { pending: null, update: null };
+if (!global._usageDailyBuffer) global._usageDailyBuffer = { days: new Map(), timer: null };
 
 const pendingRequests = global._pendingRequests;
 const lastErrorProvider = global._lastErrorProvider;
@@ -44,12 +46,96 @@ function scheduleStatsEvent(event, delayMs = 150) {
   statsEmitTimers[key] = setTimeout(() => {
     statsEmitTimers[key] = null;
     statsEmitter.emit(event);
+    if (event === "update") bumpCoalesced("usage", undefined, 250);
   }, delayMs);
   statsEmitTimers[key]?.unref?.();
 }
 
 function getLocalDateKey(timestamp) {
   return istDayKey(timestamp);
+}
+
+const usageDailyBuffer = global._usageDailyBuffer;
+const USAGE_DAILY_FLUSH_MS = 2000;
+
+function getEmptyDay() {
+  return {
+    requests: 0, promptTokens: 0, completionTokens: 0, cost: 0,
+    byProvider: {}, byModel: {}, byAccount: {}, byApiKey: {}, byEndpoint: {},
+  };
+}
+
+function mergeDay(target, source) {
+  for (const key of ["requests", "promptTokens", "completionTokens", "cachedTokens", "cost"]) {
+    target[key] = (target[key] || 0) + (source[key] || 0);
+  }
+  for (const group of ["byProvider", "byModel", "byAccount", "byApiKey", "byEndpoint"]) {
+    target[group] ||= {};
+    for (const [key, value] of Object.entries(source[group] || {})) {
+      const current = target[group][key] ||= {};
+      for (const metric of ["requests", "promptTokens", "completionTokens", "cachedTokens", "cost"]) {
+        current[metric] = (current[metric] || 0) + (value[metric] || 0);
+      }
+      for (const [metaKey, metaValue] of Object.entries(value)) {
+        if (!["requests", "promptTokens", "completionTokens", "cachedTokens", "cost"].includes(metaKey)) {
+          current[metaKey] = metaValue;
+        }
+      }
+    }
+  }
+  return target;
+}
+
+function queueDailyAggregate(entry) {
+  const dateKey = getLocalDateKey(entry.timestamp);
+  let day = usageDailyBuffer.days.get(dateKey);
+  if (!day) {
+    day = getEmptyDay();
+    usageDailyBuffer.days.set(dateKey, day);
+  }
+  aggregateEntryToDay(day, entry);
+  scheduleDailyFlush();
+}
+
+function scheduleDailyFlush() {
+  if (usageDailyBuffer.timer) return;
+  usageDailyBuffer.timer = setTimeout(() => {
+    usageDailyBuffer.timer = null;
+    flushDailyBuffer().catch((err) => console.error("Failed to flush usage daily rollup:", err));
+  }, USAGE_DAILY_FLUSH_MS);
+  usageDailyBuffer.timer?.unref?.();
+}
+
+async function flushDailyBuffer() {
+  if (usageDailyBuffer.days.size === 0) return;
+
+  // The writes are synchronous (node:sqlite / better-sqlite3), so no in-flight
+  // guard is needed: two flushes cannot interleave, and an inner async IIFE
+  // here would actually run to completion — including its `finally` — before
+  // the assignment stores it, leaving a stale truthy `flushing` behind.
+  const snapshot = new Map(usageDailyBuffer.days);
+  usageDailyBuffer.days = new Map();
+  try {
+    const db = getAdapterSync();
+    db.transaction(() => {
+      for (const [dateKey, delta] of snapshot) {
+        const row = db.get(`SELECT data FROM usageDaily WHERE dateKey = ?`, [dateKey]);
+        const day = row ? parseJson(row.data, getEmptyDay()) : getEmptyDay();
+        mergeDay(day, delta);
+        db.run(`INSERT INTO usageDaily(dateKey, data) VALUES(?, ?) ON CONFLICT(dateKey) DO UPDATE SET data = excluded.data`, [dateKey, stringifyJson(day)]);
+      }
+    });
+  } catch (err) {
+    // Roll the failed snapshot back into the buffer so nothing is lost.
+    for (const [dateKey, delta] of snapshot) {
+      const pending = usageDailyBuffer.days.get(dateKey) || getEmptyDay();
+      mergeDay(delta, pending);
+      usageDailyBuffer.days.set(dateKey, delta);
+    }
+    throw err;
+  } finally {
+    if (usageDailyBuffer.days.size > 0) scheduleDailyFlush();
+  }
 }
 
 function addToCounter(target, key, values) {
@@ -240,6 +326,11 @@ export async function getActiveRequests() {
   return { activeRequests, recentRequests, errorProvider };
 }
 
+export async function getSlimUsageStats() {
+  const { activeRequests, recentRequests, errorProvider } = await getActiveRequests();
+  return { activeRequests, recentRequests, errorProvider, pending: pendingRequests };
+}
+
 export async function saveRequestUsage(entry) {
   try {
     const db = await getAdapter();
@@ -300,16 +391,7 @@ export async function saveRequestUsage(entry) {
         ]
       );
 
-      const dateKey = getLocalDateKey(entry.timestamp);
-      const row = db.get(`SELECT data FROM usageDaily WHERE dateKey = ?`, [dateKey]);
-      const day = row ? parseJson(row.data, {}) : {
-        requests: 0, promptTokens: 0, completionTokens: 0, cost: 0,
-        byProvider: {}, byModel: {}, byAccount: {}, byApiKey: {}, byEndpoint: {},
-      };
-      aggregateEntryToDay(day, entry);
-      db.run(`INSERT INTO usageDaily(dateKey, data) VALUES(?, ?) ON CONFLICT(dateKey) DO UPDATE SET data = excluded.data`, [dateKey, stringifyJson(day)]);
-
-      // Atomic counter increment in same transaction
+      // Atomic counter increment in same transaction.
       const cur = db.get(`SELECT value FROM _meta WHERE key = 'totalRequestsLifetime'`);
       const next = (cur ? parseInt(cur.value, 10) : 0) + 1;
       db.run(`INSERT INTO _meta(key, value) VALUES('totalRequestsLifetime', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, [String(next)]);
@@ -317,6 +399,7 @@ export async function saveRequestUsage(entry) {
     });
 
     if (inserted) {
+      queueDailyAggregate(entry);
       pushToRing(entry);
       scheduleStatsEvent("update", 250);
     }
@@ -352,13 +435,80 @@ export async function getUsageHistory(filter = {}) {
   }));
 }
 
-function loadDaysInRange(adapter, maxDays) {
-  if (maxDays == null) {
-    return adapter.all(`SELECT dateKey, data FROM usageDaily ORDER BY dateKey ASC`);
+function mergeUnflushedDailyRows(rows, maxDays) {
+  if (usageDailyBuffer.days.size === 0) return rows;
+
+  const rowMap = new Map();
+  for (const r of rows) {
+    rowMap.set(r.dateKey, r);
   }
-  const cutoffKey = istDayKeyOffset(maxDays - 1);
-  return adapter.all(`SELECT dateKey, data FROM usageDaily WHERE dateKey >= ? ORDER BY dateKey ASC`, [cutoffKey]);
+
+  const cutoffKey = maxDays != null ? istDayKeyOffset(maxDays - 1) : null;
+
+  for (const [dateKey, delta] of usageDailyBuffer.days.entries()) {
+    if (cutoffKey && dateKey < cutoffKey) continue;
+    if (rowMap.has(dateKey)) {
+      const r = rowMap.get(dateKey);
+      const parsed = parseJson(r.data, getEmptyDay());
+      mergeDay(parsed, delta);
+      r.data = stringifyJson(parsed);
+    } else {
+      const day = getEmptyDay();
+      mergeDay(day, delta);
+      const newRow = { dateKey, data: stringifyJson(day) };
+      rows.push(newRow);
+      rowMap.set(dateKey, newRow);
+    }
+  }
+
+  rows.sort((a, b) => a.dateKey.localeCompare(b.dateKey));
+  return rows;
 }
+
+function loadDaysInRange(adapter, maxDays) {
+  let rows;
+  if (maxDays == null) {
+    rows = adapter.all(`SELECT dateKey, data FROM usageDaily ORDER BY dateKey ASC`);
+  } else {
+    const cutoffKey = istDayKeyOffset(maxDays - 1);
+    rows = adapter.all(`SELECT dateKey, data FROM usageDaily WHERE dateKey >= ? ORDER BY dateKey ASC`, [cutoffKey]);
+  }
+  return mergeUnflushedDailyRows(rows, maxDays);
+}
+
+export { flushDailyBuffer as flushUsageDaily };
+export function globalFlushBuffer() {
+  return usageDailyBuffer.days;
+}
+export function runShutdownFlush() {
+  _shutdownUsageFlush();
+}
+
+const _shutdownUsageFlush = () => {
+  try {
+    if (usageDailyBuffer.timer) {
+      clearTimeout(usageDailyBuffer.timer);
+      usageDailyBuffer.timer = null;
+    }
+    if (usageDailyBuffer.days.size > 0) {
+      const db = getAdapterSync();
+      db.transaction(() => {
+        for (const [dateKey, delta] of usageDailyBuffer.days) {
+          const row = db.get(`SELECT data FROM usageDaily WHERE dateKey = ?`, [dateKey]);
+          const day = row ? parseJson(row.data, getEmptyDay()) : getEmptyDay();
+          mergeDay(day, delta);
+          db.run(`INSERT INTO usageDaily(dateKey, data) VALUES(?, ?) ON CONFLICT(dateKey) DO UPDATE SET data = excluded.data`, [dateKey, stringifyJson(day)]);
+        }
+      });
+      usageDailyBuffer.days.clear();
+    }
+  } catch {}
+};
+
+process.on("beforeExit", _shutdownUsageFlush);
+process.on("SIGINT", _shutdownUsageFlush);
+process.on("SIGTERM", _shutdownUsageFlush);
+process.on("exit", _shutdownUsageFlush);
 
 export async function getUsageStats(period = "all") {
   const db = await getAdapter();

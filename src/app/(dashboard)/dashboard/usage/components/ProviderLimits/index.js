@@ -729,7 +729,9 @@ export default function ProviderLimits() {
   }, [quotaVisibility, updateQuotaVisibility]);
 
   // Auto-sync: shared page control (off by default, interval saved on the server).
-  const autoSync = useAutoSync("quota", () => refreshAll(true));
+  // No force on the automatic tick: the Claude throttle must apply to auto-sync;
+  // the manual button below still calls refreshAll(true).
+  const autoSync = useAutoSync("quota", () => refreshAll(false));
   const manualSync = useCallback(() => refreshAll(true), [refreshAll]);
 
   const sortedConnections = useMemo(

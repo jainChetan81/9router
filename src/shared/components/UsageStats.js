@@ -3,6 +3,7 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { FREE_PROVIDERS, AI_PROVIDERS } from "@/shared/constants/providers";
+import { useLiveTopic } from "@/shared/hooks/useLive.js";
 
 // Keep providers without serviceKinds (default LLM) or with "llm" in serviceKinds
 function isLLMProvider(id) {
@@ -29,15 +30,35 @@ function timeAgo(timestamp) {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
+// Shared 1s tick, paused while the tab is hidden. One interval for all rows.
+let sharedTickListeners = new Set();
+let sharedTickTimer = null;
+
+function subscribeSharedTick(fn) {
+  sharedTickListeners.add(fn);
+  if (!sharedTickTimer) {
+    sharedTickTimer = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      for (const l of sharedTickListeners) {
+        try { l(); } catch {}
+      }
+    }, 1000);
+  }
+  return () => {
+    sharedTickListeners.delete(fn);
+    if (sharedTickListeners.size === 0 && sharedTickTimer) {
+      clearInterval(sharedTickTimer);
+      sharedTickTimer = null;
+    }
+  };
+}
+
 // Auto-update time display every second without re-rendering parent
 function TimeAgo({ timestamp }) {
   const [, setTick] = useState(0);
-  
-  useEffect(() => {
-    const timer = setInterval(() => setTick(t => t + 1), 1000);
-    return () => clearInterval(timer);
-  }, []);
-  
+
+  useEffect(() => subscribeSharedTick(() => setTick(t => t + 1)), []);
+
   return <>{timeAgo(timestamp)}</>;
 }
 
@@ -256,7 +277,7 @@ export default function UsageStats({ period: periodProp, setPeriod: setPeriodPro
   }, []);
 
   // Fetch filtered stats via REST when period changes
-  useEffect(() => {
+  const fetchStats = useCallback(() => {
     // First load: show full spinner; subsequent: show subtle fetching indicator
     if (isInitialLoad.current) {
       isInitialLoad.current = false;
@@ -280,11 +301,18 @@ export default function UsageStats({ period: periodProp, setPeriod: setPeriodPro
       });
   }, [period]);
 
+  useEffect(() => {
+    fetchStats();
+  }, [fetchStats]);
+
+  // Live stream: bump on usage topic version changes (shared EventSource, hidden-aware)
+  const { version: usageLiveVersion } = useLiveTopic("usage");
+
   // SSE connection - real-time updates for activeRequests + recentRequests only
   useEffect(() => {
-    const es = new EventSource("/api/usage/stream");
+    let es = new EventSource("/api/usage/stream");
 
-    es.onmessage = (e) => {
+    const handleMessage = (e) => {
       try {
         const data = JSON.parse(e.data);
         // Always merge only real-time fields, never overwrite full stats from REST
@@ -304,10 +332,45 @@ export default function UsageStats({ period: periodProp, setPeriod: setPeriodPro
       }
     };
 
-    es.onerror = () => setLoading(false);
+    const handleError = () => setLoading(false);
 
-    return () => es.close();
-  }, []);
+    const attachHandlers = () => {
+      if (!es) return;
+      es.onmessage = handleMessage;
+      es.onerror = handleError;
+    };
+
+    attachHandlers();
+
+    // Close the stream in hidden tabs; reopen + refetch stats when visible again
+    const onVisibility = () => {
+      if (typeof document === "undefined") return;
+      if (document.hidden) {
+        if (es) { es.close(); es = null; }
+      } else {
+        if (!es) {
+          es = new EventSource("/api/usage/stream");
+          attachHandlers();
+        }
+        fetchStats();
+      }
+    };
+
+    document?.addEventListener?.("visibilitychange", onVisibility);
+
+    return () => {
+      document?.removeEventListener?.("visibilitychange", onVisibility);
+      if (es) es.close();
+    };
+  }, [fetchStats]);
+
+  // Refetch full stats when the usage topic version bumps (covers reopens while hidden → visible)
+  useEffect(() => {
+    if (usageLiveVersion > 0 && hasLoadedStats.current) {
+      fetchStats();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [usageLiveVersion]);
 
   const toggleSort = useCallback((tableType, field) => {
     const params = new URLSearchParams(searchParams.toString());
