@@ -1,14 +1,17 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { shortRange } from "./helpers.js";
 
 // Preset segment + month calendar for a custom range (design: Shared.dc.html "range").
 const PRESETS = ["Today", "24h", "7D", "30D", "60D", "All"];
 const seg = (on) => ({ border: 0, height: 28, padding: "0 11px", borderRadius: 7, font: "inherit", fontSize: 12, cursor: "pointer", display: "flex", alignItems: "center", gap: 5,
   background: on ? "var(--segon)" : "transparent", color: on ? "var(--tx)" : "var(--tx2)", fontWeight: on ? 600 : 400, boxShadow: on ? "0 1px 2px rgba(0,0,0,.08)" : "none" });
-const key = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-const fmt = (d) => d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+// Dates are picked in IST (Asia/Kolkata), matching how the server buckets days.
+const IST_OFFSET = 5.5 * 60 * 60 * 1000;
+const istDay = (d) => new Date(d.getTime() + IST_OFFSET);
+const key = (d) => { const u = istDay(d); return `${u.getUTCFullYear()}-${String(u.getUTCMonth() + 1).padStart(2, "0")}-${String(u.getUTCDate()).padStart(2, "0")}`; };
+const fmt = (d) => istDay(d).toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
 
 export default function RangeBar({ preset, customLabel, onChange, today }) {
   const [open, setOpen] = useState(false);
@@ -34,12 +37,12 @@ export default function RangeBar({ preset, customLabel, onChange, today }) {
     const ro = new ResizeObserver(update); ro.observe(el);
     return () => { el.removeEventListener("scroll", update); ro.disconnect(); };
   }, []);
-  const T = today ? new Date(today + "T00:00:00") : new Date();
-  const base = new Date(T.getFullYear(), T.getMonth() - m, 1);
-  const off = (base.getDay() + 6) % 7, dim = new Date(base.getFullYear(), base.getMonth() + 1, 0).getDate();
+  const T = useMemo(() => (today ? new Date(today + "T00:00:00Z") : new Date(Date.now() + IST_OFFSET)), [today]);
+  const base = new Date(Date.UTC(T.getUTCFullYear(), T.getUTCMonth() - m, 1));
+  const off = (base.getUTCDay() + 6) % 7, dim = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth() + 1, 0)).getUTCDate();
   const days = [];
   for (let i = 0; i < off; i++) days.push(null);
-  for (let n = 1; n <= dim; n++) days.push(new Date(base.getFullYear(), base.getMonth(), n));
+  for (let n = 1; n <= dim; n++) days.push(new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), n)));
   const pick = (dt) => {
     if (dt > T) return;
     if (!a) return setA(dt);
@@ -65,7 +68,7 @@ export default function RangeBar({ preset, customLabel, onChange, today }) {
         <div style={{ position: "absolute", top: 38, right: 0, zIndex: 60, width: 280, background: "var(--card)", border: "1px solid var(--line2)", borderRadius: 12, boxShadow: "0 12px 32px rgba(40,20,10,.16)", padding: 14, display: "flex", flexDirection: "column", gap: 10 }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
             <button aria-label="Previous month" onClick={() => setM((x) => Math.min(x + 1, 12))} style={{ border: 0, background: "var(--seg)", color: "var(--tx2)", width: 28, height: 28, borderRadius: 7, cursor: "pointer", fontFamily: "'Material Symbols Outlined'", fontSize: 18 }}>chevron_left</button>
-            <span style={{ fontWeight: 600, fontSize: 13, color: "var(--tx)" }}>{base.toLocaleDateString("en-US", { month: "long", year: "numeric" })}</span>
+            <span style={{ fontWeight: 600, fontSize: 13, color: "var(--tx)" }}>{base.toLocaleDateString("en-US", { month: "long", year: "numeric", timeZone: "UTC" })}</span>
             <button aria-label="Next month" onClick={() => setM((x) => Math.max(x - 1, 0))} style={{ border: 0, background: "var(--seg)", color: "var(--tx2)", width: 28, height: 28, borderRadius: 7, cursor: "pointer", fontFamily: "'Material Symbols Outlined'", fontSize: 18 }}>chevron_right</button>
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 2, fontSize: 10.5, color: "var(--tx3)", textAlign: "center" }}>{["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"].map((d) => <span key={d}>{d}</span>)}</div>

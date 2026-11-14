@@ -38,7 +38,13 @@ export default function QuotaRunway({ syncNonce = 0 }) {
     } catch { setRes((r) => (quiet && r.state === "live" ? { ...r, stale: true } : { state: "error", rows: [], at: null })); }
   }, []);
   useEffect(() => { const t = setTimeout(() => load({ quiet: !!cacheGet(QUOTA_URL), useCache: true }), 0); return () => clearTimeout(t); }, [load]);
-  useEffect(() => { const iv = setInterval(() => setNow(Date.now()), 30000); return () => clearInterval(iv); }, []);
+  // "Resets in" ticks every 30 s, but only while the tab is visible.
+  useEffect(() => {
+    const iv = setInterval(() => { if (!document.hidden) setNow(Date.now()); }, 30000);
+    const vis = () => { if (!document.hidden) setNow(Date.now()); };
+    document.addEventListener("visibilitychange", vis);
+    return () => { clearInterval(iv); document.removeEventListener("visibilitychange", vis); };
+  }, []);
   // No polling: the page Sync button bumps syncNonce for a fresh read.
   useEffect(() => {
     if (!syncNonce) return;
