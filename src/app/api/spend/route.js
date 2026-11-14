@@ -1,13 +1,40 @@
 import { NextResponse } from "next/server";
+import { createHash } from "node:crypto";
 import { getAdapter } from "@/lib/db/driver.js";
+import { DATA_FILE } from "@/lib/db/paths.js";
+import { createReadPool } from "@/lib/db/readPool.js";
 import { getSettings, updateSettings, getPricingForModel } from "@/lib/localDb";
 import { SUBS, aggregateSpend, invalidateSpendCache } from "@/lib/spend/aggregate.js";
+import { version as usageVersion } from "@/lib/live/bus.js";
 
 export const dynamic = "force-dynamic";
 
-// What-if targets: every provider/model pair seen in the last 60 days, with the
-// same effective price the usage logger uses (user override, then defaults).
+// Aggregate runs on a read-only worker thread so the gateway event loop
+// stays free. Falls back to inline (main-thread) execution when the
+// adapter is not file-backed (sql.js).
+const spendPool = createReadPool({ name: "spend", workerModuleUrl: new URL("@/lib/spend/aggregateWorker.js", import.meta.url).href });
+
+async function aggregateOffThread(db, args) {
+  try {
+    return await spendPool.run(db, "aggregate", args, {
+      key: JSON.stringify([args.params, args.fees, usageVersion("usage")]),
+    });
+  } catch (error) {
+    if (error?.code === "busy") throw error;
+    // Non-file-backed driver or worker failure: run inline as before.
+    if (String(error?.message).includes("file-backed")) return aggregateSpend(db, args);
+    throw error;
+  }
+}
+
+// What-if targets: every provider/model pair seen in the last 60 days, with
+// the same effective price the usage logger uses. Pairs change slowly, so
+// the resolved list is cached for 10 minutes instead of a DISTINCT scan +
+// one pricing lookup per pair on every request.
+const WHATIF_TTL = 10 * 60_000;
+let whatIfCache = null;
 async function resolveWhatIfTargets(db) {
+  if (whatIfCache && Date.now() - whatIfCache.at < WHATIF_TTL) return whatIfCache.value;
   try {
     const rows = db.all(`SELECT DISTINCT provider, model FROM usageHistory
       WHERE timestamp >= ? AND provider IS NOT NULL AND model IS NOT NULL AND model != 'invalid' LIMIT 500`,
@@ -19,9 +46,11 @@ async function resolveWhatIfTargets(db) {
         out.push({ provider, model, price: { input: p.input, output: p.output, cached: p.cached, cache_creation: p.cache_creation, reasoning: p.reasoning } });
       }
     }
-    return out.sort((a, b) => `${a.provider}/${a.model}`.localeCompare(`${b.provider}/${b.model}`));
+    const value = out.sort((a, b) => `${a.provider}/${a.model}`.localeCompare(`${b.provider}/${b.model}`));
+    whatIfCache = { at: Date.now(), value };
+    return value;
   } catch {
-    return [];
+    return whatIfCache?.value || [];
   }
 }
 
@@ -32,9 +61,15 @@ export async function GET(request) {
     const db = await getAdapter();
     const params = new URL(request.url).searchParams;
     const settings = await getSettings();
-    const payload = aggregateSpend(db, { params, now: Date.now(), fees: settings.spendFees || {} });
+    const fees = settings.spendFees || {};
+    const v = usageVersion("usage");
+    const etag = `"${createHash("sha1").update(`${v}|${params.toString()}|${JSON.stringify(fees)}`).digest("hex").slice(0, 20)}"`;
+    if (request.headers.get("if-none-match") === etag) {
+      return new NextResponse(null, { status: 304, headers: { ETag: etag, "Cache-Control": "no-store" } });
+    }
+    const payload = await aggregateOffThread(db, { params: Object.fromEntries(params), now: Date.now(), fees });
     const whatIfTargets = await resolveWhatIfTargets(db);
-    return NextResponse.json({ ...payload, whatIfTargets }, { headers: { "Cache-Control": "no-store" } });
+    return NextResponse.json({ ...payload, whatIfTargets }, { headers: { ETag: etag, "Cache-Control": "no-store" } });
   } catch (error) {
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
@@ -77,6 +112,7 @@ export async function PATCH(request) {
     await updateSettings({ spendFees: fees });
     const db = await getAdapter();
     invalidateSpendCache(db);
+    whatIfCache = null;
     return NextResponse.json({ fees });
   } catch (error) {
     return NextResponse.json({ error: error.message }, { status: 500 });

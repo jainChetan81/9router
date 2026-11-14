@@ -183,7 +183,18 @@ function queryDaySlice(db, dayFrom) {
      ORDER BY realVal DESC, v DESC, id ASC LIMIT 20`,
     [fromIso, toIso, dayFrom, dayFrom + DAY_MS],
   );
-  return { rows, dayClock, topVal, topReal };
+  // Session timeline dots: all request timestamps of logged sessions in this
+  // day. Sessions later pick the dots of the top SESSION_OUT_CAP sessions.
+  const ticks = db.all(
+    `SELECT
+       COALESCE(NULLIF(session, ''), CASE WHEN ${META_VALID} AND json_type(meta, '$.session') = 'text' THEN NULLIF(json_extract(meta, '$.session'), '') END) AS sess,
+       CAST(ROUND(unixepoch(timestamp, 'subsec') * 1000.0) AS INTEGER) AS ms
+     FROM usageHistory WHERE ${w}
+       AND (NULLIF(session, '') IS NOT NULL OR (meta LIKE '%"session"%' AND ${META_VALID} AND json_type(meta, '$.session') = 'text' AND json_extract(meta, '$.session') != ''))
+     ORDER BY id ASC`,
+    [fromIso, toIso],
+  );
+  return { rows, dayClock, topVal, topReal, ticks };
 }
 
 // Closed IST days are immutable: cache each day's slice per adapter and merge
@@ -272,6 +283,7 @@ export function aggregateSpend(db, { params, now = Date.now(), fees = {}, skipCa
   let value = 0, real = 0, realEst = 0, list = 0, req = 0, tok = 0, realOr = 0, realDs = 0, nrList = 0, nrReq = 0, nrTok = 0;
   const clock = new Map(); // "weekday:hour" -> { weekday, hour, req, cost }
   const outlierRawVal = [], outlierRawReal = []; // per-day top lists, re-ranked after the merge
+  const allTicks = []; // per-day session tick rows { sess, ms } in id order
   const keyNames = new Map(db.all(`SELECT key, name FROM apiKeys`).map((r) => [r.key, r.name]));
 
   // One pass over one slice's GROUP BY rows. barStart maps a row to its bar:
@@ -418,6 +430,7 @@ export function aggregateSpend(db, { params, now = Date.now(), fees = {}, skipCa
       mergeClock(slice.dayClock);
       outlierRawVal.push(...slice.topVal);
       outlierRawReal.push(...slice.topReal);
+      allTicks.push(...slice.ticks);
     }
     if (today0 < range.to) {
       const slice = daySlice(db, st, today0, { today: true, maxId });
@@ -425,6 +438,7 @@ export function aggregateSpend(db, { params, now = Date.now(), fees = {}, skipCa
       mergeClock(slice.dayClock);
       outlierRawVal.push(...slice.topVal);
       outlierRawReal.push(...slice.topReal);
+      allTicks.push(...slice.ticks);
     }
   } else {
     // Hourly ranges (Today, 24h): one whole-range slice as before.
@@ -460,6 +474,16 @@ export function aggregateSpend(db, { params, now = Date.now(), fees = {}, skipCa
          AND (${REAL_EXPR}) > 0
        ORDER BY realVal DESC, v DESC, id ASC LIMIT 10`,
       [fromIso, toIso, range.from, range.to],
+    ));
+    allTicks.push(...db.all(
+      `SELECT
+         COALESCE(NULLIF(session, ''), CASE WHEN ${META_VALID} AND json_type(meta, '$.session') = 'text' THEN NULLIF(json_extract(meta, '$.session'), '') END) AS sess,
+         CAST(ROUND(unixepoch(timestamp, 'subsec') * 1000.0) AS INTEGER) AS ms
+       FROM usageHistory
+       WHERE ${w}
+         AND (NULLIF(session, '') IS NOT NULL OR (meta LIKE '%"session"%' AND ${META_VALID} AND json_type(meta, '$.session') = 'text' AND json_extract(meta, '$.session') != ''))
+       ORDER BY id ASC`,
+      [fromIso, toIso],
     ));
   }
 
@@ -516,32 +540,19 @@ export function aggregateSpend(db, { params, now = Date.now(), fees = {}, skipCa
   for (const s of bySess.values()) roleCount[s.role] = (roleCount[s.role] || 0) + 1;
   const sessions = [...bySess.values()].sort((a, b) => b.v - a.v);
 
-  // Fetch up to TICK_CAP request timestamps for the top sessions shown.
+  // Session timeline dots come from each day slice's tick list (cached with
+  // the slice, so a warm range merge needs no extra query). Sessions keep
+  // their first TICK_CAP dots in id order across merged days.
   const topSess = sessions.slice(0, SESSION_OUT_CAP);
-  if (topSess.length > 0) {
-    const sessIds = topSess.map((s) => s.id);
-    const minStart = Math.min(...topSess.map((s) => s.start));
-    const maxEnd = Math.max(...topSess.map((s) => s.end)) + 1;
-    const tickFromIso = new Date(Math.max(range.from, minStart)).toISOString();
-    const tickToIso = new Date(Math.min(range.to, maxEnd)).toISOString();
-    const tickWide = (Math.min(range.to, maxEnd) - Math.max(range.from, minStart)) >= 7 * DAY_MS;
-    const tickTsWhere = tickWide ? "+timestamp >= ? AND +timestamp < ?" : "timestamp >= ? AND timestamp < ?";
-    const ph = sessIds.map(() => "?").join(",");
-    const tickRows = db.all(
-      `SELECT
-         COALESCE(NULLIF(session, ''), CASE WHEN ${META_VALID} AND json_type(meta, '$.session') = 'text' THEN NULLIF(json_extract(meta, '$.session'), '') END) AS sess,
-         CAST(ROUND(unixepoch(timestamp, 'subsec') * 1000.0) AS INTEGER) AS ms
-       FROM usageHistory
-       WHERE ${tickTsWhere}
-         AND (NULLIF(session, '') IS NOT NULL OR (meta LIKE '%"session"%' AND ${META_VALID} AND json_type(meta, '$.session') = 'text' AND json_extract(meta, '$.session') != ''))
-         AND COALESCE(NULLIF(session, ''), CASE WHEN ${META_VALID} AND json_type(meta, '$.session') = 'text' THEN NULLIF(json_extract(meta, '$.session'), '') END) IN (${ph})
-       ORDER BY id ASC`,
-      [tickFromIso, tickToIso, ...sessIds],
-    );
-    for (const tr of tickRows) {
-      const s = bySess.get(tr.sess);
-      if (s && (s.times ||= []).length < TICK_CAP) s.times.push(tr.ms);
-    }
+  const topSessSet = new Set(topSess.map((s) => s.id));
+  const sessTickIds = new Set();
+  for (const tr of allTicks) {
+    if (!topSessSet.has(tr.sess) || sessTickIds.has(tr.sess)) continue;
+    const s = bySess.get(tr.sess);
+    if (!s) continue;
+    (s.times ||= []).push(tr.ms);
+    sessTickIds.add(tr.sess);
+    if (s.times.length >= TICK_CAP) sessTickIds.delete(tr.sess);
   }
 
   const sessOut = topSess.map((s) => ({

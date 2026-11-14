@@ -1,4 +1,5 @@
 import { Worker } from "node:worker_threads";
+import { DATA_FILE } from "./paths.js";
 
 // Generic bounded pool of read-only SQLite worker threads. Same protocol and
 // tuning as the Agents read worker (src/lib/agents/readWorker.mjs), but the
@@ -77,7 +78,7 @@ export function createReadPool({
 
   function createWorker() {
     const worker = new Worker(new URL("./poolWorker.mjs", import.meta.url), {
-      workerData: { module: workerModuleUrl, keyPrefix: name },
+      workerData: { module: workerModuleUrl, keyPrefix: name, file: DATA_FILE, driver },
     });
     const slot = { worker, ready: false, retired: false, job: null, idleTimer: null };
     workers.push(slot);
