@@ -2,7 +2,7 @@
 
 import { Fragment, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { occurrences, parseUrlState, serialiseUrlState, buildRangeKey, buildEventsFilterKey, buildEventsRequestKey, nextHitLookupCursor, clearPromptLandingOnNavigation, shouldSyncSearchInput, shouldDropMissingDetail } from "./urlState";
+import { occurrences, parseUrlState, serialiseUrlState, buildRangeKey, rangeBounds, RANGE_LABELS, buildEventsFilterKey, buildEventsRequestKey, nextHitLookupCursor, clearPromptLandingOnNavigation, shouldSyncSearchInput, shouldDropMissingDetail } from "./urlState";
 import RangeBar from "../spend/RangeBar";
 import { applyIgnoreToSummary } from "@/lib/piiGuard/summary";
 import { buildView, isRefreshingState, place, PAGE, buildPromptFilterKey, buildPromptRequestKey, canLandOnPrompt, buildSessionFilterKey, buildSessionRequestKey, findingMarkers, groupMessages, toolFormat, collapseDefault, PROSE_LINES, ALABEL, stamp, age } from "./view";
@@ -10,23 +10,16 @@ import "../spend/spend.css";
 import RefreshBar from "../spend/RefreshBar";
 import SyncButton from "../spend/SyncButton";
 import useAutoSync from "../spend/useAutoSync";
+import { useLiveTopic } from "@/shared/hooks/useLive";
 import { cacheGet, cacheSet, cacheInvalidate } from "@/lib/clientCache";
 
 const summaryKey = (rk) => `/api/pii-guard?range=${rk}`;
 
-const DAY = 864e5, IST = 5.5 * 3600e3;
-const PRESET_DAYS = { "7D": 7, "30D": 30, "60D": 60, All: 90 };
-// Range in ms for the API; the event log keeps at most 90 days.
-function bounds(r, now = Date.now()) {
-  if (r.preset === "Today") return { from: Math.floor((now + IST) / DAY) * DAY - IST, to: now };
-  if (r.preset === "Custom") {
-    const to = Math.min(now, Date.parse(r.to + "T00:00:00Z") - IST + DAY);
-    return { from: Math.max(Date.parse(r.from + "T00:00:00Z") - IST, to - 90 * DAY), to };
-  }
-  return { from: now - (PRESET_DAYS[r.preset] || 1) * DAY + (r.preset === "All" ? 6e4 : 0), to: now };
-}
-async function call(url, body, signal) {
-  const res = await fetch(url, { cache: "no-store", signal, ...(body && { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }) });
+const IST = 5.5 * 3600e3;
+const bounds = rangeBounds;
+// The summary is revalidated, not refetched: the server answers 304 while nothing was logged.
+async function call(url, body, signal, cache = "no-store") {
+  const res = await fetch(url, { cache, signal, ...(body && { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }) });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data;
@@ -209,7 +202,7 @@ export default function PiiGuardClient() {
     setRefreshReason(reason);
     const { from, to } = bounds(range);
     try {
-      const d = await call(`/api/pii-guard?from=${Math.round(from)}&to=${Math.round(to)}`, null, ctl.signal);
+      const d = await call(`/api/pii-guard?from=${Math.round(from)}&to=${Math.round(to)}`, null, ctl.signal, "no-cache");
       if (ctl.signal.aborted || seq !== loadSeqRef.current) return;
       loadedKeyRef.current = rangeKey;
       cacheSet(summaryKey(rangeKey), d);
@@ -233,6 +226,11 @@ export default function PiiGuardClient() {
     return () => { clearTimeout(t); loadCtl.current?.abort(); };
   }, [load, rangeKey]);
   const autoSync = useAutoSync("piiGuard", () => load("poll"));
+  // The live stream says when the event log grew; the timer above stays as the manual and fallback control.
+  const live = useLiveTopic("pii", { throttleMs: 15_000 });
+  const liveLoad = useRef(load);
+  useEffect(() => { liveLoad.current = load; });
+  useEffect(() => { if (live.version > 0) liveLoad.current("poll"); }, [live.version]);
   const manualSync = useCallback(() => load("manual"), [load]);
 
   // Event log: 50 events per page, newest first, flattened to one row per hit. The server applies the
@@ -516,7 +514,7 @@ export default function PiiGuardClient() {
           </Fragment>))}
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", minWidth: "0", maxWidth: "100%" }}>
-          <RangeBar preset={preset} customLabel={customLabel} onChange={onRange} today={todayKey} />
+          <RangeBar preset={preset} customLabel={customLabel} onChange={onRange} today={todayKey} labels={RANGE_LABELS} />
           <SyncButton sync={{ ...autoSync, manual: manualSync }} busy={isRefreshing} />
         </div>
       </div>

@@ -10,7 +10,8 @@ const seg = (on) => ({ border: 0, height: 28, padding: "0 11px", borderRadius: 7
 const key = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 const fmt = (d) => d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 
-export default function RangeBar({ preset, customLabel, onChange, today }) {
+// `labels` renames a preset on screen (PII Guard shows "All" as "90 days"); the preset key is unchanged.
+export default function RangeBar({ preset, customLabel, onChange, today, labels }) {
   const [open, setOpen] = useState(false);
   const [m, setM] = useState(0);
   const [a, setA] = useState(null);
@@ -56,7 +57,7 @@ export default function RangeBar({ preset, customLabel, onChange, today }) {
         if (index < 0) return;
         e.preventDefault(); const next = radios[(index + (e.key === "ArrowRight" ? 1 : -1) + radios.length) % radios.length]; next?.focus(); next?.click();
       }} style={{ display: "flex", flexWrap: "nowrap", gap: 2, padding: 3, borderRadius: 9, background: "var(--seg)", maxWidth: "100%", overflowX: "auto", boxSizing: "border-box" }}>
-        {PRESETS.map((k) => <button key={k} role="radio" aria-checked={preset === k} tabIndex={preset === k ? 0 : -1} onClick={() => { setOpen(false); setA(null); onChange({ preset: k }); }} style={seg(preset === k)}>{k}</button>)}
+        {PRESETS.map((k) => <button key={k} role="radio" aria-checked={preset === k} tabIndex={preset === k ? 0 : -1} onClick={() => { setOpen(false); setA(null); onChange({ preset: k }); }} style={seg(preset === k)}>{labels?.[k] || k}</button>)}
         <button role="radio" aria-checked={preset === "Custom"} tabIndex={preset === "Custom" ? 0 : -1} onClick={() => { setOpen((o) => !o); setA(null); }} style={seg(preset === "Custom")} aria-expanded={open}>
           <span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: 15 }}>calendar_month</span><span style={{ whiteSpace: "nowrap" }}>{preset === "Custom" ? customLabel || "Custom" : "Custom"}</span>
         </button>

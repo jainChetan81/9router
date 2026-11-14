@@ -1,10 +1,13 @@
 import { NextResponse } from "next/server";
 import { clientOf } from "@/lib/spendClient.js";
-import { open, readFile, stat } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { getSettings, updateSettings } from "@/lib/localDb";
 import { ready, rules, groups, testText, testImage, eventsFile, health } from "@/lib/piiGuard/observe.js";
-import { summarize, applyIgnoreToSummary } from "@/lib/piiGuard/summary.js";
+import { summarize, createSummarizer, applyIgnoreToSummary } from "@/lib/piiGuard/summary.js";
+import { rangeStart, scanBackward, scanForward, withLog } from "@/lib/piiGuard/eventLog.js";
+import { bump, version } from "@/lib/live/bus.js";
 
 export const dynamic = "force-dynamic";
 const MODES = ["off", "observe", "redact", "block"];
@@ -70,152 +73,24 @@ function decodeImage(data) {
 
 const DAY = 24 * 60 * 60 * 1000;
 const MAX_DAYS = 90;
-const CHUNK = 1024 * 1024;
-// ponytail: reads at most 64 MiB back (~12 days at 5 MB/day). Upgrade path: rotate events.jsonl or keep a daily index.
-const CAP = 64 * 1024 * 1024;
 const MAX_SUMMARY_CACHE = 8;
+const MAX_LIVE = 3;
+const LIVE_IDLE_MS = 10 * 60_000;
+// ETags are only comparable within one process: the pii version restarts with it.
+const BOOT = randomBytes(4).toString("hex");
 
-// Parsed events, oldest first, for one file. `start` is the byte offset of the oldest parsed line,
-// `end` the offset after the newest complete line. Polls read only bytes appended after `end`;
-// an older `from` reads backward from `start`. A new inode or a shrunk file resets the cache.
-let cache = null;
+// The log is never held in memory. A summary of a past range is cached by its exact range and the file's
+// state. A range that ends now or later keeps its folded summary and the offset it has read to, so a poll
+// folds in only the bytes appended since; that state is dropped after ten idle minutes.
 const summaryCache = new Map();
-
-async function readRange(handle, start, end) {
-  const buffer = Buffer.alloc(end - start);
-  const { bytesRead } = await handle.read(buffer, 0, end - start, start);
-  return buffer.subarray(0, bytesRead);
+const live = new Map();
+let liveTimer = null;
+function touchLive() {
+  clearTimeout(liveTimer);
+  liveTimer = setTimeout(() => live.clear(), LIVE_IDLE_MS);
+  liveTimer.unref?.();
 }
 
-function parseLinesWithTimes(buf) {
-  const events = [];
-  const times = [];
-  const routing = new Map();
-  let sawNonRouting = false;
-  let firstNonRoutingTs = NaN;
-  const text = buf.toString("utf8");
-  let start = 0;
-  while (start < text.length) {
-    let nl = text.indexOf("\n", start);
-    if (nl === -1) nl = text.length;
-    if (nl > start) {
-      try {
-        const e = JSON.parse(text.slice(start, nl));
-        const ts = Date.parse(e?.ts);
-        events.push(e);
-        times.push(ts);
-        if (e?.kind === "routing") {
-          if (typeof e.requestId === "string") {
-            const fields = {};
-            for (const key of ["provider", "account", "resolvedModel"]) fields[key] = typeof e[key] === "string" ? e[key] : null;
-            if (typeof e.combo === "string") fields.combo = e.combo;
-            routing.set(e.requestId, fields);
-          }
-        } else if (!sawNonRouting) {
-          sawNonRouting = true;
-          firstNonRoutingTs = ts;
-        }
-      } catch {}
-    }
-    start = nl + 1;
-  }
-  return { events, times, routing, sawNonRouting, firstNonRoutingTs };
-}
-
-function findStartIndex(c, fromMs) {
-  for (let i = c.events.length - 1; i >= 0; i--) {
-    if (c.events[i].kind === "routing") continue;
-    if (c.times[i] < fromMs) return i + 1;
-  }
-  return 0;
-}
-
-async function ensureCachedEvents(handle, file, st, fromMs) {
-  const { ino, birthtimeMs, size } = st;
-  if (!cache || cache.file !== file || cache.ino !== ino || cache.born !== birthtimeMs || size < cache.end) {
-    // Start at the last complete line; a half-written tail is read on the next call.
-    const tailFrom = Math.max(0, size - CHUNK);
-    const tail = await readRange(handle, tailFrom, size);
-    const lastNl = tail.lastIndexOf(0x0a);
-    const end = lastNl >= 0 ? tailFrom + lastNl + 1 : tailFrom;
-    cache = { file, ino, born: birthtimeMs, start: end, end, events: [], times: [], routing: new Map(), sawNonRouting: false, oldestNonRoutingMs: NaN };
-    if (lastNl >= 0) {
-      const firstNl = tailFrom === 0 ? -1 : tail.indexOf(0x0a);
-      const sliceStart = tailFrom === 0 ? 0 : (firstNl >= 0 && firstNl < lastNl ? firstNl + 1 : -1);
-      if (sliceStart >= 0) {
-        const parsed = parseLinesWithTimes(tail.subarray(sliceStart, lastNl + 1));
-        cache.start = tailFrom + sliceStart;
-        cache.events = parsed.events;
-        cache.times = parsed.times;
-        cache.routing = parsed.routing;
-        cache.sawNonRouting = parsed.sawNonRouting;
-        cache.oldestNonRoutingMs = parsed.firstNonRoutingTs;
-      }
-    }
-  }
-  if (size > cache.end) {
-    const buf = await readRange(handle, cache.end, size);
-    const cut = buf.lastIndexOf(0x0a) + 1;
-    if (cut > 0) {
-      const parsed = parseLinesWithTimes(buf.subarray(0, cut));
-      for (let i = 0; i < parsed.events.length; i++) {
-        cache.events.push(parsed.events[i]); // no spread: a big append would overflow the call stack
-        cache.times.push(parsed.times[i]);
-      }
-      for (const [reqId, fields] of parsed.routing) cache.routing.set(reqId, fields);
-      if (!cache.sawNonRouting && parsed.sawNonRouting) {
-        cache.sawNonRouting = true;
-        cache.oldestNonRoutingMs = parsed.firstNonRoutingTs;
-      }
-      cache.end += cut;
-    }
-  }
-  let back = CHUNK;
-  let curStart = cache.start;
-  const prepended = [];
-  while (curStart > 0 && cache.end - curStart < CAP && !(cache.oldestNonRoutingMs < fromMs)) {
-    const from = Math.max(0, curStart - back);
-    const buf = await readRange(handle, from, curStart);
-    const cut = from === 0 ? 0 : buf.indexOf(0x0a) + 1; // the first line may be partial; the next round reads it whole
-    if (from > 0 && cut === 0) { back *= 2; if (back > CAP) break; continue; }
-    const parsed = parseLinesWithTimes(buf.subarray(cut));
-    prepended.push(parsed);
-    curStart = from + cut;
-    if (parsed.sawNonRouting) {
-      cache.sawNonRouting = true;
-      cache.oldestNonRoutingMs = parsed.firstNonRoutingTs;
-    }
-    back = CHUNK;
-  }
-  if (prepended.length > 0) {
-    const newEvents = [];
-    const newTimes = [];
-    for (let c = prepended.length - 1; c >= 0; c--) {
-      const { events, times } = prepended[c];
-      for (let i = 0; i < events.length; i++) {
-        newEvents.push(events[i]);
-        newTimes.push(times[i]);
-      }
-    }
-    for (let i = 0; i < cache.events.length; i++) {
-      newEvents.push(cache.events[i]);
-      newTimes.push(cache.times[i]);
-    }
-    // Existing cache.routing is newer than prepended[0], which is newer than prepended[1], etc.
-    for (let c = 0; c < prepended.length; c++) {
-      for (const [reqId, fields] of prepended[c].routing) {
-        if (!cache.routing.has(reqId)) cache.routing.set(reqId, fields);
-      }
-    }
-    cache.events = newEvents;
-    cache.times = newTimes;
-    cache.start = curStart;
-  }
-  return cache.start > 0 && !(cache.oldestNonRoutingMs <= fromMs);
-}
-
-// Returns { events (newest first, ts >= fromMs), truncated }. truncated: the cap stopped the read before `fromMs`.
-// Calls run one at a time: polls, the events pager and two tabs share one cache.
 let queue = Promise.resolve();
 let settingsQueue = Promise.resolve();
 function withSettingsLock(fn) {
@@ -224,34 +99,13 @@ function withSettingsLock(fn) {
   return run;
 }
 
-// `visit(e)`, if given, sees events newest first and returns false to stop; no copy of the range is made.
-export function loadEvents(fromMs, visit) {
-  const run = queue.then(() => readEvents(fromMs, visit));
-  queue = run.catch(() => {});
-  return run;
-}
-
-async function readEvents(fromMs, visit) {
-  const file = eventsFile();
-  let handle;
-  try {
-    handle = await open(file, "r");
-    const st = await handle.stat();
-    const truncated = await ensureCachedEvents(handle, file, st, fromMs);
-    const out = [];
-    for (let i = cache.events.length - 1; i >= 0; i--) {
-      const raw = cache.events[i];
-      if (raw.kind === "routing") continue;
-      const ts = cache.times[i];
-      if (ts < fromMs) break;
-      const event = { ...raw, ...cache.routing.get(raw.requestId) };
-      if (visit) { if (visit(event, ts) === false) break; } else out.push(event);
-    }
-    // Appends grow the cache past CAP over a long uptime; rebuild it on the next call.
-    if (cache.end - cache.start > CAP * 1.5) cache = null;
-    return { events: out, truncated };
-  } catch { return { events: [], truncated: false }; }
-  finally { await handle?.close().catch(() => {}); }
+// Returns { events (newest first, ts >= fromMs), truncated }. truncated: the scan cap stopped the read before `fromMs`.
+// `visit(e, ts)`, if given, sees events newest first and returns false to stop; no copy of the range is made
+// and only the chunks it needed are read.
+export async function loadEvents(fromMs, visit) {
+  const events = [];
+  const { truncated } = await withLog(eventsFile(), (handle, st) => scanBackward(handle, st.size, fromMs, visit || ((e) => { events.push(e); })), { truncated: false });
+  return { events, truncated };
 }
 
 function recordRecentHits(rawEvent, ts, sinceMs, untilMs, firstSeen) {
@@ -268,92 +122,20 @@ function recordRecentHits(rawEvent, ts, sinceMs, untilMs, firstSeen) {
   }
 }
 
-function extractHashesAfterCutoff(firstSeen, cutoff) {
-  const hashes = [];
-  for (const [key, firstMs] of firstSeen) {
-    if (firstMs >= cutoff) hashes.push(key.slice(0, key.indexOf("\0")));
-  }
-  return hashes;
-}
-
-// Reads only the last 24h window off the long-read queue so slow GET reads never block POST ignoreRecent.
-async function findRecentNewHashes(minutes) {
+// Values first seen in the last `minutes`, judged against the last 24 hours of the log.
+function findRecentNewHashes(minutes) {
   const now = Date.now();
   const cutoff = now - minutes * 60_000;
   const since = now - DAY;
-  const file = eventsFile();
-  let handle;
-  try {
-    const st = await stat(file).catch(() => null);
-    if (!st) return { hashes: [], truncated: false };
-    if (
-      cache &&
-      cache.file === file &&
-      cache.ino === st.ino &&
-      cache.born === st.birthtimeMs &&
-      st.size === cache.end &&
-      (cache.start === 0 || cache.oldestNonRoutingMs <= since)
-    ) {
-      const startIdx = findStartIndex(cache, since);
-      const firstSeen = new Map();
-      for (let i = startIdx; i < cache.events.length; i++) {
-        recordRecentHits(cache.events[i], cache.times[i], since, now, firstSeen);
-      }
-      return { hashes: extractHashesAfterCutoff(firstSeen, cutoff), truncated: false };
-    }
-    handle = await open(file, "r");
-    const fst = await handle.stat();
-    const tailFrom = Math.max(0, fst.size - CHUNK);
-    const tail = await readRange(handle, tailFrom, fst.size);
-    const lastNl = tail.lastIndexOf(0x0a);
-    const end = lastNl >= 0 ? tailFrom + lastNl + 1 : tailFrom;
-    let start = end;
-    const chunks = [];
-    let sawNonRouting = false;
-    let oldestMs = NaN;
-    if (lastNl >= 0) {
-      const firstNl = tailFrom === 0 ? -1 : tail.indexOf(0x0a);
-      const sliceStart = tailFrom === 0 ? 0 : (firstNl >= 0 && firstNl < lastNl ? firstNl + 1 : -1);
-      if (sliceStart >= 0) {
-        const parsed = parseLinesWithTimes(tail.subarray(sliceStart, lastNl + 1));
-        chunks.push(parsed);
-        if (parsed.sawNonRouting) {
-          sawNonRouting = true;
-          oldestMs = parsed.firstNonRoutingTs;
-        }
-        start = tailFrom + sliceStart;
-      }
-    }
-    let back = CHUNK;
-    while (start > 0 && end - start < CAP && !(oldestMs < since)) {
-      const from = Math.max(0, start - back);
-      const buf = await readRange(handle, from, start);
-      const cut = from === 0 ? 0 : buf.indexOf(0x0a) + 1;
-      if (from > 0 && cut === 0) { back *= 2; if (back > CAP) break; continue; }
-      const parsed = parseLinesWithTimes(buf.subarray(cut));
-      chunks.push(parsed);
-      if (parsed.sawNonRouting) {
-        sawNonRouting = true;
-        oldestMs = parsed.firstNonRoutingTs;
-      }
-      start = from + cut;
-      back = CHUNK;
-    }
-    const truncated = start > 0 && !(sawNonRouting && oldestMs <= since);
+  return withLog(eventsFile(), async (handle, st) => {
+    const { start, truncated } = await rangeStart(handle, st.size, since);
     if (truncated) return { hashes: [], truncated: true };
     const firstSeen = new Map();
-    for (let c = chunks.length - 1; c >= 0; c--) {
-      const { events, times } = chunks[c];
-      for (let i = 0; i < events.length; i++) {
-        recordRecentHits(events[i], times[i], since, now, firstSeen);
-      }
-    }
-    return { hashes: extractHashesAfterCutoff(firstSeen, cutoff), truncated: false };
-  } catch {
-    return { hashes: [], truncated: false };
-  } finally {
-    await handle?.close().catch(() => {});
-  }
+    await scanForward(handle, start, st.size, (e, ts) => recordRecentHits(e, ts, since, now, firstSeen));
+    const hashes = [];
+    for (const [key, firstMs] of firstSeen) if (firstMs >= cutoff) hashes.push(key.slice(0, key.indexOf("\0")));
+    return { hashes, truncated: false };
+  }, { hashes: [], truncated: false });
 }
 
 function baseSummaryKey(file, from, to, step, origin, st) {
@@ -373,32 +155,42 @@ function setCachedBaseSummary(key, value) {
     summaryCache.delete(summaryCache.keys().next().value);
   }
 }
+const fold = (summarizer) => (e, ts) => (e.kind === "routing" ? summarizer.route(e) : summarizer.add(e, ts));
+// A range ending now or later: every event in the file is inside it, so its summary only ever grows.
+async function liveSummary(handle, st, file, from, to, step, origin) {
+  const key = `${file}|${from}|${step}|${origin}`;
+  let entry = live.get(key);
+  if (!entry || entry.ino !== st.ino || entry.born !== st.birthtimeMs || st.size < entry.end) {
+    const { start, truncated } = await rangeStart(handle, st.size, from);
+    entry = { ino: st.ino, born: st.birthtimeMs, end: start, truncated, summarizer: createSummarizer({ since: from, step, origin, open: true }) };
+  }
+  live.delete(key);
+  if (st.size > entry.end) {
+    // A failed read leaves the entry out of the map: a half-folded chunk must not be counted twice.
+    entry.end = await scanForward(handle, entry.end, st.size, fold(entry.summarizer));
+  }
+  live.set(key, entry);
+  while (live.size > MAX_LIVE) live.delete(live.keys().next().value);
+  touchLive();
+  return { ...entry.summarizer.finish({ until: to }), truncated: entry.truncated, step, origin };
+}
+async function rangeSummary(handle, st, from, to, step, origin) {
+  const { start, truncated } = await rangeStart(handle, st.size, from);
+  const summarizer = createSummarizer({ since: from, until: to, step, origin });
+  // To the end of the file: a routing record follows its event, possibly after `to`.
+  await scanForward(handle, start, st.size, fold(summarizer));
+  return { ...summarizer.finish(), truncated, step, origin };
+}
+// Calls run one at a time: polls and two tabs share the live state.
 function loadBaseSummary(file, from, to, step, origin) {
-  const run = queue.then(async () => {
-    let handle;
-    try {
-      handle = await open(file, "r");
-      const fst = await handle.stat();
-      const fKey = baseSummaryKey(file, from, to, step, origin, fst);
-      const cached = getCachedBaseSummary(fKey);
-      if (cached) return cached;
-      const truncated = await ensureCachedEvents(handle, file, fst, from);
-      const startIndex = findStartIndex(cache, from);
-      const baseSummary = {
-        ...summarize(cache.events, { since: from, until: to, ignore: [], step, origin, routing: cache.routing, times: cache.times, startIndex }),
-        truncated,
-        step,
-        origin,
-      };
-      if (cache.end - cache.start > CAP * 1.5) cache = null;
-      setCachedBaseSummary(fKey, baseSummary);
-      return baseSummary;
-    } catch {
-      return { ...summarize([], { since: from, until: to, ignore: [], step, origin }), truncated: false, step, origin };
-    } finally {
-      await handle?.close().catch(() => {});
-    }
-  });
+  const run = queue.then(() => withLog(file, async (handle, st) => {
+    const key = baseSummaryKey(file, from, to, step, origin, st);
+    const cached = getCachedBaseSummary(key);
+    if (cached) return cached;
+    const summary = to >= Date.now() ? await liveSummary(handle, st, file, from, to, step, origin) : await rangeSummary(handle, st, from, to, step, origin);
+    setCachedBaseSummary(key, summary);
+    return summary;
+  }, null)).then((summary) => summary || { ...summarize([], { since: from, until: to, ignore: [], step, origin }), truncated: false, step, origin });
   queue = run.catch(() => {});
   return run;
 }
@@ -499,8 +291,14 @@ export async function GET(request) {
   if (fromRaw !== null || toRaw !== null) {
     const vr = validateRange(fromRaw, toRaw);
     if (vr === "bad") return NextResponse.json({ error: "Invalid range" }, { status: 400 });
+    // The pii topic version moves on every log append and settings save. An unchanged version for the same
+    // range answers 304 before the log or the settings are read. The minute keeps the health counters
+    // (which move without a log append) at most a minute old.
+    const etag = `W/"pii-${BOOT}-${version("pii")}-${vr.from}-${vr.to}-${Math.floor(Date.now() / 6e4)}"`;
+    const headers = { ETag: etag, "Cache-Control": "private, no-cache" };
+    if (request.headers.get("if-none-match") === etag) return new Response(null, { status: 304, headers });
     const s = await state(vr.from, vr.to);
-    return NextResponse.json(s);
+    return NextResponse.json(s, { headers });
   }
   // default last 24h
   const s = await state();
@@ -633,6 +431,7 @@ export async function POST(request) {
       }
     }
     await updateSettings({ piiGuard: next });
+    bump("pii");
     console.info(`[pii-guard] Settings changed: ${formatSettingsDiff(current, next)}`);
     // The UI updates config/ignore in place from this response; no summary is built here.
     return NextResponse.json({ ok: true, config: next });

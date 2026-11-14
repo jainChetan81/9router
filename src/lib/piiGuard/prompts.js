@@ -2,19 +2,41 @@
 // Detected values are masked (library maskText) and the result is rescanned; a record that still shows a finding
 // is dropped. Undetected text (names, custom secrets) stays readable: this is a partially masked store.
 // Lives in ~/.cache, which vps-backup skips; the directory is 0700 and the files 0600.
+//
+// Nothing here touches SQLite on the request path. `capture` masks and queues; the queue is written in one
+// transaction about once a second by a writer thread (promptWorker.mjs), which also answers the dashboard's
+// reads and runs retention. Without worker threads the same batches are written from a timer on this thread.
+// A record still queued when the process stops is lost: at most about a second of prompts.
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { Worker } from "node:worker_threads";
+import * as store from "./promptDb.mjs";
 
 export const PROMPT_CAP = 1024 * 1024, TOOL_CAP = 128 * 1024, REQUEST_CAP = 4 * 1024 * 1024;
 // Queue bound is bytes; the message count only stops pathological bodies of tiny strings.
-const TTL_MS = 14 * 864e5, QUEUE_MAX = 5000, QUEUE_BYTES = 64 * 1024 * 1024, SEEN_MAX = 200_000, SEEN_SESSIONS = 10_000, STORE_BYTES = 200 * 1024 * 1024;
-let sweepTimer = null, db = null, dbFile = null, failed = false, queue = [], queued = 0, draining = false, lastSweep = 0;
-export const stats = { stored: 0, dropped: 0, unsafe: 0, errors: 0 };
-// Per-session message digests already stored, so a resent conversation stores only what is new.
-// A session missing here (new, or after a restart) is seeded from the DB once.
-const seen = new Map(), pending = new Map();
+const QUEUE_MAX = 5000, QUEUE_BYTES = 64 * 1024 * 1024, SEEN_MAX = 200_000, SEEN_SESSIONS = 10_000;
+// A batch goes out after FLUSH_MS, or at once when it is this large.
+const FLUSH_MS = 1000, FLUSH_ROWS = 256, FLUSH_BYTES = 4 * 1024 * 1024;
+const INLINE_SLICE = 16, PARK_MAX = 500, CAPTURED_MAX = 5000, RPC_TIMEOUT_MS = 30_000, WORKER_FAILURES_MAX = 3, HOUR = 36e5;
+
+// One store per process, even when the bundler loads this module more than once.
+function fresh() {
+  return {
+    stats: { stored: 0, dropped: 0, unsafe: 0, errors: 0 },
+    queue: [], rows: 0, queuedBytes: 0, inflightBytes: 0, timer: null, soon: false,
+    // Per-session message digests already stored, so a resent conversation stores only what is new.
+    // Bounded (least recently used session goes first); a session missing here is seeded from the store.
+    seen: new Map(), pending: new Map(),
+    // Requests of a session whose digests are not loaded yet wait here; nothing is read on the request path.
+    parked: new Map(), parkedJobs: 0, parkedBytes: 0, seedWait: new Map(),
+    captured: new Map(),
+    worker: null, rpcs: new Map(), nextId: 1, workerFailures: 0,
+    inline: null, inlineFile: null, inlineFailed: false, sweepTimer: null, lastSweep: 0,
+  };
+}
+const S = (globalThis.__nineRouterPiiPromptStore ||= fresh());
+export const stats = S.stats;
 
 // Next to a custom events file (tests, other installs); otherwise in ~/.cache, outside backups.
 export function promptsFile() {
@@ -25,56 +47,68 @@ export function promptsFile() {
   return process.env.PII_GUARD_EVENTS ? join(dirname(process.env.PII_GUARD_EVENTS), "prompts.db") : join(homedir(), ".cache/pii-guard/prompts.db");
 }
 
-function open(file = promptsFile()) {
-  if (db && dbFile !== file) { try { db.close(); } catch {} db = null; failed = false; }
-  if (db || failed) return db;
-  try {
-    dbFile = file;
-    mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
-    chmodSync(dirname(file), 0o700);
-    // Loaded lazily so the module stays importable where node:sqlite is missing.
-    const { DatabaseSync } = process.getBuiltinModule("node:sqlite");
-    db = new DatabaseSync(file);
-    db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA secure_delete=ON; PRAGMA busy_timeout=0;");
-    if (db.prepare("PRAGMA auto_vacuum").get().auto_vacuum !== 2) { db.exec("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;"); }
-    db.exec(`CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, request_id TEXT NOT NULL, session_id TEXT,
-        model TEXT, provider TEXT, combo TEXT, account TEXT, client TEXT, role TEXT, kind TEXT, path TEXT, text TEXT NOT NULL, cut INTEGER NOT NULL DEFAULT 0, hashes TEXT NOT NULL DEFAULT '', digest TEXT, tool TEXT);
-      CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);
-      CREATE INDEX IF NOT EXISTS messages_request ON messages(request_id);
-      CREATE INDEX IF NOT EXISTS messages_session ON messages(session_id, ts);
-      CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(text, content='messages', content_rowid='id', tokenize='unicode61');
-      CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text); END;
-      CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.id, old.text); END;`);
-    // Migration for rows a schema without the routing columns created: add them, old rows stay NULL.
-    // A lock or a lost race against another opener retries a few times; missing columns mean the
-    // connection is not used (prompts stay off) rather than INSERTs failing on every row.
-    const REQUIRED = new Set(["provider", "combo", "account", "tool"]);
-    let ok = false;
-    for (let attempt = 0; attempt < 5 && !ok; attempt++) {
-      let cols;
-      try { cols = db.prepare("PRAGMA table_info(messages)").all().map(c => c.name); } catch { db.close(); db = null; failed = true; break; }
-      const missing = [...REQUIRED].filter(c => !cols.includes(c));
-      if (!missing.length) { ok = true; break; }
-      try { for (const col of missing) db.exec(`ALTER TABLE messages ADD COLUMN ${col} TEXT`); }
-      catch (e) {
-        if (/duplicate column/i.test(String(e?.message))) continue; // re-read all columns after a lost race
-        if (!/busy|locked/i.test(String(e?.message)) || attempt === 4) { db.close(); db = null; failed = true; break; }
-        db.close();
-        db = new DatabaseSync(file);
-        db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA secure_delete=ON; PRAGMA busy_timeout=0;");
-        if (db.prepare("PRAGMA auto_vacuum").get().auto_vacuum !== 2) { db.exec("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;"); }
-      }
-    }
-    if (db) ok = [...REQUIRED].every(col => db.prepare("PRAGMA table_info(messages)").all().some(c => c.name === col));
-    if (!ok) { failed = true; try { db?.close(); } catch {} db = null; }
-    if (ok) {
-      for (const f of [file, `${file}-wal`, `${file}-shm`]) try { chmodSync(f, 0o600); } catch {}
-      // Retention runs on a timer too, so it never depends on traffic.
-      if (!sweepTimer) { sweepTimer = setInterval(() => sweep(), 36e5); sweepTimer.unref(); }
-    }
-  } catch { failed = true; db = null; return null; }
-  sweep();
-  return db;
+// PII_GUARD_PROMPTS_WORKER=off keeps the store on this thread; tests default to that, so they stay synchronous.
+function workerMode() {
+  if (S.workerFailures >= WORKER_FAILURES_MAX) return false;
+  const v = process.env.PII_GUARD_PROMPTS_WORKER;
+  if (v === "off" || v === "0") return false;
+  if (v === "on" || v === "1") return true;
+  return !process.env.VITEST;
+}
+
+function settle(id, error, result) {
+  const call = S.rpcs.get(id);
+  if (!call) return;
+  S.rpcs.delete(id);
+  clearTimeout(call.timer);
+  if (error) call.reject(error); else call.resolve(result);
+}
+function worker() {
+  if (S.worker) return S.worker;
+  const w = new Worker(new URL("./promptWorker.mjs", import.meta.url));
+  w.unref();
+  const gone = (error) => {
+    if (S.worker !== w) return;
+    S.worker = null; S.workerFailures++;
+    for (const id of [...S.rpcs.keys()]) settle(id, error);
+  };
+  w.on("message", (m) => { S.workerFailures = 0; settle(m?.id, m?.error ? new Error(m.error) : null, m?.result); });
+  w.on("error", (error) => gone(error));
+  w.on("exit", () => gone(new Error("prompt store worker exited")));
+  return (S.worker = w);
+}
+function rpc(method, args, file = promptsFile()) {
+  return new Promise((resolve, reject) => {
+    let w;
+    try { w = worker(); } catch (error) { S.workerFailures++; return reject(error); }
+    const id = S.nextId++;
+    const timer = setTimeout(() => settle(id, new Error("prompt store worker timed out")), RPC_TIMEOUT_MS);
+    timer.unref?.();
+    S.rpcs.set(id, { resolve, reject, timer });
+    w.postMessage({ id, method, file, args });
+  });
+}
+
+// Main-thread connection: the fallback writer, and the synchronous reads below.
+function inline(file = promptsFile()) {
+  if (S.inline && S.inlineFile !== file) { store.closeDb(S.inline); S.inline = null; S.inlineFailed = false; }
+  if (S.inline || S.inlineFailed) return S.inline;
+  S.inlineFile = file;
+  S.inline = store.openDb(file);
+  if (!S.inline) { S.inlineFailed = true; return null; }
+  // Retention runs on a timer too, so it never depends on traffic. The writer thread has its own.
+  if (!workerMode()) {
+    if (!S.sweepTimer) { S.sweepTimer = setInterval(sweepSlice, HOUR); S.sweepTimer.unref(); }
+    setTimeout(sweepSlice, 0).unref();
+  }
+  return S.inline;
+}
+// Fallback retention: short slices, so this thread is never held for long.
+function sweepSlice() {
+  S.lastSweep = Date.now();
+  if (!S.inline) return;
+  try { if (store.sweep(S.inline, Date.now(), { budgetMs: 20, chunk: 50, vacuumPages: 64 }).more) setTimeout(sweepSlice, 100).unref(); }
+  catch { S.stats.errors++; }
 }
 
 const digest = (s) => createHash("sha256").update(s).digest("base64url").slice(0, 22);
@@ -145,14 +179,12 @@ export function collect(body) {
 }
 
 /** Picks the strings to store: every string not stored before in this session. Without a session: the latest
- *  string and any string with a finding.
- *  `nodes`: [{ text, role, kind, path, findings }] in request order; texts are originals (before redaction). */
-export function pick(nodes, sessionId, file) {
-  if (sessionId && !seen.has(sessionId)) {
-    const d = open(file);
-    try { if (d) remember(sessionId, d.prepare("SELECT digest FROM messages WHERE session_id = ? AND digest IS NOT NULL").all(sessionId).map((x) => x.digest)); } catch { stats.errors++; }
-  }
-  const known = sessionId ? seen.get(sessionId) : null, waiting = sessionId ? pending.get(sessionId) : null;
+ *  string and any string with a finding (those nodes need `findings`).
+ *  `nodes`: [{ text, role, kind, path }] in request order; texts are originals (before redaction).
+ *  Memory only: the session's digests are already loaded when this runs. */
+export function pick(nodes, sessionId) {
+  const known = sessionId ? S.seen.get(sessionId) : null, waiting = sessionId ? S.pending.get(sessionId) : null;
+  if (known) { S.seen.delete(sessionId); S.seen.set(sessionId, known); } // most recently used last
   const out = [], selected = new Set();
   let bytes = 0;
   nodes.forEach((n, i) => {
@@ -166,24 +198,29 @@ export function pick(nodes, sessionId, file) {
   });
   return out;
 }
-function remember(sessionId, digests) {
-  if (!sessionId || !digests.length) return;
-  let set = seen.get(sessionId);
-  if (!set) { set = new Set(); seen.set(sessionId, set); }
-  seen.delete(sessionId); seen.set(sessionId, set); // most recent last
+// `touch` records a session with nothing stored yet, so its next request is not parked again.
+function remember(sessionId, digests, touch = false) {
+  if (!sessionId || (!digests.length && !touch)) return;
+  let set = S.seen.get(sessionId);
+  if (!set) set = new Set();
+  S.seen.delete(sessionId); S.seen.set(sessionId, set); // most recent last
   for (const d of digests) set.add(d);
   let total = 0;
-  for (const s of seen.values()) total += s.size;
-  for (const [k, s] of seen) { if (total <= SEEN_MAX && seen.size <= SEEN_SESSIONS) break; total -= s.size; seen.delete(k); }
+  for (const s of S.seen.values()) total += s.size;
+  for (const [k, s] of S.seen) { if (total <= SEEN_MAX && S.seen.size <= SEEN_SESSIONS) break; total -= s.size; S.seen.delete(k); }
 }
 
-/** Queues masked records; never blocks the request. Masking and the rescan happen here (sync, small);
- *  the SQLite write runs after the response starts. Full queue: the record is dropped and counted. */
+/** Queues masked records; never blocks the request and never touches the database. Masking and the rescan
+ *  happen here (CPU only, and only for text this session has not stored yet); the write is batched.
+ *  Returns how many records were queued, or held until the session's digests are loaded.
+ *  Full queue: the record is dropped and counted. */
 export function capture(meta, library, detector) {
   if (!meta.nodes.length || typeof library?.maskText !== "function") return 0;
-  // Only masked rows enter the asynchronous write queue.
-  try { return store({ ...meta, file: promptsFile() }, library, detector); }
-  catch { stats.errors++; return 0; }
+  try {
+    // Routing labels are identifiers, never values: validate each, fail closed to null.
+    const routing = { provider: cleanId(meta.provider, detector), combo: cleanId(meta.combo, detector), account: cleanId(meta.account, detector) };
+    return ingest({ ...meta, routing, file: promptsFile(), library, detector });
+  } catch { S.stats.errors++; return 0; }
 }
 const ID_RE = /^[A-Za-z0-9._:/+-]{1,64}$/;
 /** A routing label is an identifier, never a value. Scanner hits or an `@` fail closed: the field stores null. */
@@ -197,18 +234,46 @@ export function updateRouting(requestId, routing, detector) {
   if (process.env.PII_GUARD_PROMPTS === "off") return;
   const fields = Object.fromEntries(["provider", "combo", "account"].map(key => [key, cleanId(routing?.[key], detector)]));
   const file = promptsFile();
-  for (const row of queue) if (row.file === file && row.requestId === requestId) Object.assign(row, fields);
-  if (!db || dbFile !== file) return;
-  try {
-    db.prepare("UPDATE messages SET provider=?, combo=?, account=? WHERE request_id=?")
-      .run(fields.provider, fields.combo, fields.account, requestId);
-  } catch { stats.errors++; }
+  for (const op of S.queue) if (op.row && op.file === file && op.row.requestId === requestId) Object.assign(op.row, fields);
+  for (const jobs of S.parked.values()) for (const job of jobs) if (job.file === file && job.requestId === requestId) Object.assign(job.routing, fields);
+  // Rows of this request that a batch already wrote are updated by the next batch. No rows, no work.
+  if (!S.captured.has(`${file}\0${requestId}`)) return;
+  S.queue.push({ file, route: { requestId, ...fields } });
+  schedule();
 }
-function store({ nodes, bodyFindings = [], requestId, sessionId, model, provider, combo, account: rawAccount, tool: rawTool, client, file }, library, detector) {
-  // Routing labels are identifiers, never values: validate each, fail closed to null.
-  const account = cleanId(rawAccount, detector);
-  const routing = { provider: cleanId(provider, detector), combo: cleanId(combo, detector), account };
-  for (const n of nodes) {
+
+function park(job) {
+  job.bytes = job.nodes.reduce((sum, n) => sum + (n.text?.length || 0), 0);
+  if (S.parkedJobs >= PARK_MAX || S.parkedBytes + job.bytes > QUEUE_BYTES) { S.stats.dropped++; return 0; }
+  const key = `${job.file}\0${job.sessionId}`;
+  let jobs = S.parked.get(key);
+  if (!jobs) S.parked.set(key, jobs = []);
+  jobs.push(job); S.parkedJobs++; S.parkedBytes += job.bytes;
+  if (!workerMode()) schedule(); // the fallback loads the digests when the batch timer fires
+  else if (!S.seedWait.has(key)) {
+    const wait = rpc("seed", { sessionId: job.sessionId }, job.file)
+      .then((digests) => seeded(key, job.sessionId, digests), () => { S.stats.errors++; unpark(key); })
+      .finally(() => S.seedWait.delete(key));
+    S.seedWait.set(key, wait);
+  }
+  return job.nodes.length;
+}
+function unpark(key) {
+  const jobs = S.parked.get(key) || [];
+  S.parked.delete(key);
+  for (const job of jobs) { S.parkedJobs--; S.parkedBytes -= job.bytes; }
+  return jobs;
+}
+function seeded(key, sessionId, digests) {
+  remember(sessionId, Array.isArray(digests) ? digests : [], true);
+  for (const job of unpark(key)) { try { ingest(job, true); } catch { S.stats.errors++; } }
+}
+
+// `loaded`: the session's digests were just loaded, so the job is never parked twice.
+function ingest(job, loaded = false) {
+  const { nodes, bodyFindings = [], requestId, sessionId, model, routing, tool: rawTool, client, file, library, detector } = job;
+  if (sessionId && !loaded && !S.seen.has(sessionId)) return park(job);
+  const analyse = (n) => {
     // The request scan used context (sibling keys like "phone"); a rescan of the bare string may miss those.
     // Same path: reuse its spans. Inside the node but unmatched by hash: unsafe, so the node is not stored.
     const own = detector.scan(n.text), inside = bodyFindings.filter((f) => f.path === n.path || f.path.startsWith(`${n.path}.`) || f.path.startsWith(`${n.path}[`));
@@ -219,187 +284,140 @@ function store({ nodes, bodyFindings = [], requestId, sessionId, model, provider
     for (const f of inside) need.set(f.hash, (need.get(f.hash) || 0) + 1);
     for (const f of n.findings) have.set(f.hash, (have.get(f.hash) || 0) + 1);
     n.unsafe = [...need].some(([h, c]) => (have.get(h) || 0) < c);
-  }
-  const chosen = pick(nodes, sessionId, file);
+  };
+  // With a session only the strings not stored before are scanned: a resent conversation costs its digests.
+  let chosen;
+  if (sessionId) { chosen = pick(nodes, sessionId); chosen.forEach(analyse); }
+  else { nodes.forEach(analyse); chosen = pick(nodes, null); }
   const ts = Date.now();
 
   let captured = 0;
   for (const n of chosen) {
-    if (n.unsafe) { stats.unsafe++; continue; }
+    if (n.unsafe) { S.stats.unsafe++; continue; }
     let masked;
     try {
       const [text, cut] = cap(library.maskText(n.text, n.findings), n.kind);
       // Fail closed: anything still detected after masking means a span was missed.
-      if (detector.scan(text).length) { stats.unsafe++; continue; }
-      masked = { file, ts, requestId, sessionId: sessionId || null, model: model || null, ...routing, client: client || null, role: n.role, kind: n.kind, path: n.path, digest: n.digest, tool: cleanId(rawTool ?? n.tool, detector), text, cut, hashes: [...new Set(n.findings.map((f) => f.hash))].join(" ") };
-    } catch { stats.errors++; continue; }
-    if (queue.length >= QUEUE_MAX || queued + masked.text.length > QUEUE_BYTES) { stats.dropped++; continue; }
-    queue.push(masked); queued += masked.text.length;
+      if (detector.scan(text).length) { S.stats.unsafe++; continue; }
+      masked = { ts, requestId, sessionId: sessionId || null, model: model || null, ...routing, client: client || null, role: n.role, kind: n.kind, path: n.path, digest: n.digest, tool: cleanId(rawTool ?? n.tool, detector), text, cut, hashes: [...new Set(n.findings.map((f) => f.hash))].join(" ") };
+    } catch { S.stats.errors++; continue; }
+    if (S.rows >= QUEUE_MAX || S.queuedBytes + S.inflightBytes + masked.text.length > QUEUE_BYTES) { S.stats.dropped++; continue; }
+    S.queue.push({ file, row: masked }); S.rows++; S.queuedBytes += masked.text.length;
     captured++;
-    if (sessionId) { let set = pending.get(sessionId); if (!set) pending.set(sessionId, set = new Set()); set.add(n.digest); }
+    if (sessionId) { let set = S.pending.get(sessionId); if (!set) S.pending.set(sessionId, set = new Set()); set.add(n.digest); }
   }
-  if (!draining && queue.length) { draining = true; setImmediate(drain); }
+  if (captured) {
+    const key = `${file}\0${requestId}`;
+    S.captured.delete(key); S.captured.set(key, true);
+    if (S.captured.size > CAPTURED_MAX) S.captured.delete(S.captured.keys().next().value);
+    schedule();
+  }
   return captured;
 }
-function drain() {
-  const all = queue; queue = []; queued = 0; draining = false;
-  for (const file of new Set(all.map((r) => r.file))) write(file, all.filter((r) => r.file === file));
-  if (Date.now() - lastSweep > 36e5) sweep();
+
+function schedule() {
+  if (S.rows >= FLUSH_ROWS || S.queuedBytes >= FLUSH_BYTES) {
+    if (S.soon) return;
+    S.soon = true;
+    setImmediate(() => { S.soon = false; void (workerMode() ? flush() : flushInline(INLINE_SLICE)); });
+  } else if (!S.timer) {
+    S.timer = setTimeout(() => { S.timer = null; void (workerMode() ? flush() : flushInline(INLINE_SLICE)); }, FLUSH_MS);
+    S.timer.unref?.();
+  }
 }
-function write(file, rows) {
-  const d = open(file);
-  if (!d) { stats.dropped += rows.length; releasePending(rows); return; }
-  try {
-    const ins = d.prepare("INSERT INTO messages (ts, request_id, session_id, model, provider, combo, account, client, role, kind, path, text, cut, hashes, digest, tool) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-    d.exec("BEGIN");
-    for (const r of rows) ins.run(r.ts, r.requestId, r.sessionId, r.model, r.provider, r.combo, r.account, r.client, r.role, r.kind, r.path, r.text, r.cut, r.hashes, r.digest, r.tool);
-    d.exec("COMMIT");
-    stats.stored += rows.length;
-    releasePending(rows);
-    for (const r of rows) remember(r.sessionId, [r.digest]);
-  } catch { try { d.exec("ROLLBACK"); } catch {} stats.errors++; stats.dropped += rows.length; releasePending(rows); }
+function takeBatches(limit = Infinity) {
+  const ops = S.queue.length > limit ? S.queue.splice(0, limit) : S.queue;
+  if (ops === S.queue) S.queue = [];
+  S.rows = 0; S.queuedBytes = 0;
+  for (const op of S.queue) if (op.row) { S.rows++; S.queuedBytes += op.row.text.length; }
+  const byFile = new Map();
+  for (const op of ops) { let list = byFile.get(op.file); if (!list) byFile.set(op.file, list = []); list.push(op); }
+  return byFile;
 }
-function releasePending(rows) {
+function settled(ops, ok) {
+  const rows = ops.filter((op) => op.row).map((op) => op.row);
+  if (ok) S.stats.stored += rows.length; else S.stats.dropped += rows.length;
   for (const r of rows) {
     if (!r.sessionId) continue;
-    const set = pending.get(r.sessionId);
+    const set = S.pending.get(r.sessionId);
     set?.delete(r.digest);
-    if (set && !set.size) pending.delete(r.sessionId);
+    if (set && !set.size) S.pending.delete(r.sessionId);
+    if (ok) remember(r.sessionId, [r.digest]);
   }
 }
-export function sweep(now = Date.now()) {
-  lastSweep = now;
-  const d = db;
-  if (!d) return 0;
-  try {
-    const expired = Number(d.prepare("DELETE FROM messages WHERE ts < ?").run(now - TTL_MS).changes);
-    const capped = Number(d.prepare(`WITH sizes AS (
-      SELECT id, SUM(length(CAST(text AS BLOB))) OVER (ORDER BY ts DESC, id DESC) AS newest_bytes FROM messages
-    ) DELETE FROM messages WHERE id IN (SELECT id FROM sizes WHERE newest_bytes > ?)`)
-      .run(STORE_BYTES).changes);
-    if (expired || capped) d.exec(`PRAGMA incremental_vacuum(${d.prepare("PRAGMA freelist_count").get().freelist_count})`);
-    return expired + capped;
-  } catch { stats.errors++; return 0; }
+/** Writes everything captured so far. The promise resolves when the batch is stored (or dropped); on the
+ *  fallback path the write has already happened when this returns. Never rejects. */
+export function flush() {
+  clearTimeout(S.timer); S.timer = null;
+  if (workerMode()) return flushWorker().catch(() => { S.stats.errors++; });
+  flushInline();
+  return Promise.resolve();
 }
-/** Test helper: write the queue now. */
-export function flush() { if (queue.length) drain(); }
+async function flushWorker() {
+  while (S.seedWait.size) await Promise.allSettled([...S.seedWait.values()]);
+  for (const [file, ops] of takeBatches()) {
+    const bytes = ops.reduce((sum, op) => sum + (op.row ? op.row.text.length : 0), 0);
+    S.inflightBytes += bytes;
+    try { await rpc("write", { ops: ops.map(({ row, route }) => (row ? { row } : { route })) }, file); settled(ops, true); }
+    catch { S.stats.errors++; settled(ops, false); }
+    finally { S.inflightBytes -= bytes; }
+  }
+}
+// Fallback writer on this thread. The timers pass `limit`: a batch is then written a slice at a time, with
+// the event loop free in between, because one insert costs about a millisecond in a large store.
+function flushInline(limit = Infinity) {
+  for (const [key, jobs] of [...S.parked]) {
+    const { file, sessionId } = jobs[0];
+    let digests = [];
+    try { const h = inline(file); if (h) digests = store.digestsFor(h, sessionId); } catch { S.stats.errors++; }
+    seeded(key, sessionId, digests);
+  }
+  clearTimeout(S.timer); S.timer = null;
+  for (const [file, ops] of takeBatches(limit)) {
+    const h = inline(file);
+    if (!h) { settled(ops, false); continue; }
+    try { store.writeOps(h, ops); settled(ops, true); }
+    catch { S.stats.errors++; settled(ops, false); }
+  }
+  if (S.queue.length && !S.soon) { S.soon = true; setImmediate(() => { S.soon = false; flushInline(limit); }); }
+  if (S.inline && Date.now() - S.lastSweep > HOUR) setTimeout(sweepSlice, 0).unref();
+}
 
-// Words and word starts: "repeat this" matches both words in order; quotes stop FTS syntax injection.
-function ftsQuery(q) {
-  const words = q.normalize("NFKC").match(/[\p{L}\p{N}_]+/gu) || [];
-  return words.slice(0, 12).map((w, i, a) => `"${w}"${i === a.length - 1 ? "*" : ""}`).join(" ");
+/** Retention on this thread's connection, run to the end: a test helper and the fallback's manual sweep.
+ *  Returns the number of rows removed. */
+export function sweep(now = Date.now(), capBytes) {
+  S.lastSweep = Date.now();
+  if (!S.inline) return 0;
+  try { return store.sweep(S.inline, now, { capBytes }).removed; } catch { S.stats.errors++; return 0; }
 }
-const COLS = "m.id, m.ts, m.request_id AS requestId, m.session_id AS sessionId, m.model, m.provider, m.combo, m.account, m.client, m.role, m.kind, m.path, m.cut, m.hashes, m.tool";
-/** Search, newest first, 50 per page. Snippets only; full text comes from `message(id)`. */
-export function search({ q = "", sessionId = "", requestId = "", hash = "", from = 0, to = Date.now(), before = Infinity, limit = 50 } = {}) {
-  const d = open();
-  if (!d) return { rows: [], next: null, unavailable: true };
-  const where = ["m.ts >= ?", "m.ts <= ?"], args = [Math.max(from, Date.now() - TTL_MS), to];
-  if (Number.isFinite(before)) { where.push("m.id < ?"); args.push(before); }
-  if (sessionId) { where.push("m.session_id = ?"); args.push(sessionId); }
-  if (requestId) { where.push("m.request_id = ?"); args.push(requestId); }
-  if (hash) { where.push("(' ' || m.hashes || ' ') LIKE ?"); args.push(`% ${hash} %`); }
-  const fts = ftsQuery(q);
-  if (q && !fts) return { rows: [], next: null };
-  const sql = fts
-    ? `SELECT ${COLS}, snippet(messages_fts, 0, '\u0001', '\u0002', '…', 24) AS snip FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid WHERE messages_fts MATCH ? AND ${where.join(" AND ")} ORDER BY m.id DESC LIMIT ?`
-    : `SELECT ${COLS}, substr(m.text, 1, 240) AS snip FROM messages m WHERE ${where.join(" AND ")} ORDER BY m.id DESC LIMIT ?`;
-  const n = Math.min(Math.max(1, limit), 100);
-  const rows = d.prepare(sql).all(...(fts ? [fts] : []), ...args, n + 1);
-  const page = rows.slice(0, n);
-  return { rows: page, next: rows.length > n ? page.at(-1).id : null };
+/** Retention where the store lives (the writer thread when there is one). */
+export function sweepAsync(now = Date.now(), capBytes) {
+  if (!workerMode()) { inline(); return Promise.resolve(sweep(now, capBytes)); }
+  return rpc("sweep", { now, capBytes });
 }
-// Sessions view: one aggregate per stored session, newest first, paged by last_seen. Messages without a
-// session_id never appear here; they stay reachable only through Prompts and per-request links.
-// Unique finding values are folded from the per-message hash lists in JS: the lists are small.
-export function sessions({ q = "", client = "", provider = "", combo = "", hash = "", findings = null, from = 0, to = Date.now(), before = Infinity, limit = 50 } = {}) {
-  const d = open();
-  if (!d) return { rows: [], next: null, unavailable: true };
-  const lo = Math.max(from, Date.now() - TTL_MS);
-  // The ts pair feeds two ? pairs (CTE and outer WHERE), so it repeats in the args in that order.
-  const where = ["m.ts >= ?", "m.ts <= ?"], args = [lo, to, lo, to];
-  // HAVING placeholders come after the outer WHERE ones, and `before` feeds an HAVING ? only,
-  // so it is appended last.
-  if (client) { where.push("g.clients LIKE ?"); args.push(`%\u0001${client}\u0001%`); }
-  if (provider) { where.push("g.providers LIKE ?"); args.push(`%\u0001${provider}\u0001%`); }
-  if (combo) { where.push("EXISTS (SELECT 1 FROM messages f WHERE f.session_id = g.session_id AND f.combo LIKE ?)"); args.push(`${combo}%`); }
-  if (hash) { where.push("EXISTS (SELECT 1 FROM messages f WHERE f.session_id = g.session_id AND (' ' || f.hashes || ' ') LIKE ?)"); args.push(`% ${hash} %`); }
-  if (findings === true) where.push("EXISTS (SELECT 1 FROM messages f2 WHERE f2.session_id = g.session_id AND f2.hashes != '')");
-  if (findings === false) where.push("NOT EXISTS (SELECT 1 FROM messages f2 WHERE f2.session_id = g.session_id AND f2.hashes != '')");
-  if (q) where.push(`(g.session_id LIKE ? OR COALESCE(g.models,'') LIKE ? OR COALESCE(g.clients,'') LIKE ? OR COALESCE(g.providers,'') LIKE ? OR EXISTS (SELECT 1 FROM messages f3 WHERE f3.session_id = g.session_id AND COALESCE(f3.combo,'') LIKE ?))`);
-  if (q) args.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
-  if (Number.isFinite(before)) { where.push("g.last < ?"); args.push(before); }
-  const n = Math.min(Math.max(1, limit), 200);
-  const rows = d.prepare(`WITH g AS (
-      SELECT session_id, MIN(ts) AS first, MAX(ts) AS last, COUNT(*) AS messages,
-        COUNT(DISTINCT request_id) AS requests,
-        '\u0001' || COALESCE(GROUP_CONCAT(DISTINCT client), '') || '\u0001' AS clients,
-        '\u0001' || COALESCE(GROUP_CONCAT(DISTINCT provider), '') || '\u0001' AS providers,
-        '\u0001' || COALESCE(GROUP_CONCAT(DISTINCT model), '') || '\u0001' AS models
-      FROM messages WHERE ts >= ? AND ts <= ? GROUP BY session_id
-    ) SELECT g.session_id AS sessionId, g.first, g.last, g.messages, g.requests, g.clients, g.providers, g.models,
-      MAX(m.client) AS client, MAX(m.provider) AS provider, MAX(m.combo) AS combo, MAX(m.model) AS model,
-      MAX(m.hashes != '') AS hasFindings
-    FROM g JOIN messages m ON m.session_id = g.session_id
-    WHERE ${where.filter((w) => !w.startsWith("g.last")).join(" AND ")}
-    GROUP BY g.session_id HAVING (${where.filter((w) => w.startsWith("g.last")).join(" AND ") || "1=1"})
-    ORDER BY g.last DESC, g.first ASC, g.session_id ASC LIMIT ?`).all(...args, n + 1);
-  // Distinct finding hashes per page, folded in JS from the per-message hash lists: one query
-  // for the page instead of one per session.
-  const page = rows.slice(0, n);
-  const values = new Map();
-  if (page.length) {
-    const ph = page.map(() => "?").join(",");
-    for (const row of d.prepare(`SELECT session_id, hashes FROM messages WHERE hashes != '' AND session_id IN (${ph})`).all(...page.map((r) => r.sessionId)))
-      for (const h of row.hashes.split(" ")) { if (h) { values.set(row.session_id, (values.get(row.session_id) || new Set()).add(h)); } }
-  }
-  return { rows: page.map((r) => ({ ...r, values: values.get(r.sessionId)?.size || 0 })), next: rows.length > n ? rows[n - 1].last : null };
-}
-/** Full conversation for one session, oldest first: session metadata plus messages up to a byte cap
- *  (oldest kept), each with text and finding counts. Requests without a session never appear. */
-export function conversation({ sessionId, from = 0, to = Date.now(), cap = 800_000, after = 0 } = {}) {
-  const d = open();
-  if (!d) return { unavailable: true };
-  if (typeof sessionId !== "string" || !sessionId || sessionId.length > 200) return { error: "Invalid session id" };
-  const meta = d.prepare(`SELECT MIN(ts) AS first, MAX(ts) AS last FROM messages WHERE session_id = ? AND ts >= ? AND ts <= ?`).get(sessionId, Math.max(from, Date.now() - TTL_MS), to);
-  if (!meta?.first) return { notFound: true };
-  const list = d.prepare(`SELECT id, ts, request_id AS requestId, session_id AS sessionId, model, provider, combo, account, client, role, kind, path, tool, cut, length(text) AS len, hashes
-    FROM messages WHERE session_id = ? AND ts >= ? AND ts <= ? AND id > ? ORDER BY ts ASC, id ASC`)
-    .all(sessionId, Math.max(from, Date.now() - TTL_MS), to, after);
-  // Byte cap oldest-first: truncated tail is fetched later with `after`.
-  const bytes = { used: 0, over: [] }, rows = [];
-  const c = Math.max(Number(cap) || 800_000, 0);
-  for (const row of list) {
-    if (rows.length && bytes.used + row.len > c) { bytes.over.push(row); continue; }
-    bytes.used += row.len;
-    rows.push(row);
-  }
-  const ids = rows.map((r) => r.id);
-  const texts = new Map();
-  for (let i = 0; i < ids.length; i += 100) {
-    const chunk = ids.slice(i, i + 100);
-    const ph = chunk.map(() => "?").join(",");
-    for (const r of d.prepare(`SELECT id, text FROM messages WHERE id IN (${ph})`).all(...chunk)) texts.set(r.id, r.text);
-  }
-  // Distinct finding values in the whole session (even past the byte cap).
-  const allHashes = new Set();
-  for (const r of d.prepare("SELECT hashes FROM messages WHERE session_id = ? AND hashes != '' AND ts >= ? AND ts <= ?").all(sessionId, Math.max(from, Date.now() - TTL_MS), to))
-    for (const h of r.hashes.split(" ")) if (h) allHashes.add(h);
-  return {
-    sessionId, first: meta.first, last: meta.last, values: allHashes.size,
-    messages: {
-      rows: rows.map((r) => ({ ...r, text: texts.get(r.id) ?? "", values: r.hashes ? [...new Set(r.hashes.split(" "))].filter(Boolean) : [] })),
-      total: list.length, shown: rows.length, over: bytes.over.length,
-    },
-    requests: new Set(list.map((r) => r.requestId)).size,
-  };
-}
-export function message(id) {
-  const d = open();
-  if (!d) return null;
-  return d.prepare(`SELECT ${COLS}, m.text FROM messages m WHERE m.id = ? AND m.ts >= ?`).get(id, Date.now() - TTL_MS) || null;
-}
-/** Test helper. */
+
+// Synchronous reads on this thread: the fallback path and tests. The dashboard routes use the *Async forms.
+export function search(args) { return store.search(inline(), args); }
+export function sessions(args) { return store.sessions(inline(), args); }
+export function conversation(args) { return store.conversation(inline(), args); }
+export function message(id) { return store.message(inline(), id); }
+// Same results, read in the writer thread so a large session or a search never holds the gateway thread.
+const read = (name, sync) => (args) => (workerMode() ? rpc(name, args) : Promise.resolve().then(() => sync(args)));
+export const searchAsync = read("search", search);
+export const sessionsAsync = read("sessions", sessions);
+export const conversationAsync = read("conversation", conversation);
+export const messageAsync = read("message", message);
+
 /** Test helper: forget in-memory dedupe, as a restart does. */
-export function _forget() { seen.clear(); }
-export function _reset() { clearInterval(sweepTimer); sweepTimer = null; try { db?.close(); } catch {} db = null; failed = false; queue = []; queued = 0; draining = false; seen.clear(); pending.clear(); Object.assign(stats, { stored: 0, dropped: 0, unsafe: 0, errors: 0 }); }
+export function _forget() { S.seen.clear(); }
+/** Test helper: back to a cold start. Resolves when the writer thread, if any, has stopped. */
+export function _reset() {
+  clearTimeout(S.timer); clearInterval(S.sweepTimer);
+  store.closeDb(S.inline);
+  const w = S.worker;
+  S.worker = null;
+  for (const id of [...S.rpcs.keys()]) settle(id, new Error("prompt store reset"));
+  const { stats: counters } = S;
+  Object.assign(S, fresh(), { stats: Object.assign(counters, { stored: 0, dropped: 0, unsafe: 0, errors: 0 }) });
+  return w ? w.terminate().then(() => {}, () => {}) : Promise.resolve();
+}
