@@ -6,6 +6,7 @@ import { dirname, isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { performance } from "node:perf_hooks";
 import { clientOf } from "../spendClient.js";
+import { bump } from "../live/bus.js";
 import { capture as capturePrompts, collect as collectPrompts, stats as promptStats, cleanId, updateRouting as updatePromptRouting } from "./prompts.js";
 
 const since = new Date().toISOString();
@@ -27,7 +28,8 @@ function warn() {
 }
 function append(event) {
   const file = eventsFile();
-  return mkdir(dirname(file), { recursive: true, mode: 0o700 }).then(() => appendFile(file, `${JSON.stringify(event)}\n`, { mode: 0o600 }));
+  // The live bus tells open dashboards the log grew; it carries a counter, never event content.
+  return mkdir(dirname(file), { recursive: true, mode: 0o700 }).then(() => appendFile(file, `${JSON.stringify(event)}\n`, { mode: 0o600 })).then(() => { bump("pii"); });
 }
 function failure(stage) {
   errors++;
