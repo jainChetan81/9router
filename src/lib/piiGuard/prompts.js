@@ -6,12 +6,16 @@
 // Nothing here touches SQLite on the request path. `capture` masks and queues; the queue is written in one
 // transaction about once a second by a writer thread (promptWorker.mjs), which also answers the dashboard's
 // reads and runs retention. Without worker threads the same batches are written from a timer on this thread.
-// A record still queued when the process stops is lost: at most about a second of prompts.
+// On a clean shutdown the queue is written synchronously before the process exits (flushOnShutdown, run by
+// the database shutdown hooks), so a normal restart loses nothing. Only a crash loses what is still queued:
+// at most about a second of prompts.
+// Retention: 14 days, and a size cap of 512 MiB by default (PII_GUARD_PROMPTS_MAX_MB); see promptDb.mjs.
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Worker } from "node:worker_threads";
 import * as store from "./promptDb.mjs";
+import { onBeforeDbClose } from "../db/shutdownHooks.js";
 
 export const PROMPT_CAP = 1024 * 1024, TOOL_CAP = 128 * 1024, REQUEST_CAP = 4 * 1024 * 1024;
 // Queue bound is bytes; the message count only stops pathological bodies of tiny strings.
@@ -24,7 +28,7 @@ const INLINE_SLICE = 16, PARK_MAX = 500, CAPTURED_MAX = 5000, RPC_TIMEOUT_MS = 3
 function fresh() {
   return {
     stats: { stored: 0, dropped: 0, unsafe: 0, errors: 0 },
-    queue: [], rows: 0, queuedBytes: 0, inflightBytes: 0, timer: null, soon: false,
+    queue: [], rows: 0, queuedBytes: 0, inflightBytes: 0, inflight: new Set(), timer: null, soon: false,
     // Per-session message digests already stored, so a resent conversation stores only what is new.
     // Bounded (least recently used session goes first); a session missing here is seeded from the store.
     seen: new Map(), pending: new Map(),
@@ -357,24 +361,25 @@ async function flushWorker() {
   while (S.seedWait.size) await Promise.allSettled([...S.seedWait.values()]);
   for (const [file, ops] of takeBatches()) {
     const bytes = ops.reduce((sum, op) => sum + (op.row ? op.row.text.length : 0), 0);
-    S.inflightBytes += bytes;
+    const sent = { file, ops };
+    S.inflightBytes += bytes; S.inflight.add(sent);
     try { await rpc("write", { ops: ops.map(({ row, route }) => (row ? { row } : { route })) }, file); settled(ops, true); }
     catch { S.stats.errors++; settled(ops, false); }
-    finally { S.inflightBytes -= bytes; }
+    finally { S.inflightBytes -= bytes; S.inflight.delete(sent); }
   }
 }
 // Fallback writer on this thread. The timers pass `limit`: a batch is then written a slice at a time, with
 // the event loop free in between, because one insert costs about a millisecond in a large store.
-function flushInline(limit = Infinity) {
+function flushInline(limit = Infinity, open = inline) {
   for (const [key, jobs] of [...S.parked]) {
     const { file, sessionId } = jobs[0];
     let digests = [];
-    try { const h = inline(file); if (h) digests = store.digestsFor(h, sessionId); } catch { S.stats.errors++; }
+    try { const h = open(file); if (h) digests = store.digestsFor(h, sessionId); } catch { S.stats.errors++; }
     seeded(key, sessionId, digests);
   }
   clearTimeout(S.timer); S.timer = null;
   for (const [file, ops] of takeBatches(limit)) {
-    const h = inline(file);
+    const h = open(file);
     if (!h) { settled(ops, false); continue; }
     try { store.writeOps(h, ops); settled(ops, true); }
     catch { S.stats.errors++; settled(ops, false); }
@@ -382,6 +387,33 @@ function flushInline(limit = Infinity) {
   if (S.queue.length && !S.soon) { S.soon = true; setImmediate(() => { S.soon = false; flushInline(limit); }); }
   if (S.inline && Date.now() - S.lastSweep > HOUR) setTimeout(sweepSlice, 0).unref();
 }
+
+/** Clean shutdown: writes everything still queued, synchronously, before the process exits. Registered on the
+ *  database shutdown hooks, so it runs on SIGINT/SIGTERM/exit. Never throws.
+ *  With a writer thread the process would exit before the thread is asked, so the rows go through a
+ *  connection on this thread (it waits up to 2 s for the writer's lock). A batch already sent to the writer
+ *  may not land either: its session rows are written again here, which the unique index makes a no-op when
+ *  the writer got there first. Rows without a session have no such guard and are left to the writer. */
+export function flushOnShutdown() {
+  try {
+    if (!S.queue.length && !S.parked.size && !S.inflight.size) return;
+    if (!workerMode()) return void flushInline();
+    const handles = new Map();
+    const open = (file) => {
+      if (!handles.has(file)) handles.set(file, store.openDb(file, { busyTimeout: 2000 }));
+      return handles.get(file);
+    };
+    try {
+      for (const { file, ops } of S.inflight) {
+        const again = ops.filter((op) => op.route || op.row?.sessionId);
+        const h = again.length ? open(file) : null;
+        if (h) try { store.writeOps(h, again); } catch { S.stats.errors++; }
+      }
+      flushInline(Infinity, open);
+    } finally { for (const h of handles.values()) store.closeDb(h); }
+  } catch { S.stats.errors++; }
+}
+onBeforeDbClose("piiPrompts", flushOnShutdown);
 
 /** Retention on this thread's connection, run to the end: a test helper and the fallback's manual sweep.
  *  Returns the number of rows removed. */

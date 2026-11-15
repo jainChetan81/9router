@@ -163,3 +163,68 @@ describeIfLibrary("prompt store writer thread", () => {
     expect((await P.searchAsync({})).rows).toEqual([]);
   });
 });
+
+describe("prompt store size cap", () => {
+  it("defaults to 512 MiB and follows PII_GUARD_PROMPTS_MAX_MB", () => {
+    expect(D.storeCapBytes({})).toBe(512 * 1024 * 1024);
+    expect(D.storeCapBytes({ PII_GUARD_PROMPTS_MAX_MB: "1024" })).toBe(1024 * 1024 * 1024);
+    expect(D.storeCapBytes({ PII_GUARD_PROMPTS_MAX_MB: "64.5" })).toBe(Math.floor(64.5 * 1024 * 1024));
+    for (const bad of ["", "abc", "0", "-5", "NaN"]) expect(D.storeCapBytes({ PII_GUARD_PROMPTS_MAX_MB: bad })).toBe(512 * 1024 * 1024);
+  });
+});
+
+describeIfLibrary("prompt store size cap from the environment", () => {
+  it("a sweep without an explicit cap uses PII_GUARD_PROMPTS_MAX_MB", () => {
+    const h = D.openDb(file);
+    const big = "x".repeat(64 * 1024);
+    D.writeOps(h, Array.from({ length: 40 }, (_, i) => ({ row: { ts: Date.now() + i, requestId: `r${i}`, sessionId: "cap", model: null, provider: null, combo: null, account: null, client: null, role: "user", kind: "text", path: "p", text: big, cut: 0, hashes: "", digest: `d${i}`, tool: null } })));
+    expect(D.sweep(h).removed).toBe(0); // 2.5 MiB is far under the default
+    process.env.PII_GUARD_PROMPTS_MAX_MB = "1";
+    try {
+      expect(D.sweep(h).removed).toBeGreaterThan(0);
+      expect(D.textBytes(h)).toBeLessThanOrEqual(1024 * 1024);
+    } finally { delete process.env.PII_GUARD_PROMPTS_MAX_MB; }
+    D.closeDb(h);
+  });
+});
+
+describeIfLibrary("prompt store shutdown flush", () => {
+  const stored = () => {
+    const h = D.openDb(file);
+    const rows = h.db.prepare("SELECT request_id AS r, text FROM messages ORDER BY id").all().map((x) => `${x.r}:${x.text}`);
+    D.closeDb(h);
+    return rows;
+  };
+
+  it("the database shutdown hooks write the queue on the fallback path", async () => {
+    const { runBeforeDbClose } = await import("../../src/lib/db/shutdownHooks.js");
+    capture(["no session"], null, "s1");
+    capture(["with session"], "shut-a", "s2");
+    expect(await exists(file)).toBe(false);
+    runBeforeDbClose();
+    expect(stored().sort()).toEqual(["s1:no session", "s2:with session"]);
+    // A second run (beforeExit, then exit) has nothing left to write.
+    runBeforeDbClose();
+    expect(stored()).toHaveLength(2);
+  });
+
+  it("writes queued and parked rows synchronously when a writer thread is in use", async () => {
+    process.env.PII_GUARD_PROMPTS_WORKER = "on";
+    capture(["queued row"], null, "w1");
+    capture(["parked row"], "shut-b", "w2"); // waits for the writer thread to load the session
+    P.flushOnShutdown();
+    expect(stored().sort()).toEqual(["w1:queued row", "w2:parked row"]);
+  });
+
+  it("a batch already sent to the writer thread is not stored twice", async () => {
+    process.env.PII_GUARD_PROMPTS_WORKER = "on";
+    capture(["warm up"], "shut-c", "w0");
+    await P.flush();
+    capture(["in flight"], "shut-c", "w1");
+    const sent = P.flush();
+    await new Promise((r) => setImmediate(r)); // the batch is now with the writer thread
+    P.flushOnShutdown();
+    await sent;
+    expect(stored().filter((r) => r === "w1:in flight")).toHaveLength(1);
+  });
+});

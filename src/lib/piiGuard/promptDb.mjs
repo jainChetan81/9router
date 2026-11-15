@@ -5,7 +5,14 @@ import { dirname } from "node:path";
 
 export const TTL_MS = 14 * 864e5;
 // Cap on the database file's used pages (text + indexes + FTS), and on the stored text bytes.
-export const STORE_BYTES = 200 * 1024 * 1024;
+// 512 MiB holds the full 14-day TTL at the rate seen in production (about 40 MiB a day);
+// PII_GUARD_PROMPTS_MAX_MB overrides it. Read on every sweep, so the writer thread and the
+// fallback agree and a test can change it.
+export const DEFAULT_STORE_MB = 512;
+export function storeCapBytes(env = process.env) {
+  const mb = Number(env.PII_GUARD_PROMPTS_MAX_MB);
+  return Math.floor((Number.isFinite(mb) && mb >= 1 ? mb : DEFAULT_STORE_MB) * 1024 * 1024);
+}
 // Eviction stops this far under the cap, so a store at the cap does not evict on every batch.
 const CAP_SLACK = 0.95;
 const SWEEP_CHUNK = 400;
@@ -133,7 +140,7 @@ function deleteOldest(h, limit, before) {
 /** Retention: rows past the TTL go first, then the oldest rows until the store is back under its cap.
  *  Works in chunks from the stored byte counter and the page counts; it never scans the table.
  *  `budgetMs` and `vacuumPages` bound one call; `more` is true when another call has work left. */
-export function sweep(h, now = Date.now(), { capBytes = STORE_BYTES, budgetMs = Infinity, chunk = SWEEP_CHUNK, vacuumPages = Infinity } = {}) {
+export function sweep(h, now = Date.now(), { capBytes = storeCapBytes(), budgetMs = Infinity, chunk = SWEEP_CHUNK, vacuumPages = Infinity } = {}) {
   const started = Date.now(), spent = () => Date.now() - started >= budgetMs;
   let removed = 0, more = false;
   for (;;) {
