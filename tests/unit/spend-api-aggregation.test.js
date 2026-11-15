@@ -205,18 +205,33 @@ describe("spend aggregation SQL (N6/B10)", () => {
     vi.doUnmock("@/lib/spend/pool.js");
   }, 60_000);
 
-  it("the ETag changes with the rolling time bucket for Today and 24h, not 7D", async () => {
-    const { etagBucketFor } = await import("../../src/app/api/spend/route.js");
-    const now = Date.parse("2026-11-09T21:00:00.000Z");
-    const { istMidnightMs } = await import("../../src/lib/spend/time.js");
-    const today = etagBucketFor({ preset: "Today" }, now);
-    expect(today).toBe(istMidnightMs(now));
-    const h24 = etagBucketFor({ preset: "24h" }, now);
-    expect(h24).toBe(Math.floor(now / 36e5) * 36e5);
-    expect(etagBucketFor({ preset: "7D" }, now)).toBe("");
-    // Rollover changes the bucket.
-    expect(etagBucketFor({ preset: "24h" }, now + 36e5)).not.toBe(h24);
-  });
+  it("passes the sync signal to the aggregate, and only when the header is set", async () => {
+    const seen = [];
+    const capture = { run: async (_db, _method, args, opts) => { seen.push({ skipCache: args.skipCache, key: opts.key }); return { totals: {} }; } };
+    vi.doMock("@/lib/spend/pool.js", () => ({ spendPool: capture }));
+    const m = await import("../../src/app/api/spend/route.js?v=sync");
+    const url = "http://x/api/spend?preset=7D";
+
+    const plain = await m.GET(new Request(url));
+    const synced = await m.GET(new Request(url, { headers: { "x-9r-sync": "1" } }));
+    expect(plain.status).toBe(200);
+    expect(synced.status).toBe(200);
+    expect(seen.map((s) => s.skipCache)).toEqual([false, true]);
+    // A sync read never joins a cached read that is in flight.
+    expect(seen[0].key).not.toBe(seen[1].key);
+    vi.doUnmock("@/lib/spend/pool.js");
+  }, 60_000);
+
+  it("sends no ETag and never answers 304", async () => {
+    const m = await import("../../src/app/api/spend/route.js");
+    const first = await m.GET(new Request("http://x/api/spend?preset=7D"));
+    expect(first.status).toBe(200);
+    expect(first.headers.get("etag")).toBeNull();
+    expect(first.headers.get("cache-control")).toBe("no-store");
+    const again = await m.GET(new Request("http://x/api/spend?preset=7D", { headers: { "if-none-match": "*" } }));
+    expect(again.status).toBe(200);
+    expect(m.etagBucketFor).toBeUndefined();
+  }, 60_000);
 
   it("rejects invalid fee payloads on PATCH /api/spend (S1 server side)", async () => {
     // Route handler test would need Next runtime; assert the module's guard instead.

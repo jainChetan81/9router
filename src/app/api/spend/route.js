@@ -1,12 +1,11 @@
 import { NextResponse } from "next/server";
-import { createHash } from "node:crypto";
 import { getAdapter } from "@/lib/db/driver.js";
 import { DATA_FILE } from "@/lib/db/paths.js";
 import { spendPool } from "@/lib/spend/pool.js";
 import { getSettings, updateSettings, getPricingForModel } from "@/lib/localDb";
 import { SUBS, aggregateSpend, invalidateSpendCache } from "@/lib/spend/aggregate.js";
-import { HOUR_MS, istMidnightMs } from "@/lib/spend/time.js";
 import { version as usageVersion } from "@/lib/live/bus.js";
+import { isSyncRequest } from "@/lib/dashboardSync.js";
 
 export const dynamic = "force-dynamic";
 
@@ -18,7 +17,9 @@ export const dynamic = "force-dynamic";
 async function aggregateOffThread(db, args) {
   try {
     return await spendPool.run(db, "aggregate", args, {
-      key: JSON.stringify([args.params, args.fees, usageVersion("usage")]),
+      // Identical reads in flight share one job; a sync read never joins a
+      // cached one.
+      key: JSON.stringify([args.params, args.fees, usageVersion("usage"), !!args.skipCache]),
     });
   } catch (error) {
     if (error?.code === "busy") throw error;
@@ -26,15 +27,6 @@ async function aggregateOffThread(db, args) {
     // run inline so the request still answers.
     return aggregateSpend(db, args);
   }
-}
-
-// Current time bucket for rolling presets, so a 304 can never outlive the
-// window it names. Today rolls at IST midnight, 24h at the top of the hour.
-export function etagBucketFor(params, now) {
-  const preset = (typeof params?.get === "function" ? params.get("preset") : params?.preset) || "30D";
-  if (preset === "Today") return istMidnightMs(now);
-  if (preset === "24h") return Math.floor(now / HOUR_MS) * HOUR_MS;
-  return "";
 }
 
 // What-if targets: every provider/model pair seen in the last 60 days, with
@@ -72,15 +64,14 @@ export async function GET(request) {
     const params = new URL(request.url).searchParams;
     const settings = await getSettings();
     const fees = settings.spendFees || {};
-    const v = usageVersion("usage");
-    const bucket = etagBucketFor(params, Date.now());
-    const etag = `"${createHash("sha1").update(`${v}|${params.toString()}|${JSON.stringify(fees)}|${bucket}`).digest("hex").slice(0, 20)}"`;
-    if (request.headers.get("if-none-match") === etag) {
-      return new NextResponse(null, { status: 304, headers: { ETag: etag, "Cache-Control": "no-store" } });
-    }
-    const payload = await aggregateOffThread(db, { params: Object.fromEntries(params), now: Date.now(), fees });
+    // "Sync now" reads fresh: no body cache and no throttle on today's slice.
+    // Closed IST days and the what-if price list stay cached.
+    const sync = isSyncRequest(request);
+    const payload = await aggregateOffThread(db, { params: Object.fromEntries(params), now: Date.now(), fees, skipCache: sync });
     const whatIfTargets = await resolveWhatIfTargets(db);
-    return NextResponse.json({ ...payload, whatIfTargets }, { headers: { ETag: etag, "Cache-Control": "no-store" } });
+    // No ETag: the page keeps its own copy (clientCache) and never sends a
+    // conditional request.
+    return NextResponse.json({ ...payload, whatIfTargets }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     if (error?.code === "busy") {
       return NextResponse.json({ error: "busy" }, { status: 503, headers: { "Retry-After": "1" } });

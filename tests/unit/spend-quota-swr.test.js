@@ -144,3 +144,66 @@ describe("quota route SWR resilience", () => {
     await new Promise((r) => setTimeout(r, 20));
   }, 30_000);
 });
+
+describe("quota route: Sync now (x-9r-sync)", () => {
+  let mod;
+  const plain = () => new Request("http://x/api/spend/quota");
+  const sync = () => new Request("http://x/api/spend/quota", { headers: { "x-9r-sync": "1" } });
+  beforeEach(async () => {
+    vi.resetModules();
+    usageNow = 10;
+    conns.length = 0;
+    conns.push(CONN);
+    mod = await import("../../src/app/api/spend/quota/route.js");
+  });
+
+  it("a sync request waits for a fresh snapshot; a plain one gets the cached snapshot", async () => {
+    await mod.GET(plain());
+    usageNow = 50;
+
+    const cachedBody = await (await mod.GET(plain())).json();
+    expect(cachedBody.rows[0].usedPct).toBe(10);
+
+    const fresh = await mod.GET(sync());
+    const freshBody = await fresh.json();
+    expect(freshBody.rows[0].usedPct).toBe(50);
+    expect(freshBody.refreshing).toBeUndefined();
+    expect(freshBody.asOf).toBeGreaterThanOrEqual(cachedBody.asOf);
+
+    // The fresh snapshot is now what everyone else gets.
+    expect((await (await mod.GET(plain())).json()).rows[0].usedPct).toBe(50);
+  }, 30_000);
+
+  it("a sync request never gets the stale snapshot with refreshing: true", async () => {
+    await mod.GET(plain());
+    const realNow = Date.now;
+    Date.now = () => realNow() + 61_000;
+    try {
+      usageNow = 70;
+      const body = await (await mod.GET(sync())).json();
+      expect(body.rows[0].usedPct).toBe(70);
+      expect(body.refreshing).toBeUndefined();
+    } finally { Date.now = realNow; }
+  }, 30_000);
+
+  it("answers 502 when the sync refresh fails, and keeps the old snapshot for others", async () => {
+    await mod.GET(plain());
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { getProviderConnections } = await import("@/lib/localDb");
+      getProviderConnections.mockRejectedValueOnce(new Error("connections store unavailable"));
+      const failed = await mod.GET(sync());
+      expect(failed.status).toBe(502);
+      expect((await failed.json()).error).toBeTruthy();
+      expect((await (await mod.GET(plain())).json()).rows[0].usedPct).toBe(10);
+    } finally { spy.mockRestore(); }
+  }, 30_000);
+
+  it("sends no ETag and never answers 304", async () => {
+    const first = await mod.GET(plain());
+    expect(first.headers.get("etag")).toBeNull();
+    expect(first.headers.get("cache-control")).toBe("no-store");
+    const again = await mod.GET(new Request("http://x/api/spend/quota", { headers: { "if-none-match": '"q0-none"' } }));
+    expect(again.status).toBe(200);
+  }, 30_000);
+});
