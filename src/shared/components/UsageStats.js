@@ -4,6 +4,7 @@ import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { FREE_PROVIDERS, AI_PROVIDERS } from "@/shared/constants/providers";
 import { useLiveTopic } from "@/shared/hooks/useLive.js";
+import { createLatestRequest } from "@/shared/utils/latestRequest.js";
 
 // Keep providers without serviceKinds (default LLM) or with "llm" in serviceKinds
 function isLLMProvider(id) {
@@ -276,7 +277,11 @@ export default function UsageStats({ period: periodProp, setPeriod: setPeriodPro
       .catch(() => {});
   }, []);
 
-  // Fetch filtered stats via REST when period changes
+  // Fetch filtered stats via REST when period changes. Only the latest request counts: a new one aborts
+  // the one in flight, and a late answer for a previous period is ignored.
+  const statsRequest = useRef(null);
+  if (!statsRequest.current) statsRequest.current = createLatestRequest();
+  useEffect(() => () => statsRequest.current.cancel(), []);
   const fetchStats = useCallback(() => {
     // First load: show full spinner; subsequent: show subtle fetching indicator
     if (isInitialLoad.current) {
@@ -286,19 +291,15 @@ export default function UsageStats({ period: periodProp, setPeriod: setPeriodPro
       setFetching(true);
     }
 
-    fetch(`/api/usage/stats?period=${period}`)
-      .then((r) => r.ok ? r.json() : null)
-      .then((data) => {
-        if (data) {
-          hasLoadedStats.current = true;
-          setStats((prev) => ({ ...prev, ...data }));
-        }
-      })
-      .catch(() => {})
-      .finally(() => {
-        setLoading(false);
-        setFetching(false);
-      });
+    statsRequest.current.json(`/api/usage/stats?period=${period}`).then(({ current, data }) => {
+      if (!current) return; // a newer request owns the state and the spinners
+      if (data) {
+        hasLoadedStats.current = true;
+        setStats((prev) => ({ ...prev, ...data }));
+      }
+      setLoading(false);
+      setFetching(false);
+    });
   }, [period]);
 
   useEffect(() => {
@@ -342,7 +343,8 @@ export default function UsageStats({ period: periodProp, setPeriod: setPeriodPro
 
     attachHandlers();
 
-    // Close the stream in hidden tabs; reopen + refetch stats when visible again
+    // Close the stream in hidden tabs; reopen when visible again. The stats are not fetched here: the live
+    // tick below moves when the tab is shown, and that is the one refetch.
     const onVisibility = () => {
       if (typeof document === "undefined") return;
       if (document.hidden) {
@@ -352,7 +354,6 @@ export default function UsageStats({ period: periodProp, setPeriod: setPeriodPro
           es = new EventSource("/api/usage/stream");
           attachHandlers();
         }
-        fetchStats();
       }
     };
 
@@ -362,14 +363,15 @@ export default function UsageStats({ period: periodProp, setPeriod: setPeriodPro
       document?.removeEventListener?.("visibilitychange", onVisibility);
       if (es) es.close();
     };
-  }, [fetchStats]);
+    // Independent of the period: changing it must not close and reopen the stream.
+  }, []);
 
-  // Refetch full stats when the usage topic version bumps (covers reopens while hidden → visible)
+  // Refetch full stats when the usage tick moves (a usage event, the tab shown again, a reconnect).
+  // The current fetch is read from a ref, so this runs on a tick only, not on a period change.
+  const fetchStatsRef = useRef(fetchStats);
+  useEffect(() => { fetchStatsRef.current = fetchStats; });
   useEffect(() => {
-    if (usageLiveVersion > 0 && hasLoadedStats.current) {
-      fetchStats();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    if (usageLiveVersion > 0 && hasLoadedStats.current) fetchStatsRef.current();
   }, [usageLiveVersion]);
 
   const toggleSort = useCallback((tableType, field) => {
