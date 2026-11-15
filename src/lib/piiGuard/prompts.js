@@ -392,8 +392,8 @@ function flushInline(limit = Infinity, open = inline) {
  *  database shutdown hooks, so it runs on SIGINT/SIGTERM/exit. Never throws.
  *  With a writer thread the process would exit before the thread is asked, so the rows go through a
  *  connection on this thread (it waits up to 2 s for the writer's lock). A batch already sent to the writer
- *  may not land either: its session rows are written again here, which the unique index makes a no-op when
- *  the writer got there first. Rows without a session have no such guard and are left to the writer. */
+ *  may not land either: it is written again here, which the unique index makes a no-op when the writer got
+ *  there first. */
 export function flushOnShutdown() {
   try {
     if (!S.queue.length && !S.parked.size && !S.inflight.size) return;
@@ -405,9 +405,8 @@ export function flushOnShutdown() {
     };
     try {
       for (const { file, ops } of S.inflight) {
-        const again = ops.filter((op) => op.route || op.row?.sessionId);
-        const h = again.length ? open(file) : null;
-        if (h) try { store.writeOps(h, again); } catch { S.stats.errors++; }
+        const h = open(file);
+        if (h) try { store.writeOps(h, ops); } catch { S.stats.errors++; }
       }
       flushInline(Infinity, open);
     } finally { for (const h of handles.values()) store.closeDb(h); }

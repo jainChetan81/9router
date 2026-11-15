@@ -86,13 +86,49 @@ describeIfLibrary("prompt store insert idempotency", () => {
     // Simulate a database from an even older build: no unique index yet and a
     // duplicate row inside. Drop the index, duplicate a row, then reopen.
     const raw = D.openDb(file);
-    raw.db.exec("DROP INDEX IF EXISTS messages_dedupe");
+    raw.db.exec("DROP INDEX IF EXISTS messages_dedupe2");
     raw.db.exec(`INSERT INTO messages (ts, request_id, session_id, role, kind, path, text, cut, hashes, digest)
       SELECT ts, request_id, session_id, role, kind, path, text, cut, hashes, digest FROM messages LIMIT 1`);
     D.closeDb(raw);
     const h2 = D.openDb(file); // runs the dedupe-then-index migration
     expect(h2.db.prepare("SELECT COUNT(*) AS n FROM messages").get().n).toBe(3);
     D.closeDb(h2);
+  });
+
+  it("rows without a session are idempotent too", () => {
+    const h = D.openDb(file);
+    const ops = [1, 2, 3].map((i) => ({ row: row(i, null) }));
+    expect(D.writeOps(h, ops)).toMatchObject({ stored: 3 });
+    expect(D.writeOps(h, ops)).toMatchObject({ stored: 0 });
+    // The same digest under another request is a different message.
+    expect(D.writeOps(h, [{ row: { ...row(1, null), requestId: "other" } }])).toMatchObject({ stored: 1 });
+    expect(h.db.prepare("SELECT COUNT(*) AS n FROM messages").get().n).toBe(4);
+    expect(D.textBytes(h)).toBe(sum2(h));
+    D.closeDb(h);
+  });
+
+  it("migrates a store with the old index: sessionless duplicates go, the byte counter stays exact", () => {
+    const h = D.openDb(file);
+    D.writeOps(h, [1, 2, 3].map((i) => ({ row: row(i, null) })));
+    D.writeOps(h, [4, 5].map((i) => ({ row: row(i) })));
+    // The store as the previous build left it: the old index, under which a NULL session never collides.
+    h.db.exec("DROP INDEX messages_dedupe2; CREATE UNIQUE INDEX messages_dedupe ON messages(session_id, request_id, path, digest);");
+    expect(D.writeOps(h, [1, 2].map((i) => ({ row: row(i, null) })))).toMatchObject({ stored: 2 }); // the bug
+    expect(h.db.prepare("SELECT COUNT(*) AS n FROM messages").get().n).toBe(7);
+    D.closeDb(h);
+    const h2 = D.openDb(file);
+    const indexes = h2.db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'messages_dedupe%'").all().map((x) => x.name);
+    expect(indexes).toEqual(["messages_dedupe2"]);
+    expect(h2.db.prepare("SELECT COUNT(*) AS n FROM messages").get().n).toBe(5);
+    expect(D.textBytes(h2)).toBe(sum2(h2));
+    // Full-text search still matches the rows that stayed, once each.
+    expect(D.search(h2, { q: "row", to: Date.now() + 1000 }).rows).toHaveLength(5);
+    expect(D.writeOps(h2, [1, 2, 3].map((i) => ({ row: row(i, null) })))).toMatchObject({ stored: 0 });
+    D.closeDb(h2);
+    // A second open has nothing to migrate.
+    const h3 = D.openDb(file);
+    expect(h3.db.prepare("SELECT COUNT(*) AS n FROM messages").get().n).toBe(5);
+    D.closeDb(h3);
   });
 });
 

@@ -23,6 +23,35 @@ const SWEEP_CHUNK = 400;
 const PRAGMAS = (busy) => `PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA secure_delete=ON; PRAGMA busy_timeout=${busy}; PRAGMA journal_size_limit=16777216;`;
 const REQUIRED = ["provider", "combo", "account", "tool"];
 
+// Idempotent inserts: a digest identifies one message of a request, in a session or without one. After an
+// RPC timeout the writer may still store a batch that is then sent again, and the shutdown flush rewrites
+// batches the writer may already hold, so writing a row twice must store it once.
+// A plain UNIQUE index treats every NULL session_id as distinct, so rows without a session were never
+// deduplicated; the index is on COALESCE(session_id, '') instead ('' is never stored as a session id).
+// Runs once per database: remove existing duplicates, create the new index, drop the old one, in one
+// transaction, so a crash or a lock leaves the old state and the next open tries again.
+const DEDUPE_INDEX = "messages_dedupe2";
+function migrateDedupe(db) {
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(DEDUPE_INDEX)) return;
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const removed = Number(db.prepare(`DELETE FROM messages WHERE digest IS NOT NULL AND rowid NOT IN (
+        SELECT MIN(rowid) FROM messages WHERE digest IS NOT NULL GROUP BY COALESCE(session_id, ''), request_id, path, digest)`).run().changes);
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ${DEDUPE_INDEX} ON messages(COALESCE(session_id, ''), request_id, path, digest);
+      DROP INDEX IF EXISTS messages_dedupe;`);
+    // The byte counter (when it exists already) must not count the rows just removed.
+    if (removed) db.exec("UPDATE meta SET value = (SELECT COALESCE(SUM(length(CAST(text AS BLOB))), 0) FROM messages) WHERE key = 'text_bytes'");
+    db.exec("COMMIT");
+  } catch (e) { try { db.exec("ROLLBACK"); } catch {} throw e; }
+}
+
+// A failed open (a lock held by another process during a migration, a full disk) is tried again after
+// 30 s, then 2 min, then every 10 min: one bad moment must not keep the store off until a restart.
+const OPEN_RETRY_MS = [30_000, 120_000, 600_000];
+export function openRetryMs(failures) {
+  return OPEN_RETRY_MS[Math.min(Math.max(1, failures), OPEN_RETRY_MS.length) - 1];
+}
+
 /** Opens (and migrates) the store. Returns `{ db, file }` or null when it cannot be used. */
 export function openDb(file, { busyTimeout = 0 } = {}) {
   let db = null;
@@ -47,14 +76,7 @@ export function openDb(file, { busyTimeout = 0 } = {}) {
       CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text); END;
       CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.id, old.text); END;
       CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);`);
-    // Idempotent inserts: a digest identifies one message of a session. After
-    // an RPC timeout the worker may still have written the batch before the
-    // late retry arrives, so re-running it must not duplicate rows.
-    // Additive and crash-safe for an existing live database: deduplicate any
-    // existing digest pairs first, then create the unique index.
-    db.exec(`DELETE FROM messages WHERE digest IS NOT NULL AND rowid NOT IN (
-        SELECT MIN(rowid) FROM messages WHERE digest IS NOT NULL GROUP BY session_id, request_id, path, digest);`);
-    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS messages_dedupe ON messages(session_id, request_id, path, digest);`);
+    migrateDedupe(db);
     // Migration for rows a schema without the routing columns created: add them, old rows stay NULL.
     // A lock or a lost race against another opener retries a few times; missing columns mean the
     // connection is not used (prompts stay off) rather than INSERTs failing on every row.
@@ -94,8 +116,8 @@ export function usedBytes(h) {
 }
 
 /** One transaction for a whole batch. `ops` keeps request order: { row } inserts, { route } updates a request's rows.
- *  Inserts are idempotent on (session_id, request_id, path, digest): a batch a timed-out call retries after the
- *  worker already wrote it inserts nothing the second time. */
+ *  Inserts are idempotent on (session_id or '', request_id, path, digest): a batch written a second time
+ *  (the shutdown flush, a retry) inserts nothing. */
 export function writeOps(h, ops) {
   const d = h.db;
   const ins = d.prepare("INSERT OR IGNORE INTO messages (ts, request_id, session_id, model, provider, combo, account, client, role, kind, path, text, cut, hashes, digest, tool) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
