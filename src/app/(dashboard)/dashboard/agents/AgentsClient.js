@@ -8,24 +8,38 @@ import "../spend/spend.css";
 import "../spend/shared-page.css";
 import "./agents.css";
 import RefreshBar from "../spend/RefreshBar";
-import SyncButton from "../spend/SyncButton";
-import useAutoSync from "../spend/useAutoSync";
+import { AgentsSyncControl, Freshness } from "./AgentsSync";
+import { createRefetcher, createTrailingPoller, autoAllowed, liveAutoAllowed, rangeNeeds, LIVE_THROTTLE_MS, RANGE_THROTTLE_MS, OVERRIDES_GAP_MS } from "./liveSync";
+import { useLiveTopic } from "@/shared/hooks/useLive";
+import { createEtagFetcher } from "./etagFetch";
 import { cacheInvalidate } from "@/lib/clientCache";
 import { cacheGet, cacheSet, isFresh } from "@/lib/clientCache";
 
 const RANGE_TTL = 5 * 60_000;
 
 let detailRequestSequence = 0;
+// Sequence per session so a finished fetch does not overwrite a newer one.
+// Bounded: oldest entry goes once the cap is reached (only in-flight fetches
+// read it, so evicting stale ids is safe).
 const overrideRequestIds = new Map();
-
-async function getJson(url) {
-  const res = await fetch(url, { cache: "no-store" });
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error || res.statusText);
-  return body;
+const OVERRIDE_IDS_MAX = 200;
+function nextOverrideRequestId(sid) {
+  if (overrideRequestIds.size >= OVERRIDE_IDS_MAX && !overrideRequestIds.has(sid)) {
+    overrideRequestIds.delete(overrideRequestIds.keys().next().value);
+  }
+  const requestId = (overrideRequestIds.get(sid) || 0) + 1;
+  overrideRequestIds.set(sid, requestId);
+  return requestId;
 }
 
-// The live feed polls every 2 seconds. Tool telemetry loads on range changes.
+// Last answer per URL with its ETag, 304 reuse, the sync signal and the
+// trailing refetch after a server floor window: see etagFetch.js.
+const { getJson, cancelRetries } = createEtagFetcher();
+
+// Live data is pushed: the "agents" and "usage" live topics tell the page when
+// to refetch /api/agents/live (at most every 2 s, Live tab only). Sessions,
+// roles and tools load when their tab is open. The sync control is the
+// fallback timer (60 s unless another interval is saved) and "Sync now".
 export default function AgentsClient() {
   const [range, setRange] = useState({ preset: "7D" });
   const [live, setLive] = useState(null);
@@ -48,14 +62,17 @@ export default function AgentsClient() {
   const [retryRouting, setRetryRouting] = useState(null);
   const [mode, setMode] = useState("loading");
   const [errorText, setErrorText] = useState("");
-  const [ui, setUi] = useState({ tab: "live", paused: false, ago: 0, q: "", fClient: "", fRole: "", sel: null, exp: {}, focus: null, hov: null, pick: null, zoom: null, gOff: 0, drawer: null, drawerMode: "routing", conflict: null });
+  // Last successful fetch and latest failure per data kind, for the freshness line.
+  const [feed, setFeed] = useState({});
+  const markFeed = useCallback((kind, ok, at = Date.now()) => setFeed((old) => ({ ...old, [kind]: ok ? { okAt: at, failed: false } : { okAt: old[kind]?.okAt ?? null, failed: true } })), []);
+  const [ui, setUi] = useState({ tab: "live", paused: false, q: "", fClient: "", fRole: "", sel: null, exp: {}, focus: null, hov: null, pick: null, zoom: null, gOff: 0, drawer: null, drawerMode: "routing", conflict: null });
   const set = useCallback((p) => setUi((u) => { const next = typeof p === "function" ? p(u) : p; if (next === u) return u; for (const k in next) if (!Object.is(next[k], u[k])) return { ...u, ...next }; return u; }), []);
   const closeDrawer = useCallback(() => { setDraft({}); setCf(false); set({ drawer: null, conflict: null }); }, [set]);
   const [theme, setTheme] = useState("light");
   const [vw, setVw] = useState(1440);
   const [tabsAtEnd, setTabsAtEnd] = useState(true);
   const tabsScrollRef = useRef(null);
-  const [tick, setTick] = useState(0); // bump to force live + range + detail reloads
+  const [tick, setTick] = useState(0); // bump to reload the selected session's detail
 
   useEffect(() => {
     // Combo and model lists change rarely; reuse them across page visits.
@@ -70,8 +87,7 @@ export default function AgentsClient() {
 
   const refreshOverrides = useCallback(async (sid) => {
     if (!sid) return {};
-    const requestId = (overrideRequestIds.get(sid) || 0) + 1;
-    overrideRequestIds.set(sid, requestId);
+    const requestId = nextOverrideRequestId(sid);
     const data = await getJson(`/api/agents/sessions/${encodeURIComponent(sid)}/overrides`);
     if (overrideRequestIds.get(sid) === requestId) {
       setOverridesBySession((old) => ({ ...old, [sid]: { overrides: data.overrides || [], revisions: data.revisions || {} } }));
@@ -138,28 +154,25 @@ export default function AgentsClient() {
     const timer = setTimeout(() => refreshOverrides(ui.drawer).catch(() => setToast("Unable to load routing overrides.")), 0);
     return () => clearTimeout(timer);
   }, [ui.drawer, refreshOverrides]);
-  const lastOverridePoll = useRef(0);
+  // One batch request for every live session. `live` changes far more often than the request takes:
+  // the poller runs one request at a time and follows a change that arrived meanwhile with a trailing
+  // run, so the newest session list is never left waiting for a later change.
+  const [overridePoller] = useState(() => createTrailingPoller({
+    gapMs: OVERRIDES_GAP_MS,
+    run: (ids) => {
+      const reqIds = Object.fromEntries(ids.map((sid) => [sid, nextOverrideRequestId(sid)]));
+      return getJson(`/api/agents/overrides?ids=${ids.map(encodeURIComponent).join(",")}`).then((d) => {
+        const got = d.sessions || {};
+        const fresh = ids.filter((sid) => got[sid.toLowerCase()] && overrideRequestIds.get(sid) === reqIds[sid]);
+        setOverridesBySession((old) => ({ ...old, ...Object.fromEntries(fresh.map((sid) => { const v = got[sid.toLowerCase()]; return [sid, { overrides: v.overrides || [], revisions: v.revisions || {} }]; })) }));
+      });
+    },
+  }));
+  useEffect(() => () => overridePoller.cancel(), [overridePoller]);
   useEffect(() => {
     const ids = (live?.sessions || []).map((s) => s.session).filter(Boolean);
-    if (!ids.length) return;
-    const now = Date.now();
-    if (now - lastOverridePoll.current < 10000) return;
-    lastOverridePoll.current = now;
-    let cancelled = false;
-    const reqIds = Object.fromEntries(ids.map((sid) => {
-      const requestId = (overrideRequestIds.get(sid) || 0) + 1;
-      overrideRequestIds.set(sid, requestId);
-      return [sid, requestId];
-    }));
-    // One batch request for every live session (was one request per session).
-    getJson(`/api/agents/overrides?ids=${ids.map(encodeURIComponent).join(",")}`).then((d) => {
-      if (cancelled) return;
-      const got = d.sessions || {};
-      const fresh = ids.filter((sid) => got[sid.toLowerCase()] && overrideRequestIds.get(sid) === reqIds[sid]);
-      setOverridesBySession((old) => ({ ...old, ...Object.fromEntries(fresh.map((sid) => { const v = got[sid.toLowerCase()]; return [sid, { overrides: v.overrides || [], revisions: v.revisions || {} }]; })) }));
-    }).catch(() => {});
-    return () => { cancelled = true; };
-  }, [live]);
+    if (ids.length) overridePoller.request(ids);
+  }, [live, overridePoller]);
 
   useEffect(() => {
     const el = document.documentElement, sync = () => setTheme(el.classList.contains("dark") ? "dark" : "light");
@@ -183,61 +196,89 @@ export default function AgentsClient() {
     return () => { el.removeEventListener("scroll", update); resize?.disconnect(); };
   }, []);
 
+  // `clock` is the view's "now". It moves with every live answer and by a
+  // timer (5 s on the Live tab, 30 s elsewhere) so "idle N s" labels advance.
+  const [clock, setClock] = useState(() => Date.now());
+  useEffect(() => {
+    const iv = setInterval(() => { if (!document.hidden) setClock(Date.now()); }, ui.tab === "live" ? 5000 : 30_000);
+    return () => clearInterval(iv);
+  }, [ui.tab]);
   const liveId = useRef(0);
-  const liveSig = useRef("");
+  const liveSeen = useRef(null);
   const uiRef = useRef(ui);
   useEffect(() => { uiRef.current = ui; });
+  // Set only while "Sync now" (or a saved auto-sync interval) starts its loads.
+  // A load reads it before its first await, so only those loads carry the
+  // sync signal; live-topic refetches and page loads never do.
+  const syncFlag = useRef(false);
+  // The loaders as they are now, for a trailing refetch (see etagFetch.js).
+  const reloadRef = useRef({ live: null, range: null });
+  const reloadLive = useCallback(() => reloadRef.current.live?.(), []);
+  const reloadRange = useCallback(() => reloadRef.current.range?.(), []);
   const loadLive = useCallback(async () => {
     const id = ++liveId.current;
+    const sync = syncFlag.current;
     try {
-      const d = await getJson("/api/agents/live");
+      const d = await getJson("/api/agents/live", { sync, reload: reloadLive });
       if (id !== liveId.current) return;
-      // Skip the re-render when the live feed did not change (N5).
-      const sig = JSON.stringify(d);
-      if (sig !== liveSig.current) { liveSig.current = sig; setLive(d); }
-      set({ ago: 0 });
+      // A 304 hands back the same object: skip the re-render when the feed did not change (N5).
+      if (d !== liveSeen.current) { liveSeen.current = d; setLive(d); setClock(Date.now()); }
+      markFeed("live", true);
+      setMode((m) => (m === "stale" ? "ready" : m));
     } catch {
       if (id !== liveId.current) return;
+      markFeed("live", false);
       setMode((m) => (m === "ready" || m === "stale" ? "stale" : m));
     }
-  }, [set]);
-  useEffect(() => { const t = setTimeout(loadLive, 0); return () => clearTimeout(t); }, [loadLive, tick]);
+  }, [markFeed, reloadLive]);
 
-  // No fixed polling: the page sync control (default every 10 s, saved on the
-  // server) bumps `tick`, which reloads live data; "Sync now" also reloads ranges.
-
-
-  const rangeId = useRef(0);
-  const [rangeBusy, setRangeBusy] = useState(false);
-  const [rangeNonce, setRangeNonce] = useState(0);
-  // Sessions and analytics are heavy. Load them on range change, then every
-  // 30 s; only the small /live feed follows the 2 s tick (N5).
-  const loadRange = useCallback(async ({ background = false, busy = false } = {}) => {
-    const id = ++rangeId.current;
+  // ---- range data: sessions, analytics (roles) and tools, each only while shown ----
+  const rangeQs = useMemo(() => {
     const q = new URLSearchParams({ preset: range.preset });
     if (range.preset === "Custom") { q.set("from", range.from); q.set("to", range.to); }
-    const key = `/api/agents/range?${q}`;
-    // Past sessions and analytics: show the cached copy at once, refetch only
-    // when it is older than RANGE_TTL. The 30 s background refresh still runs.
+    return q.toString();
+  }, [range]);
+  const needs = useMemo(() => rangeNeeds({ tab: ui.tab, drawer: ui.drawer }), [ui.tab, ui.drawer]);
+  const [busyKinds, setBusyKinds] = useState({});
+  const setKindBusy = useCallback((kind, on) => setBusyKinds((old) => (!!old[kind] === on ? old : { ...old, [kind]: on })), []);
+  const rangeBusy = !!(busyKinds.sessions || busyKinds.analytics);
+  const [rangeNonce, setRangeNonce] = useState(0);
+  const rangeFail = useCallback((kind, e) => {
+    setKindBusy(kind, false);
+    markFeed(kind, false);
+    setErrorText(e.message || "Request failed");
+    setMode((m) => (m === "ready" || m === "stale" ? "stale" : "error"));
+  }, [setKindBusy, markFeed]);
+
+  const sessionsId = useRef(0);
+  const sessionsSeen = useRef(null);
+  const loadSessions = useCallback(async ({ background = false, busy = false } = {}) => {
+    const id = ++sessionsId.current;
+    const sync = syncFlag.current;
+    const key = `/api/agents/sessions?${rangeQs}`;
+    // Show the cached copy at once, refetch only when it is older than RANGE_TTL.
     if (!background) {
       const hit = cacheGet(key);
       if (hit) {
-        setSessions(hit.data.s.sessions || []);
-        setTotalSessions(hit.data.s.total ?? (hit.data.s.sessions || []).length);
-        setMoreCursor(hit.data.s.nextCursor || null);
-        setAnalytics(hit.data.a);
+        setSessions(hit.data.sessions || []);
+        setTotalSessions(hit.data.total ?? (hit.data.sessions || []).length);
+        setMoreCursor(hit.data.nextCursor || null);
         setMode("ready");
-        if (isFresh(hit, RANGE_TTL)) { setRangeBusy(false); return; }
+        markFeed("sessions", true, hit.at); // a cached copy shows its real age
+        if (isFresh(hit, RANGE_TTL)) { setKindBusy("sessions", false); return; }
       } else {
         setMoreCursor(null); // the old range's cursor must not page the new range
       }
     }
-    if (!background || busy) setRangeBusy(true); // auto-sync refreshes stay silent
+    if (!background || busy) setKindBusy("sessions", true); // automatic refreshes stay silent
     try {
-      const [s, a] = await Promise.all([getJson(`/api/agents/sessions?${q}`), getJson(`/api/agents/analytics?${q}`)]);
-      if (id !== rangeId.current) return;
-      cacheSet(key, { s, a });
-      setRangeBusy(false);
+      const s = await getJson(key, { sync, reload: reloadRange });
+      if (id !== sessionsId.current) return;
+      setKindBusy("sessions", false);
+      // A 304 hands back the same object: nothing changed, keep the list as it is.
+      if (background && s === sessionsSeen.current) { markFeed("sessions", true); setMode("ready"); return; }
+      sessionsSeen.current = s;
+      cacheSet(key, s);
       // Background refreshes merge pages already loaded by "Load 100 more" (N4).
       setSessions((old) => {
         const page = s.sessions || [];
@@ -248,46 +289,152 @@ export default function AgentsClient() {
       });
       setTotalSessions(s.total ?? (s.sessions || []).length);
       if (!background) setMoreCursor(s.nextCursor || null);
-      setAnalytics((old) => (old && JSON.stringify(old) === JSON.stringify(a) ? old : a));
+      markFeed("sessions", true);
       setMode("ready");
     } catch (e) {
-      if (id !== rangeId.current) return;
-      setRangeBusy(false);
-      setErrorText(e.message || "Request failed");
-      setMode((m) => (m === "ready" || m === "stale" ? "stale" : "error"));
+      if (id !== sessionsId.current) return;
+      rangeFail("sessions", e);
     }
-  }, [range]);
-  useEffect(() => { const t = setTimeout(() => loadRange(), 0); return () => clearTimeout(t); }, [loadRange, rangeNonce]);
-  // Auto-sync tick: live feed every time; sessions and analytics every 3rd tick at most once a minute.
-  const lastRangeSync = useRef(0);
-  const syncAll = useCallback((force = false) => {
-    setTick((x) => x + 1);
-    const now = Date.now();
-    if (force || now - lastRangeSync.current >= 60_000) {
-      lastRangeSync.current = now;
-      if (force) cacheInvalidate("/api/agents");
-      // Background merge keeps pages loaded with "Load more"; the cache is skipped after invalidation.
-      loadRange({ background: true, busy: force });
-    }
-  }, [loadRange]);
-  const autoSync = useAutoSync("agents", () => syncAll(false));
-  const manualSync = useCallback(() => syncAll(true), [syncAll]);
+  }, [rangeQs, setKindBusy, markFeed, rangeFail, reloadRange]);
 
-  useEffect(() => {
-    let cancelled = false;
-    const q = new URLSearchParams({ preset: range.preset });
-    if (range.preset === "Custom") { q.set("from", range.from); q.set("to", range.to); }
-    const key = `/api/agents/tools?${q}`, hit = cacheGet(key);
-    if (hit) setTimeout(() => { if (!cancelled) { setTools(hit.data); setToolsError(""); } }, 0);
-    if (isFresh(hit, RANGE_TTL)) return () => { cancelled = true; };
-    getJson(key).then((data) => {
+  const analyticsId = useRef(0);
+  const analyticsSeen = useRef(null);
+  const loadAnalytics = useCallback(async ({ background = false, busy = false } = {}) => {
+    const id = ++analyticsId.current;
+    const sync = syncFlag.current;
+    const key = `/api/agents/analytics?${rangeQs}`;
+    if (!background) {
+      const hit = cacheGet(key);
+      if (hit) {
+        setAnalytics(hit.data);
+        setMode("ready");
+        markFeed("analytics", true, hit.at);
+        if (isFresh(hit, RANGE_TTL)) { setKindBusy("analytics", false); return; }
+      }
+    }
+    if (!background || busy) setKindBusy("analytics", true);
+    try {
+      const a = await getJson(key, { sync, reload: reloadRange });
+      if (id !== analyticsId.current) return;
+      setKindBusy("analytics", false);
+      if (a !== analyticsSeen.current) { analyticsSeen.current = a; cacheSet(key, a); setAnalytics(a); }
+      markFeed("analytics", true);
+      setMode("ready");
+    } catch (e) {
+      if (id !== analyticsId.current) return;
+      rangeFail("analytics", e);
+    }
+  }, [rangeQs, setKindBusy, markFeed, rangeFail, reloadRange]);
+
+  const toolsId = useRef(0);
+  const loadTools = useCallback(async ({ background = false } = {}) => {
+    const id = ++toolsId.current;
+    const sync = syncFlag.current;
+    const key = `/api/agents/tools?${rangeQs}`;
+    if (!background) {
+      const hit = cacheGet(key);
+      if (hit) { setTools(hit.data); setToolsError(""); markFeed("tools", true, hit.at); }
+      if (isFresh(hit, RANGE_TTL)) return;
+    }
+    try {
+      const data = await getJson(key, { sync, reload: reloadRange });
+      if (id !== toolsId.current) return;
       cacheSet(key, data);
-      if (!cancelled) { setTools(data); setToolsError(""); }
-    }).catch((error) => {
-      if (!cancelled) { setTools(null); setToolsError(error.message || "Request failed"); }
-    });
-    return () => { cancelled = true; };
-  }, [range]);
+      setTools(data); setToolsError("");
+      markFeed("tools", true);
+    } catch (error) {
+      if (id !== toolsId.current) return;
+      markFeed("tools", false);
+      // A failed background refresh keeps the table that is on screen.
+      if (!background) { setTools(null); setToolsError(error.message || "Request failed"); }
+    }
+  }, [rangeQs, markFeed, reloadRange]);
+
+  // Load each kind when its view opens and when the range changes.
+  useEffect(() => { if (!needs.sessions) return; const t = setTimeout(() => loadSessions(), 0); return () => clearTimeout(t); }, [needs.sessions, loadSessions, rangeNonce]);
+  useEffect(() => { if (!needs.analytics) return; const t = setTimeout(() => loadAnalytics(), 0); return () => clearTimeout(t); }, [needs.analytics, loadAnalytics, rangeNonce]);
+  useEffect(() => { if (!needs.tools) return; const t = setTimeout(() => loadTools(), 0); return () => clearTimeout(t); }, [needs.tools, loadTools, rangeNonce]);
+
+  // Refresh what the current view shows, without replacing it by a cached copy.
+  const refreshRange = useCallback((force = false) => {
+    if (needs.sessions) loadSessions({ background: true, busy: force });
+    if (needs.analytics) loadAnalytics({ background: true, busy: force });
+    if (needs.tools) loadTools({ background: true });
+  }, [needs, loadSessions, loadAnalytics, loadTools]);
+
+  // ---- when to refetch ----
+  // Live topics: "agents" moves when a request starts, streams or ends;
+  // "usage" moves when a usage row is saved. Either one can change this page.
+  const agentsTopic = useLiveTopic("agents", { throttleMs: LIVE_THROTTLE_MS });
+  const usageTopic = useLiveTopic("usage", { throttleMs: LIVE_THROTTLE_MS });
+  // `tick` also moves when the tab is shown again or the stream reconnects.
+  const liveVersion = `${agentsTopic.tick}.${usageTopic.tick}`;
+  const loadLiveRef = useRef(loadLive);
+  const refreshRangeRef = useRef(refreshRange);
+  useEffect(() => {
+    loadLiveRef.current = loadLive; refreshRangeRef.current = refreshRange;
+    // Trailing refetch: the same loaders, in the background, for the view that is open now.
+    reloadRef.current = { live: loadLive, range: () => refreshRange(false) };
+  });
+  const refetchers = useRef(null);
+  useEffect(() => {
+    const view = () => ({ paused: uiRef.current.paused, hidden: document.hidden, tab: uiRef.current.tab });
+    const r = {
+      live: createRefetcher({ run: () => loadLiveRef.current(), throttleMs: LIVE_THROTTLE_MS, allowed: () => liveAutoAllowed(view()) }),
+      range: createRefetcher({ run: () => refreshRangeRef.current(false), throttleMs: RANGE_THROTTLE_MS, allowed: () => autoAllowed(view()) }),
+    };
+    refetchers.current = r;
+    // First paint: one live fetch on any tab, for the header's live count.
+    r.live.force();
+    return () => { r.live.cancel(); r.range.cancel(); refetchers.current = null; cancelRetries(); };
+  }, []);
+  // A live topic moved (also after the tab becomes visible again).
+  const seenVersion = useRef(liveVersion);
+  useEffect(() => {
+    if (seenVersion.current === liveVersion) return;
+    seenVersion.current = liveVersion;
+    refetchers.current?.live.request();
+    refetchers.current?.range.request();
+  }, [liveVersion]);
+  // Opening the Live tab or resuming from Pause catches up at once.
+  const liveWasActive = useRef(true);
+  useEffect(() => {
+    const active = !ui.paused && ui.tab === "live";
+    const resumed = active && !liveWasActive.current;
+    liveWasActive.current = active;
+    if (resumed) refetchers.current?.live.request();
+  }, [ui.tab, ui.paused]);
+
+  // Retry button: fetch live now, whatever the tab or pause state.
+  const [liveNonce, setLiveNonce] = useState(0);
+  useEffect(() => { if (liveNonce) refetchers.current?.live.force(); }, [liveNonce]);
+
+  // Fallback timer. It keeps the header's live count roughly right on every
+  // tab (one small request, usually a 304) and refreshes the open range view.
+  // `fresh` is true when the user saved an auto-sync interval: that timer is
+  // a sync like the button and skips every cache. The unsaved 60 s fallback
+  // stays an ordinary, cacheable poll.
+  const autoSync = useCallback((fresh = false) => {
+    if (!autoAllowed({ paused: uiRef.current.paused, hidden: document.hidden })) return;
+    if (fresh) cacheInvalidate("/api/agents");
+    syncFlag.current = !!fresh;
+    try {
+      refetchers.current?.live.force();
+      refetchers.current?.range.request();
+    } finally { syncFlag.current = false; }
+    setTick((x) => x + 1);
+  }, []);
+  // "Sync now" works while paused too. Every load it starts carries the sync
+  // signal: no cached copy, no 304, no server result cache.
+  const manualSync = useCallback(() => {
+    cacheInvalidate("/api/agents");
+    syncFlag.current = true;
+    try {
+      refetchers.current?.live.force();
+      refetchers.current?.range.force();
+    } finally { syncFlag.current = false; }
+    setTick((x) => x + 1);
+  }, []);
 
   const loadDetail = useCallback(async (sid) => {
     if (!sid) { setDetail(null); setDetailLoad({ sid: null, status: "idle" }); return; }
@@ -342,7 +489,6 @@ export default function AgentsClient() {
     const t = setTimeout(() => loadDetail(sel), 0);
     return () => clearTimeout(t);
   }, [ui.tab, sel, loadDetail]);
-  // A live session's detail refreshes every 10 s; ended sessions do not change (N5).
   const selLive = !!(sel && live?.sessions?.some((x) => x.session === sel));
   // A live session's detail follows the page sync ticks; ended sessions do not change (N5).
   useEffect(() => {
@@ -355,8 +501,8 @@ export default function AgentsClient() {
     if (!moreCursor || moreBusy || rangeBusy) return;
     setMoreBusy(true);
     try {
-      const q = new URLSearchParams({ preset: range.preset, cursor: moreCursor });
-      if (range.preset === "Custom") { q.set("from", range.from); q.set("to", range.to); }
+      const q = new URLSearchParams(rangeQs);
+      q.set("cursor", moreCursor);
       const page = await getJson(`/api/agents/sessions?${q}`);
       setSessions((old) => {
         const seen = new Set((old || []).map((s) => s.session));
@@ -366,7 +512,7 @@ export default function AgentsClient() {
     } catch (error) {
       setToast(error.message || "Unable to load more sessions.");
     } finally { setMoreBusy(false); }
-  }, [moreCursor, moreBusy, rangeBusy, range]);
+  }, [moreCursor, moreBusy, rangeBusy, rangeQs]);
 
   // Prime the mode once live answers arrive.
   useEffect(() => {
@@ -377,8 +523,8 @@ export default function AgentsClient() {
 
   const act = useMemo(() => ({
     tab: (k) => set({ tab: k, tabTouched: true }),
-    pause: () => set((u) => ({ ...u, paused: !u.paused, ago: 0 })),
-    retry: () => { setMode("loading"); setTick((x) => x + 1); setRangeNonce((x) => x + 1); },
+    pause: () => set((u) => ({ ...u, paused: !u.paused })),
+    retry: () => { setMode("loading"); setLiveNonce((x) => x + 1); setTick((x) => x + 1); setRangeNonce((x) => x + 1); },
     setQ: (q) => set({ q }),
     setClient: (c) => set({ fClient: c }),
     setRole: (r) => set({ fRole: r }),
@@ -404,10 +550,15 @@ export default function AgentsClient() {
 
   const drawerOverrideState = overridesBySession[ui.drawer] || {};
   const busy = overrideBusy && overrideBusy.sid === ui.drawer ? overrideBusy : null;
-  const v = buildView({ live, sessions, totalSessions, detail, detailsBySession, detailLoad, analytics, tools, range, ui: { ...ui, mode, errorText }, vw, combos, models, overrides: drawerOverrideState.overrides || [], overridesBySession, revisions: drawerOverrideState.revisions || {}, draft, cf, toast, moreCursor, rangeBusy, busy,
-    setDraft: (update) => setDraft((old) => ({ ...old, ...(typeof update === "function" ? update(old) : update) })),
-    setCf, setToast, applyOverrides, reloadOverrides: refreshOverrides,
-    act: { ...act, applyOverrides, revertOverride } });
+  // The view model is rebuilt only when one of its inputs changes.
+  const mergeDraft = useCallback((update) => setDraft((old) => ({ ...old, ...(typeof update === "function" ? update(old) : update) })), []);
+  const viewAct = useMemo(() => ({ ...act, applyOverrides, revertOverride }), [act, applyOverrides, revertOverride]);
+  const viewUi = useMemo(() => ({ ...ui, mode, errorText }), [ui, mode, errorText]);
+  const drawerOverrides = drawerOverrideState.overrides, drawerRevisions = drawerOverrideState.revisions;
+  const v = useMemo(() => buildView({ live, sessions, totalSessions, detail, detailsBySession, detailLoad, analytics, tools, range, ui: viewUi, vw, now: clock, combos, models, overrides: drawerOverrides || [], overridesBySession, revisions: drawerRevisions || {}, draft, cf, toast, moreCursor, rangeBusy, busy,
+    setDraft: mergeDraft, setCf, setToast, applyOverrides, reloadOverrides: refreshOverrides, act: viewAct }),
+  [live, sessions, totalSessions, detail, detailsBySession, detailLoad, analytics, tools, range, viewUi, vw, clock, combos, models, drawerOverrides, overridesBySession, drawerRevisions, draft, cf, toast, moreCursor, rangeBusy, busy, mergeDraft, applyOverrides, refreshOverrides, viewAct]);
+  const shownFeed = feed[ui.tab === "live" ? "live" : ui.tab === "roles" ? "analytics" : ui.tab] || {};
 
   const isLoading = mode === "loading", isError = mode === "error", ready = !isLoading && !isError;
   const onRange = (r) => { setRange(r); set({ hov: null, pick: null, focus: null, sel: null }); setDetail(null); const url = new URL(window.location.href); url.searchParams.delete("s"); window.history.replaceState({}, "", url); };
@@ -482,9 +633,9 @@ export default function AgentsClient() {
               {v.tabs.map((t) => <button key={t.label} onClick={t.on} style={t.style} role="tab" aria-selected={ui.tab === t.label.toLowerCase()} aria-label={t.count ? t.label + " " + t.count : t.label}>{t.dot && <span style={t.dot} />}{t.label}{t.count && <span style={{ fontSize: 11, color: "var(--tx2)", marginLeft: 8 }}>{t.count}</span>}</button>)}
             </div></div>
             {ui.tab === "live" ? null : <div onClick={(e) => { if (rangeBusy) e.stopPropagation(); }}><RangeBar preset={v.preset} customLabel={v.customLabel} onChange={onRange} /></div>}
-            <SyncButton sync={{ ...autoSync, manual: manualSync }} busy={rangeBusy} />
+            <AgentsSyncControl onAuto={autoSync} onManual={manualSync} paused={ui.paused} busy={rangeBusy} />
           </div>
-          <div style={{ fontSize: 11, color: "var(--tx2)", display: "flex", alignItems: "center", gap: 4 }}><span className="material-symbols-outlined" style={{ fontSize: 14 }}>schedule</span>Times in IST (UTC+5:30) · Agent telemetry logging began Nov 9</div>
+          <div style={{ fontSize: 11, color: "var(--tx2)", display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap" }}><span className="material-symbols-outlined" style={{ fontSize: 14 }}>schedule</span>Times in IST (UTC+5:30) · Agent telemetry logging began Nov 9<span style={{ marginLeft: "auto" }}><Freshness okAt={shownFeed.okAt ?? null} failed={!!shownFeed.failed} paused={ui.paused} onToggle={act.pause} /></span></div>
         </div>
 
         {isLoading && <AgentsSkeleton v={v} />}

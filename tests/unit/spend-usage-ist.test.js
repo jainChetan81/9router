@@ -61,6 +61,11 @@ describe("usageRepo IST bucketing (B12)", () => {
       status: "ok",
     });
 
+    // The daily rollup is buffered in memory and flushed on a ~2 s timer;
+    // force the flush so the raw table read below sees all buckets.
+    const { flushUsageDaily } = await import("@/lib/db/repos/usageRepo.js");
+    await flushUsageDaily();
+
     const dailyRows = adapter.all(`SELECT dateKey FROM usageDaily ORDER BY dateKey ASC`);
     expect(dailyRows.map((r) => r.dateKey)).toEqual(["2026-11-04", "2026-11-09", "2026-11-10"]);
 

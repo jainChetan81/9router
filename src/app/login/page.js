@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import { canSubmitLogin, showDefaultPasswordHint } from "./loginState";
 import { Card, Button, Input } from "@/shared/components";
 
 export default function LoginPage() {
@@ -245,18 +246,20 @@ export default function LoginPage() {
                   variant="primary"
                   className="w-full"
                   loading={loading}
-                  disabled={retryAfter > 0}
+                  disabled={!canSubmitLogin({ password, retryAfter })}
                 >
                   {retryAfter > 0 ? `Wait ${retryAfter}s` : "Login"}
                 </Button>
 
-                <p className="text-xs text-center text-text-muted mt-2">
-                  Default password is <code className="bg-sidebar px-1 rounded">123456</code>
-                </p>
-                {hasPassword === false && (
-                  <p className="text-xs text-center text-amber-600 dark:text-amber-400">
-                    Security risk: no password set. You will be asked to set one when logging in remotely.
-                  </p>
+                {showDefaultPasswordHint(hasPassword) && (
+                  <>
+                    <p className="text-xs text-center text-text-muted mt-2">
+                      Default password is <code className="bg-sidebar px-1 rounded">123456</code>
+                    </p>
+                    <p className="text-xs text-center text-amber-600 dark:text-amber-400">
+                      Security risk: no password set. You will be asked to set one when logging in remotely.
+                    </p>
+                  </>
                 )}
               </form>
             ) : (

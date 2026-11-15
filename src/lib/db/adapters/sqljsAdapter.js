@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import initSqlJs from "sql.js";
 import { PRAGMA_SQL } from "../schema.js";
+import { runBeforeDbClose } from "../shutdownHooks.js";
 
 let SQL = null;
 
@@ -106,7 +107,8 @@ export async function createSqlJsAdapter(filePath) {
   }
 
   // Flush on shutdown
-  const flush = () => { if (dirty) try { persist(); } catch {} };
+  // Buffered writers flush first, so their rows are in the persisted image.
+  const flush = () => { runBeforeDbClose(); if (dirty) try { persist(); } catch {} };
   process.on("beforeExit", flush);
   process.on("SIGINT", flush);
   process.on("SIGTERM", flush);

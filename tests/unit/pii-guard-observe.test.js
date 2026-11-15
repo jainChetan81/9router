@@ -356,10 +356,12 @@ describe("PII guard routing records", () => {
       P.flush();
       const scan = { requestId: P.search({}).rows[0].requestId };
       await guard.recordRouting({ provider: "first", account: "acc-one", resolvedModel: "first/m" });
+      P.flush(); // routing updates ride the next batch
       // A request without findings writes no event lines, only prompt rows.
       expect(await readFile(events, "utf8").catch(() => "")).toBe("");
       expect(P.search({ requestId: scan.requestId }).rows[0]).toMatchObject({ provider: "first", combo: "daily", account: "acc-one" });
       await guard.recordRouting({ provider: "second", account: "acc-two", resolvedModel: "second/m" });
+      P.flush();
       expect(P.search({ requestId: scan.requestId }).rows[0]).toMatchObject({ provider: "second", combo: "daily", account: "acc-two" });
     } finally { P._reset(); }
   });

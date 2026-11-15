@@ -170,6 +170,69 @@ describe("spend aggregation SQL (N6/B10)", () => {
     expect(after.totals).toEqual(first.totals);
   }, 60_000);
 
+  it("runs the aggregate on the real worker thread with the inline result", async () => {
+    const { spendPool } = await import("../../src/lib/spend/pool.js");
+    const { aggregateSpend } = await import("../../src/lib/spend/aggregate.js");
+    const db = await adapter();
+    const args = { params: { preset: "7D" }, now: Date.now(), fees: {} };
+    // Call the pool directly: the route would hide a worker failure behind
+    // its inline fallback.
+    const viaWorker = await spendPool.run(db, "aggregate", args, { key: "worker-smoke" });
+    const inline = aggregateSpend(db, args);
+    expect(JSON.stringify(viaWorker.totals ?? viaWorker)).toBe(JSON.stringify(inline.totals ?? inline));
+  }, 60_000);
+
+  it("falls back to inline aggregation on a worker failure and keeps 503 when busy", async () => {
+    const mod = await import("../../src/app/api/spend/route.js");
+    // Swap the pool for fakes: one that fails with a plain error (worker
+    // crash), then one that fails with the busy code.
+    const calls = [];
+    const fake = { run: async () => { calls.push(1); throw new Error("spend read worker exited"); } };
+    const busy = { run: async () => { const e = new Error("spend read queue is busy"); e.code = "busy"; throw e; } };
+    // Module-private pool: exercise via module re-import with the pool mocked.
+    vi.doMock("@/lib/spend/pool.js", () => ({ spendPool: fake }));
+    let m = await import("../../src/app/api/spend/route.js?v=inline");
+    const params = new URLSearchParams({ preset: "7D" });
+    const res = await m.GET(new Request(`http://x/api/spend?${params}`));
+    expect(res.status).toBe(200);
+    expect((await res.json()).whatIfTargets).toBeDefined();
+    expect(calls.length).toBe(1);
+
+    vi.doMock("@/lib/spend/pool.js", () => ({ spendPool: busy }));
+    m = await import("../../src/app/api/spend/route.js?v=busy");
+    const busyRes = await m.GET(new Request(`http://x/api/spend?${params}`));
+    expect(busyRes.status).toBe(503);
+    vi.doUnmock("@/lib/spend/pool.js");
+  }, 60_000);
+
+  it("passes the sync signal to the aggregate, and only when the header is set", async () => {
+    const seen = [];
+    const capture = { run: async (_db, _method, args, opts) => { seen.push({ skipCache: args.skipCache, key: opts.key }); return { totals: {} }; } };
+    vi.doMock("@/lib/spend/pool.js", () => ({ spendPool: capture }));
+    const m = await import("../../src/app/api/spend/route.js?v=sync");
+    const url = "http://x/api/spend?preset=7D";
+
+    const plain = await m.GET(new Request(url));
+    const synced = await m.GET(new Request(url, { headers: { "x-9r-sync": "1" } }));
+    expect(plain.status).toBe(200);
+    expect(synced.status).toBe(200);
+    expect(seen.map((s) => s.skipCache)).toEqual([false, true]);
+    // A sync read never joins a cached read that is in flight.
+    expect(seen[0].key).not.toBe(seen[1].key);
+    vi.doUnmock("@/lib/spend/pool.js");
+  }, 60_000);
+
+  it("sends no ETag and never answers 304", async () => {
+    const m = await import("../../src/app/api/spend/route.js");
+    const first = await m.GET(new Request("http://x/api/spend?preset=7D"));
+    expect(first.status).toBe(200);
+    expect(first.headers.get("etag")).toBeNull();
+    expect(first.headers.get("cache-control")).toBe("no-store");
+    const again = await m.GET(new Request("http://x/api/spend?preset=7D", { headers: { "if-none-match": "*" } }));
+    expect(again.status).toBe(200);
+    expect(m.etagBucketFor).toBeUndefined();
+  }, 60_000);
+
   it("rejects invalid fee payloads on PATCH /api/spend (S1 server side)", async () => {
     // Route handler test would need Next runtime; assert the module's guard instead.
     const mod = await import("../../src/app/api/spend/route.js");

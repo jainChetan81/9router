@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseUrlState, serialiseUrlState, dropMissingDetail, validDate, rangeLabel, buildRangeKey, buildEventsFilterKey, buildEventsRequestKey, nextHitLookupCursor, HIT_LOOKUP_PAGE_LIMIT, clearPromptLandingOnNavigation, shouldSyncSearchInput, shouldDropMissingDetail, DEFAULT_RANGE, occurrences } from "../../src/app/(dashboard)/dashboard/pii-guard/urlState.js";
+import { parseUrlState, serialiseUrlState, dropMissingDetail, validDate, rangeLabel, buildRangeKey, buildEventsFilterKey, buildEventsRequestKey, nextHitLookupCursor, HIT_LOOKUP_PAGE_LIMIT, clearPromptLandingOnNavigation, shouldSyncSearchInput, shouldDropMissingDetail, DEFAULT_RANGE, occurrences, liveReloadWanted, rangeBounds } from "../../src/app/(dashboard)/dashboard/pii-guard/urlState.js";
 
 describe("masked preview matches", () => {
   it("finds every non-overlapping occurrence", () => {
@@ -199,5 +199,63 @@ describe("session view url state", () => {
     expect(parseUrlState(withSession).session).toBe("a1b2c3d4e5f60718");
     const value = serialiseUrlState({ ...base, view: "value", sf: { client: "x" } });
     expect(value.toString()).toBe("tab=findings");
+  });
+});
+
+describe("range bounds", () => {
+  const DAY = 864e5, HOUR = 36e5, IST = 5.5 * HOUR;
+  // 2026-11-14 19:40 IST.
+  const now = Date.UTC(2026, 10, 14, 14, 10, 0);
+  const midnight = Date.UTC(2026, 10, 13, 18, 30, 0); // 2026-11-14 00:00 IST
+  const istDay = (ms) => new Date(ms + IST).toISOString().slice(0, 16);
+
+  it("7D and 30D are whole IST calendar days ending at the coming midnight", async () => {
+    const { rangeBounds } = await import("../../src/app/(dashboard)/dashboard/pii-guard/urlState.js");
+    expect(rangeBounds({ preset: "7D" }, now)).toEqual({ from: midnight - 6 * DAY, to: midnight + DAY });
+    expect(istDay(rangeBounds({ preset: "7D" }, now).from)).toBe("2026-11-08T00:00");
+    expect(rangeBounds({ preset: "30D" }, now)).toEqual({ from: midnight - 29 * DAY, to: midnight + DAY });
+    expect(rangeBounds({ preset: "60D" }, now)).toEqual({ from: midnight - 59 * DAY, to: midnight + DAY });
+  });
+  it("the bounds do not move between two polls on the same day", async () => {
+    const { rangeBounds } = await import("../../src/app/(dashboard)/dashboard/pii-guard/urlState.js");
+    expect(rangeBounds({ preset: "7D" }, now + 3 * HOUR)).toEqual(rangeBounds({ preset: "7D" }, now));
+    expect(rangeBounds({ preset: "24h" }, now + 20 * 60_000)).toEqual(rangeBounds({ preset: "24h" }, now));
+  });
+  it("Today is the IST day, 24h ends at the next full hour", async () => {
+    const { rangeBounds } = await import("../../src/app/(dashboard)/dashboard/pii-guard/urlState.js");
+    expect(rangeBounds({ preset: "Today" }, now)).toEqual({ from: midnight, to: midnight + DAY });
+    const end = Date.UTC(2026, 10, 14, 15, 0, 0);
+    expect(rangeBounds({ preset: "24h" }, now)).toEqual({ from: end - DAY, to: end });
+  });
+  it("All is exactly the 90 days the log answers, and is labelled so", async () => {
+    const { rangeBounds, RANGE_LABELS, MAX_RANGE_DAYS } = await import("../../src/app/(dashboard)/dashboard/pii-guard/urlState.js");
+    const { from, to } = rangeBounds({ preset: "All" }, now);
+    expect(to - from).toBe(MAX_RANGE_DAYS * DAY);
+    expect(to).toBe(midnight + DAY);
+    expect(RANGE_LABELS.All).toBe("90 days");
+  });
+  it("Custom covers its IST days, never past today or longer than 90 days", async () => {
+    const { rangeBounds } = await import("../../src/app/(dashboard)/dashboard/pii-guard/urlState.js");
+    expect(rangeBounds({ preset: "Custom", from: "2026-11-10", to: "2026-11-12" }, now)).toEqual({ from: midnight - 4 * DAY, to: midnight - DAY });
+    expect(rangeBounds({ preset: "Custom", from: "2026-11-10", to: "2026-11-14" }, now).to).toBe(midnight + DAY);
+    const long = rangeBounds({ preset: "Custom", from: "2026-01-01", to: "2026-11-14" }, now);
+    expect(long.to - long.from).toBe(90 * DAY);
+  });
+});
+
+describe("live reload of the summary", () => {
+  const now = Date.parse("2026-11-15T10:00:00Z");
+  it("a mount is not a change: only a tick later than the one seen reloads", () => {
+    const to = rangeBounds({ preset: "24h" }, now).to;
+    expect(liveReloadWanted({ tick: 7, seen: 7, to, now })).toBe(false); // ticks kept from before the mount
+    expect(liveReloadWanted({ tick: 8, seen: 7, to, now })).toBe(true);
+    expect(liveReloadWanted({ tick: 0, seen: 0, to, now })).toBe(false);
+  });
+  it("a range that ended in the past is not reloaded on a tick", () => {
+    const past = rangeBounds({ preset: "Custom", from: "2026-11-01", to: "2026-11-10" }, now);
+    expect(past.to).toBeLessThan(now);
+    expect(liveReloadWanted({ tick: 8, seen: 7, to: past.to, now })).toBe(false);
+    const today = rangeBounds({ preset: "Custom", from: "2026-11-01", to: "2026-11-15" }, now);
+    expect(liveReloadWanted({ tick: 8, seen: 7, to: today.to, now })).toBe(true);
   });
 });

@@ -23,6 +23,34 @@ export function rangeLabel(from, to) {
   return `${f(from)} – ${f(to)}`;
 }
 
+const DAY = 864e5, HOUR = 36e5, IST = 5.5 * HOUR;
+export const MAX_RANGE_DAYS = 90;
+const PRESET_DAYS = { "7D": 7, "30D": 30, "60D": 60, All: MAX_RANGE_DAYS };
+// The event log answers at most 90 days, so the last preset says so instead of "All".
+export const RANGE_LABELS = { All: "90 days" };
+/** Range in ms for the API, aligned like Spend: whole IST calendar days (today counts as day one and
+ *  the range ends at the coming midnight), and "24h" ends at the next full hour. Every bar of the trend
+ *  is then a whole day or hour, and the bounds stay the same between polls. */
+export function rangeBounds(r, now = Date.now()) {
+  const today = Math.floor((now + IST) / DAY) * DAY - IST, end = today + DAY;
+  if (r?.preset === "Today") return { from: today, to: end };
+  if (r?.preset === "Custom") {
+    const to = Math.min(end, Date.parse(r.to + "T00:00:00Z") - IST + DAY);
+    return { from: Math.max(Date.parse(r.from + "T00:00:00Z") - IST, to - MAX_RANGE_DAYS * DAY), to };
+  }
+  const days = PRESET_DAYS[r?.preset];
+  if (days) return { from: end - days * DAY, to: end };
+  const hour = Math.floor(now / HOUR) * HOUR + HOUR;
+  return { from: hour - DAY, to: hour };
+}
+
+/** Whether a live "pii" tick reloads the summary. `seen` is the tick already handled: the one at mount
+ *  (ticks are kept while the page is away, so a mount is not a change), then each later one. A range
+ *  that ended before now cannot change with the log, so it is not reloaded. */
+export function liveReloadWanted({ tick, seen, to, now = Date.now() }) {
+  return tick !== seen && !(to < now);
+}
+
 export function buildRangeKey(range) {
   return JSON.stringify([range?.preset || "", range?.from || "", range?.to || ""]);
 }

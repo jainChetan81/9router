@@ -1,13 +1,42 @@
 import { NextResponse } from "next/server";
 import { getAdapter } from "@/lib/db/driver.js";
+import { DATA_FILE } from "@/lib/db/paths.js";
+import { spendPool } from "@/lib/spend/pool.js";
 import { getSettings, updateSettings, getPricingForModel } from "@/lib/localDb";
 import { SUBS, aggregateSpend, invalidateSpendCache } from "@/lib/spend/aggregate.js";
+import { version as usageVersion } from "@/lib/live/bus.js";
+import { isSyncRequest } from "@/lib/dashboardSync.js";
 
 export const dynamic = "force-dynamic";
 
-// What-if targets: every provider/model pair seen in the last 60 days, with the
-// same effective price the usage logger uses (user override, then defaults).
+// Aggregate runs on a read-only worker thread so the gateway event loop
+// stays free. Falls back to inline (main-thread) execution when the
+// adapter is not file-backed (sql.js) or the worker itself failed; only a
+// busy read queue (pool or queue full) still answers 503.
+
+async function aggregateOffThread(db, args) {
+  try {
+    return await spendPool.run(db, "aggregate", args, {
+      // Identical reads in flight share one job; a sync read never joins a
+      // cached one.
+      key: JSON.stringify([args.params, args.fees, usageVersion("usage"), !!args.skipCache]),
+    });
+  } catch (error) {
+    if (error?.code === "busy") throw error;
+    // Worker failure, worker crash, timeout, or a non-file-backed driver:
+    // run inline so the request still answers.
+    return aggregateSpend(db, args);
+  }
+}
+
+// What-if targets: every provider/model pair seen in the last 60 days, with
+// the same effective price the usage logger uses. Pairs change slowly, so
+// the resolved list is cached for 10 minutes instead of a DISTINCT scan +
+// one pricing lookup per pair on every request.
+const WHATIF_TTL = 10 * 60_000;
+let whatIfCache = null;
 async function resolveWhatIfTargets(db) {
+  if (whatIfCache && Date.now() - whatIfCache.at < WHATIF_TTL) return whatIfCache.value;
   try {
     const rows = db.all(`SELECT DISTINCT provider, model FROM usageHistory
       WHERE timestamp >= ? AND provider IS NOT NULL AND model IS NOT NULL AND model != 'invalid' LIMIT 500`,
@@ -19,9 +48,11 @@ async function resolveWhatIfTargets(db) {
         out.push({ provider, model, price: { input: p.input, output: p.output, cached: p.cached, cache_creation: p.cache_creation, reasoning: p.reasoning } });
       }
     }
-    return out.sort((a, b) => `${a.provider}/${a.model}`.localeCompare(`${b.provider}/${b.model}`));
+    const value = out.sort((a, b) => `${a.provider}/${a.model}`.localeCompare(`${b.provider}/${b.model}`));
+    whatIfCache = { at: Date.now(), value };
+    return value;
   } catch {
-    return [];
+    return whatIfCache?.value || [];
   }
 }
 
@@ -32,10 +63,19 @@ export async function GET(request) {
     const db = await getAdapter();
     const params = new URL(request.url).searchParams;
     const settings = await getSettings();
-    const payload = aggregateSpend(db, { params, now: Date.now(), fees: settings.spendFees || {} });
+    const fees = settings.spendFees || {};
+    // "Sync now" reads fresh: no body cache and no throttle on today's slice.
+    // Closed IST days and the what-if price list stay cached.
+    const sync = isSyncRequest(request);
+    const payload = await aggregateOffThread(db, { params: Object.fromEntries(params), now: Date.now(), fees, skipCache: sync, usageVersion: usageVersion("usage") });
     const whatIfTargets = await resolveWhatIfTargets(db);
+    // No ETag: the page keeps its own copy (clientCache) and never sends a
+    // conditional request.
     return NextResponse.json({ ...payload, whatIfTargets }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
+    if (error?.code === "busy") {
+      return NextResponse.json({ error: "busy" }, { status: 503, headers: { "Retry-After": "1" } });
+    }
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 }
@@ -77,6 +117,7 @@ export async function PATCH(request) {
     await updateSettings({ spendFees: fees });
     const db = await getAdapter();
     invalidateSpendCache(db);
+    whatIfCache = null;
     return NextResponse.json({ fees });
   } catch (error) {
     return NextResponse.json({ error: error.message }, { status: 500 });

@@ -14,6 +14,8 @@ import RefreshBar from "./RefreshBar";
 import SyncButton from "./SyncButton";
 import useAutoSync from "./useAutoSync";
 import { cacheGet, cacheSet, cacheInvalidate, isFresh, updatedAgo } from "@/lib/clientCache";
+import { fDT } from "@/lib/spend/uiHelpers";
+import { syncHeaders } from "@/lib/dashboardSync";
 import "./shared-page.css";
 
 async function getJson(url, opts) {
@@ -56,14 +58,21 @@ export default function SpendClient() {
   const [syncNonce, setSyncNonce] = useState(0);
   const sync = useCallback(() => { cacheInvalidate("/api/spend"); setSyncNonce((n) => n + 1); }, []);
   const autoSync = useAutoSync("spend", sync);
-  useEffect(() => { const t = setInterval(() => setNowTick(Date.now()), 30_000); return () => clearInterval(t); }, []);
-  const load = useCallback(async () => {
+  // "Updated X ago" ticks every 30 s, but only while the tab is visible.
+  useEffect(() => {
+    const t = setInterval(() => { if (!document.hidden) setNowTick(Date.now()); }, 30_000);
+    const vis = () => { if (!document.hidden) setNowTick(Date.now()); };
+    document.addEventListener("visibilitychange", vis);
+    return () => { clearInterval(t); document.removeEventListener("visibilitychange", vis); };
+  }, []);
+  const load = useCallback(async ({ sync: fresh = false } = {}) => {
     const id = ++loadId.current; // ignore responses from superseded ranges
     const q = new URLSearchParams({ preset: range.preset });
     if (range.preset === "Custom") { q.set("from", range.from); q.set("to", range.to); }
     const url = `/api/spend?${q}`;
     // Spend changes slowly: show cached data at once; refetch only when older than SPEND_TTL.
-    const hit = cacheGet(url);
+    // A sync never reads the cached copy and tells the server to skip its caches too.
+    const hit = fresh ? null : cacheGet(url);
     if (hit) {
       setData(hit.data);
       setLoadedAt(hit.at);
@@ -74,7 +83,7 @@ export default function SpendClient() {
     }
     setRefreshing(true);
     try {
-      const d = await getJson(url);
+      const d = await getJson(url, { headers: syncHeaders(fresh) });
       if (id !== loadId.current) return;
       cacheSet(url, d);
       setData(d);
@@ -89,8 +98,15 @@ export default function SpendClient() {
       setMode("error");
     }
   }, [range]);
+  // A changed syncNonce means the Sync button or the auto-sync timer asked; a
+  // range change or the first load is an ordinary, cacheable read.
+  const syncSeen = useRef(0);
   useEffect(() => {
-    const t = setTimeout(load, 0);
+    const t = setTimeout(() => {
+      const fresh = syncNonce !== syncSeen.current;
+      syncSeen.current = syncNonce;
+      load({ sync: fresh });
+    }, 0);
     return () => clearTimeout(t);
   }, [load, syncNonce]);
 
@@ -154,7 +170,7 @@ export default function SpendClient() {
   const onRange = (r) => { setRange(r); set({ hover: null, agFilter: null, agOpen: null }); };
   const todayKey = data ? new Date(data.now + 5.5 * 3600e3).toISOString().slice(0, 10) : null;
   const showLast30 = () => onRange({ preset: "30D" });
-  const retry = () => load();
+  const retry = () => load({ sync: true });
   const openConsole = () => router.push("/dashboard/console-log");
   const emptyText = `9Router logged no calls in this range (${data?.range?.first ?? ""} – ${data?.range?.last ?? ""} IST). Real spend is $0.00. Allowance and fees still apply.`;
   const ready = mode === "ready" && v;
@@ -173,7 +189,7 @@ export default function SpendClient() {
             <div style={{ display: "flex", alignItems: "baseline", gap: "8px" }}><span style={{ fontWeight: "600" }}>{rangeTitle}</span><span style={{ color: "var(--tx3)", fontSize: "12px" }}>{rangeSub}</span></div>
             <div className="r9-spend-range-controls" style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", minWidth: 0, maxWidth: "100%" }}>
               <RangeBar preset={preset} customLabel={customLabel} onChange={onRange} today={todayKey} />
-              {(loadedAt > 0) && (<span className="r9-spend-refreshing" title={new Date(loadedAt).toLocaleString()} style={{ fontSize: "11.5px", color: "var(--tx3)", whiteSpace: "nowrap" }}>{refreshing ? "Refreshing…" : updatedAgo(loadedAt, nowTick)}</span>)}
+              {(loadedAt > 0) && (<span className="r9-spend-refreshing" title={`${fDT(loadedAt)} IST`} style={{ fontSize: "11.5px", color: "var(--tx3)", whiteSpace: "nowrap" }}>{refreshing ? "Refreshing…" : updatedAgo(loadedAt, nowTick)}</span>)}
               <SyncButton sync={autoSync} busy={refreshing} />
             </div>
             <span className="r9-spend-ist-note" style={{ fontSize: 11, color: "var(--tx2)", display: "flex", alignItems: "center", gap: 4 }}><span style={{ fontFamily: "'Material Symbols Outlined'", fontSize: 14 }}>schedule</span>Times in IST (UTC+5:30) · Real spend logging began Nov 9</span>

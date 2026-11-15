@@ -1,0 +1,350 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { existsSync } from "node:fs";
+
+// The scanner library lives in the separate pii-guard repo. Resolve it from
+// PII_GUARD_MODULE, else this checkout's default build path; skip the suite
+// (a cold CI or a fresh clone) when it is not present.
+const libraryPath = process.env.PII_GUARD_MODULE || "/home/chetan/Projects/pii-guard/dist/index.js";
+const describeIfLibrary = existsSync(libraryPath) ? describe : describe.skip;
+
+const library = await import(libraryPath);
+const P = await import("../../src/lib/piiGuard/prompts.js");
+const D = await import("../../src/lib/piiGuard/promptDb.mjs");
+const detector = library.createDetector({ salt: "abcdef0123456789" });
+const exists = (f) => stat(f).then(() => true, () => false);
+const capture = (text, sessionId, requestId = "r1") =>
+  P.capture({ nodes: P.collect({ messages: text.map((content) => ({ role: "user", content })) }), requestId, sessionId, model: "m", client: "c" }, library, detector);
+
+let dir, file;
+beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "pii-writer-")); file = join(dir, "prompts.db"); process.env.PII_GUARD_PROMPTS = file; await P._reset(); });
+afterEach(async () => { await P._reset(); delete process.env.PII_GUARD_PROMPTS; delete process.env.PII_GUARD_PROMPTS_WORKER; await rm(dir, { recursive: true, force: true }); });
+
+describeIfLibrary("prompt store batching", () => {
+  it("capture never opens the database: nothing exists on disk until the batch is written", async () => {
+    expect(capture(["first question"], null)).toBe(1);
+    expect(capture(["second question"], "known-later")).toBeGreaterThan(0); // held until its digests load
+    await new Promise((r) => setImmediate(r));
+    expect(await exists(file)).toBe(false);
+    expect(P.stats.stored).toBe(0);
+    P.flush();
+    expect(await exists(file)).toBe(true);
+    expect(P.stats.stored).toBe(2);
+  });
+
+  it("writes on its own about a second later, in one batch", async () => {
+    for (let i = 0; i < 5; i++) capture([`timer row ${i}`], null, `t${i}`);
+    expect(P.stats.stored).toBe(0);
+    await new Promise((r) => setTimeout(r, 1300));
+    expect(P.stats.stored).toBe(5);
+    expect(P.search({ q: "timer" }).rows).toHaveLength(5);
+  });
+
+  it("a session not in memory is deduplicated against the store, off the request path", async () => {
+    capture(["alpha one", "alpha two"], "s1", "a1");
+    P.flush();
+    P._forget(); // as after a restart, or an evicted session
+    capture(["alpha one", "alpha two", "alpha three"], "s1", "a2");
+    expect(P.stats.stored).toBe(2);
+    P.flush();
+    expect(P.stats.stored).toBe(3);
+    expect(P.search({ sessionId: "s1" }).rows.map((r) => r.requestId)).toEqual(["a2", "a1", "a1"]);
+  });
+
+  it("drops held requests past the bound instead of growing without limit", () => {
+    for (let i = 0; i < 520; i++) capture(["held"], `session-${i}`, `h${i}`);
+    expect(P.stats.dropped).toBe(20);
+  });
+});
+
+describeIfLibrary("prompt store insert idempotency", () => {
+  const row = (i, sessionId = "s") => ({ ts: Date.now() + i, requestId: `r${i}`, sessionId, model: null, provider: null, combo: null, account: null, client: null, role: "user", kind: "text", path: `messages[0].content`, text: `row ${i}`, cut: 0, hashes: "", digest: `dg${i}`, tool: null });
+
+  it("a retried batch inserts nothing twice, even after a worker restart", () => {
+    const h = D.openDb(file);
+    const ops = [1, 2, 3].map((i) => ({ row: row(i) }));
+    expect(D.writeOps(h, ops)).toMatchObject({ stored: 3 });
+    // The same batch arrives again (late retry after an RPC timeout).
+    expect(D.writeOps(h, ops)).toMatchObject({ stored: 0 });
+    // And again from a fresh connection, as the writer thread would.
+    D.closeDb(h);
+    const h2 = D.openDb(file);
+    expect(D.writeOps(h2, ops)).toMatchObject({ stored: 0 });
+    expect(h2.db.prepare("SELECT COUNT(*) AS n FROM messages").get().n).toBe(3);
+    expect(D.textBytes(h2)).toBe(D.writeOps(h2, []).stored ? 0 : sum2(h2));
+  });
+
+  const sum2 = (h) => Number(h.db.prepare("SELECT COALESCE(SUM(length(CAST(text AS BLOB))), 0) AS n FROM messages").get().n);
+
+  it("pre-existing duplicates are deduped before the unique index is created", () => {
+    const h = D.openDb(file);
+    const ops = [1, 2, 3].map((i) => ({ row: row(i) }));
+    D.writeOps(h, ops);
+    D.closeDb(h);
+    // Simulate a database from an even older build: no unique index yet and a
+    // duplicate row inside. Drop the index, duplicate a row, then reopen.
+    const raw = D.openDb(file);
+    raw.db.exec("DROP INDEX IF EXISTS messages_dedupe2");
+    raw.db.exec(`INSERT INTO messages (ts, request_id, session_id, role, kind, path, text, cut, hashes, digest)
+      SELECT ts, request_id, session_id, role, kind, path, text, cut, hashes, digest FROM messages LIMIT 1`);
+    D.closeDb(raw);
+    const h2 = D.openDb(file); // runs the dedupe-then-index migration
+    expect(h2.db.prepare("SELECT COUNT(*) AS n FROM messages").get().n).toBe(3);
+    D.closeDb(h2);
+  });
+
+  it("rows without a session are idempotent too", () => {
+    const h = D.openDb(file);
+    const ops = [1, 2, 3].map((i) => ({ row: row(i, null) }));
+    expect(D.writeOps(h, ops)).toMatchObject({ stored: 3 });
+    expect(D.writeOps(h, ops)).toMatchObject({ stored: 0 });
+    // The same digest under another request is a different message.
+    expect(D.writeOps(h, [{ row: { ...row(1, null), requestId: "other" } }])).toMatchObject({ stored: 1 });
+    expect(h.db.prepare("SELECT COUNT(*) AS n FROM messages").get().n).toBe(4);
+    expect(D.textBytes(h)).toBe(sum2(h));
+    D.closeDb(h);
+  });
+
+  it("migrates a store with the old index: sessionless duplicates go, the byte counter stays exact", () => {
+    const h = D.openDb(file);
+    D.writeOps(h, [1, 2, 3].map((i) => ({ row: row(i, null) })));
+    D.writeOps(h, [4, 5].map((i) => ({ row: row(i) })));
+    // The store as the previous build left it: the old index, under which a NULL session never collides.
+    h.db.exec("DROP INDEX messages_dedupe2; CREATE UNIQUE INDEX messages_dedupe ON messages(session_id, request_id, path, digest);");
+    expect(D.writeOps(h, [1, 2].map((i) => ({ row: row(i, null) })))).toMatchObject({ stored: 2 }); // the bug
+    expect(h.db.prepare("SELECT COUNT(*) AS n FROM messages").get().n).toBe(7);
+    D.closeDb(h);
+    const h2 = D.openDb(file);
+    const indexes = h2.db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'messages_dedupe%'").all().map((x) => x.name);
+    expect(indexes).toEqual(["messages_dedupe2"]);
+    expect(h2.db.prepare("SELECT COUNT(*) AS n FROM messages").get().n).toBe(5);
+    expect(D.textBytes(h2)).toBe(sum2(h2));
+    // Full-text search still matches the rows that stayed, once each.
+    expect(D.search(h2, { q: "row", to: Date.now() + 1000 }).rows).toHaveLength(5);
+    expect(D.writeOps(h2, [1, 2, 3].map((i) => ({ row: row(i, null) })))).toMatchObject({ stored: 0 });
+    D.closeDb(h2);
+    // A second open has nothing to migrate.
+    const h3 = D.openDb(file);
+    expect(h3.db.prepare("SELECT COUNT(*) AS n FROM messages").get().n).toBe(5);
+    D.closeDb(h3);
+  });
+});
+
+describeIfLibrary("prompt store retention", () => {
+  const fill = (h, n, size, ts = Date.now()) => D.writeOps(h, Array.from({ length: n }, (_, i) => ({ row: { ts: ts + i, requestId: `r${i}`, sessionId: "s", model: null, provider: null, combo: null, account: null, client: null, role: "user", kind: "text", path: "p", text: `w${i} `.repeat(Math.ceil(size / 6)).slice(0, size), cut: 0, hashes: "", digest: `d${i}`, tool: null } })));
+  const sum = (h) => Number(h.db.prepare("SELECT COALESCE(SUM(length(CAST(text AS BLOB))), 0) AS n FROM messages").get().n);
+
+  it("keeps a byte counter equal to the stored text through inserts, expiry and eviction", () => {
+    const h = D.openDb(file);
+    fill(h, 50, 2000, Date.now() - 20 * 864e5); // already expired
+    fill(h, 200, 2000);
+    expect(D.textBytes(h)).toBe(sum(h));
+    expect(D.sweep(h).removed).toBe(50);
+    expect(D.textBytes(h)).toBe(sum(h));
+    D.sweep(h, Date.now(), { capBytes: 150_000 });
+    expect(D.textBytes(h)).toBe(sum(h));
+    D.closeDb(h);
+  });
+
+  it("evicts the oldest rows until text and file are under the cap", () => {
+    const h = D.openDb(file);
+    fill(h, 600, 4000);
+    const cap = 1024 * 1024;
+    expect(D.usedBytes(h)).toBeGreaterThan(cap);
+    const { removed } = D.sweep(h, Date.now(), { capBytes: cap });
+    expect(removed).toBeGreaterThan(0);
+    expect(D.textBytes(h)).toBeLessThanOrEqual(cap);
+    expect(D.usedBytes(h)).toBeLessThanOrEqual(cap);
+    const left = h.db.prepare("SELECT MIN(request_id) AS oldest, COUNT(*) AS n FROM messages").get();
+    expect(Number(left.n)).toBe(600 - removed);
+    expect(h.db.prepare("SELECT 1 FROM messages WHERE request_id = 'r0'").get()).toBeUndefined(); // oldest went first
+    expect(h.db.prepare("SELECT 1 FROM messages WHERE request_id = 'r599'").get()).toBeDefined();
+    // Search no longer finds an evicted row.
+    expect(D.search(h, { q: "w0" }).rows).toEqual([]);
+    D.closeDb(h);
+  });
+
+  it("works in slices under a time budget and reports what is left", () => {
+    const h = D.openDb(file);
+    fill(h, 900, 500, Date.now() - 20 * 864e5);
+    const first = D.sweep(h, Date.now(), { budgetMs: 0, chunk: 100 });
+    expect(first).toMatchObject({ removed: 100, more: true });
+    let more = true, rounds = 0;
+    while (more && rounds++ < 50) more = D.sweep(h, Date.now(), { budgetMs: 0, chunk: 100 }).more;
+    expect(Number(h.db.prepare("SELECT COUNT(*) AS n FROM messages").get().n)).toBe(0);
+    expect(D.textBytes(h)).toBe(0);
+    D.closeDb(h);
+  });
+});
+
+describeIfLibrary("prompt store writer thread", () => {
+  it("stores, deduplicates after a restart, searches and sweeps without a main-thread connection", async () => {
+    process.env.PII_GUARD_PROMPTS_WORKER = "on";
+    capture(["worker one", "worker two"], "ws", "w1");
+    await P.flush();
+    expect(P.stats).toMatchObject({ stored: 2, errors: 0 });
+    P._forget();
+    capture(["worker one", "worker two", "worker three"], "ws", "w2");
+    P.updateRouting("w2", { provider: "prov", combo: "daily", account: "acc" }, detector);
+    await P.flush();
+    expect(P.stats.stored).toBe(3);
+    const rows = (await P.searchAsync({ q: "worker" })).rows;
+    expect(rows.map((r) => r.requestId)).toEqual(["w2", "w1", "w1"]);
+    expect(rows[0]).toMatchObject({ provider: "prov", combo: "daily", account: "acc" });
+    expect((await P.conversationAsync({ sessionId: "ws" })).messages.total).toBe(3);
+    expect(await P.messageAsync(rows[0].id)).toMatchObject({ text: "worker three" });
+    expect(await P.sweepAsync(Date.now() + 15 * 864e5)).toBe(3);
+    expect((await P.searchAsync({})).rows).toEqual([]);
+  });
+});
+
+describe("prompt store size cap", () => {
+  it("defaults to 512 MiB and follows PII_GUARD_PROMPTS_MAX_MB", () => {
+    expect(D.storeCapBytes({})).toBe(512 * 1024 * 1024);
+    expect(D.storeCapBytes({ PII_GUARD_PROMPTS_MAX_MB: "1024" })).toBe(1024 * 1024 * 1024);
+    expect(D.storeCapBytes({ PII_GUARD_PROMPTS_MAX_MB: "64.5" })).toBe(Math.floor(64.5 * 1024 * 1024));
+    for (const bad of ["", "abc", "0", "-5", "NaN"]) expect(D.storeCapBytes({ PII_GUARD_PROMPTS_MAX_MB: bad })).toBe(512 * 1024 * 1024);
+  });
+});
+
+describeIfLibrary("prompt store size cap from the environment", () => {
+  it("a sweep without an explicit cap uses PII_GUARD_PROMPTS_MAX_MB", () => {
+    const h = D.openDb(file);
+    const big = "x".repeat(64 * 1024);
+    D.writeOps(h, Array.from({ length: 40 }, (_, i) => ({ row: { ts: Date.now() + i, requestId: `r${i}`, sessionId: "cap", model: null, provider: null, combo: null, account: null, client: null, role: "user", kind: "text", path: "p", text: big, cut: 0, hashes: "", digest: `d${i}`, tool: null } })));
+    expect(D.sweep(h).removed).toBe(0); // 2.5 MiB is far under the default
+    process.env.PII_GUARD_PROMPTS_MAX_MB = "1";
+    try {
+      expect(D.sweep(h).removed).toBeGreaterThan(0);
+      expect(D.textBytes(h)).toBeLessThanOrEqual(1024 * 1024);
+    } finally { delete process.env.PII_GUARD_PROMPTS_MAX_MB; }
+    D.closeDb(h);
+  });
+});
+
+describeIfLibrary("prompt store shutdown flush", () => {
+  const stored = () => {
+    const h = D.openDb(file);
+    const rows = h.db.prepare("SELECT request_id AS r, text FROM messages ORDER BY id").all().map((x) => `${x.r}:${x.text}`);
+    D.closeDb(h);
+    return rows;
+  };
+
+  it("the database shutdown hooks write the queue on the fallback path", async () => {
+    const { runBeforeDbClose } = await import("../../src/lib/db/shutdownHooks.js");
+    capture(["no session"], null, "s1");
+    capture(["with session"], "shut-a", "s2");
+    expect(await exists(file)).toBe(false);
+    runBeforeDbClose();
+    expect(stored().sort()).toEqual(["s1:no session", "s2:with session"]);
+    // A second run (beforeExit, then exit) has nothing left to write.
+    runBeforeDbClose();
+    expect(stored()).toHaveLength(2);
+  });
+
+  it("writes queued and parked rows synchronously when a writer thread is in use", async () => {
+    process.env.PII_GUARD_PROMPTS_WORKER = "on";
+    capture(["queued row"], null, "w1");
+    capture(["parked row"], "shut-b", "w2"); // waits for the writer thread to load the session
+    P.flushOnShutdown();
+    expect(stored().sort()).toEqual(["w1:queued row", "w2:parked row"]);
+  });
+
+  it("a batch already sent to the writer thread is not stored twice", async () => {
+    process.env.PII_GUARD_PROMPTS_WORKER = "on";
+    capture(["warm up"], "shut-c", "w0");
+    await P.flush();
+    capture(["in flight"], "shut-c", "w1");
+    const sent = P.flush();
+    await new Promise((r) => setImmediate(r)); // the batch is now with the writer thread
+    P.flushOnShutdown();
+    await sent;
+    expect(stored().filter((r) => r === "w1:in flight")).toHaveLength(1);
+  });
+
+  it("a sessionless batch in flight is written on shutdown, once", async () => {
+    process.env.PII_GUARD_PROMPTS_WORKER = "on";
+    capture(["warm up"], null, "n0");
+    await P.flush();
+    capture(["no session in flight"], null, "n1");
+    const sent = P.flush();
+    await new Promise((r) => setImmediate(r));
+    P.flushOnShutdown();
+    await sent;
+    expect(stored().filter((r) => r === "n1:no session in flight")).toHaveLength(1);
+  });
+});
+
+describeIfLibrary("prompt store write that times out", () => {
+  afterEach(() => P._setRpcTimeout());
+
+  // A stand-in for the writer thread: it answers when the test says so.
+  function slowWorker() {
+    const posted = [];
+    globalThis.__nineRouterPiiPromptStore.worker = { postMessage: (m) => posted.push(m), terminate: async () => {} };
+    return posted;
+  }
+
+  it("is not forgotten: its messages are not selected again, and the late reply stores them once", async () => {
+    process.env.PII_GUARD_PROMPTS_WORKER = "on";
+    const posted = slowWorker();
+    P._setRpcTimeout(30);
+    capture(["slow one", "slow two"], "late-s", "q1");
+    expect(posted.map((m) => m.method)).toEqual(["seed"]);
+    P._workerReply({ id: posted[0].id, result: [] });
+    await P.flush(); // resolves at the timeout: the thread is busy with a long read
+    expect(posted.map((m) => m.method)).toEqual(["seed", "write"]);
+    expect(posted[1].args.ops).toHaveLength(2);
+    expect(P.stats).toMatchObject({ stored: 0, dropped: 0, errors: 1 });
+    // The client sends the same conversation again before the thread gets to the write.
+    expect(capture(["slow one", "slow two"], "late-s", "q2")).toBe(0);
+    // The thread writes the batch after all.
+    P._workerReply({ id: posted[1].id, result: { stored: 2, bytes: 16 } });
+    expect(P.stats).toMatchObject({ stored: 2, dropped: 0 });
+    expect(capture(["slow one", "slow two", "slow three"], "late-s", "q3")).toBe(1);
+  });
+
+  it("counts the batch as dropped only when the late reply is a failure", async () => {
+    process.env.PII_GUARD_PROMPTS_WORKER = "on";
+    const posted = slowWorker();
+    P._setRpcTimeout(30);
+    capture(["lost row"], null, "x1");
+    await P.flush();
+    expect(P.stats).toMatchObject({ stored: 0, dropped: 0 });
+    P._workerReply({ id: posted[0].id, error: "database is locked" });
+    expect(P.stats).toMatchObject({ stored: 0, dropped: 1 });
+  });
+});
+
+describeIfLibrary("prompt store open retry", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("waits 30 s, 2 min, then 10 min between tries", () => {
+    expect([1, 2, 3, 4, 9].map(D.openRetryMs)).toEqual([30_000, 120_000, 600_000, 600_000, 600_000]);
+  });
+
+  it("a failed open is tried again after the backoff instead of staying off until a restart", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const blocker = join(dir, "blocker"); // a file where the store's directory should be
+    await writeFile(blocker, "");
+    process.env.PII_GUARD_PROMPTS = join(blocker, "prompts.db");
+    expect(P.search({}).unavailable).toBe(true);
+    await rm(blocker);
+    // Not on every call: the next try is 30 s later.
+    vi.advanceTimersByTime(29_000);
+    expect(P.search({}).unavailable).toBe(true);
+    vi.advanceTimersByTime(2_000);
+    expect(P.search({})).toEqual({ rows: [], next: null });
+    capture(["after the retry"], null, "b1");
+    P.flush();
+    expect(P.search({ q: "retry" }).rows).toHaveLength(1);
+  });
+
+  it("this thread's connection waits for a lock instead of failing at once", () => {
+    P.search({});
+    const h = globalThis.__nineRouterPiiPromptStore.inline;
+    expect(h.db.prepare("PRAGMA busy_timeout").get().timeout).toBe(1000);
+  });
+});

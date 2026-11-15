@@ -7,6 +7,7 @@ import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { USAGE_APIKEY_PROVIDERS } from "@/shared/constants/providers";
 import { normalizeQuotaRow, sortQuotaRows } from "@/lib/spend/quotaRunway.js";
 import { createRefreshDeduper, quotaUsageRows } from "@/lib/spend/quotaSnapshot.js";
+import { isSyncRequest } from "@/lib/dashboardSync.js";
 
 export const dynamic = "force-dynamic";
 const TTL = 60000, TIMEOUT = 8000;
@@ -14,6 +15,9 @@ let cached = null;
 let inFlight = null;
 const refreshConnection = createRefreshDeduper();
 
+// Stale-while-revalidate: GET returns the last snapshot at once with its
+// "as of" time and starts a background refresh when the snapshot is older
+// than TTL. A page load never waits on provider APIs; only "Sync now" does.
 async function readConnection(connection, now) {
   let timer;
   const deadline = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Usage request timed out")), TIMEOUT); });
@@ -52,15 +56,38 @@ async function fetchQuotaSnapshot() {
   } catch (error) { throw error; }
 }
 
-export async function GET() {
-  if (cached && cached.expiresAt > Date.now()) return NextResponse.json(cached.body, { headers: { "Cache-Control": "no-store" } });
-  if (!inFlight) {
-    inFlight = fetchQuotaSnapshot().then(({ rows, hasSuccess }) => {
-      const body = { rows };
-      if (hasSuccess) cached = { body, expiresAt: Date.now() + (rows.some((row) => row.error) ? 15000 : TTL) };
-      return body;
-    }).finally(() => { inFlight = null; });
+const NO_STORE = { headers: { "Cache-Control": "no-store" } };
+
+// One refresh at a time; every caller that needs one joins it.
+function startRefresh() {
+  inFlight ||= fetchQuotaSnapshot().then(({ rows, hasSuccess }) => {
+    const body = { rows, asOf: Date.now() };
+    if (hasSuccess) cached = { body, expiresAt: Date.now() + (rows.some((row) => row.error) ? 15000 : TTL) };
+    return body;
+  }).catch((error) => {
+    // The refresh may run detached behind a stale body; a rejection must
+    // never surface as an unhandled rejection (it can kill the process). Keep
+    // serving the last snapshot; a later request retries.
+    console.error("[quota] refresh failed:", error?.message || error);
+    return null;
+  }).finally(() => { inFlight = null; });
+  return inFlight;
+}
+
+// No ETag here: the answer is no-store and the page never sends a
+// conditional request.
+export async function GET(request) {
+  // "Sync now" waits for a snapshot read from the providers now (each read
+  // has its own timeout). Everything else gets the last snapshot at once.
+  const sync = isSyncRequest(request);
+  if (!sync && cached && cached.expiresAt > Date.now()) return NextResponse.json(cached.body, NO_STORE);
+  const refresh = startRefresh();
+  if (!sync && cached) {
+    // Serve the stale snapshot at once. `refreshing` tells the page to ask
+    // again shortly for the snapshot this refresh produces.
+    return NextResponse.json({ ...cached.body, refreshing: true }, NO_STORE);
   }
-  try { return NextResponse.json(await inFlight, { headers: { "Cache-Control": "no-store" } }); }
-  catch (error) { return NextResponse.json({ error: error.message }, { status: 500 }); }
+  const body = await refresh;
+  if (!body) return NextResponse.json({ error: "Quota refresh failed" }, { status: 502, ...NO_STORE });
+  return NextResponse.json(body, NO_STORE);
 }

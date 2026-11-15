@@ -384,7 +384,11 @@ export default function ProviderTopology({ providers = [], activeRequests = [], 
 
   useEffect(() => {
     if (rawActiveSet.size === 0) return;
-    const id = setInterval(() => setTick((t) => t + 1), FE_ACTIVE_TICK_MS);
+    const id = setInterval(() => {
+      // Pause the tick while the tab is hidden — no repaint cost in background.
+      if (typeof document !== "undefined" && document.hidden) return;
+      setTick((t) => t + 1);
+    }, FE_ACTIVE_TICK_MS);
     return () => clearInterval(id);
   }, [rawActiveSet]);
 

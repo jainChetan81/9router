@@ -54,6 +54,8 @@ const ALWAYS_PROTECTED = [
   "/api/pii-guard/prompts",
   "/api/pii-guard/sessions",
   "/api/agents",
+  // Live dashboard change stream.
+  "/api/live",
 ];
 
 // Require auth, but allow through if requireLogin is disabled

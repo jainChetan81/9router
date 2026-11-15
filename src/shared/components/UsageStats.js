@@ -3,6 +3,8 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { FREE_PROVIDERS, AI_PROVIDERS } from "@/shared/constants/providers";
+import { useLiveTopic } from "@/shared/hooks/useLive.js";
+import { createLatestRequest } from "@/shared/utils/latestRequest.js";
 
 // Keep providers without serviceKinds (default LLM) or with "llm" in serviceKinds
 function isLLMProvider(id) {
@@ -29,15 +31,35 @@ function timeAgo(timestamp) {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
+// Shared 1s tick, paused while the tab is hidden. One interval for all rows.
+let sharedTickListeners = new Set();
+let sharedTickTimer = null;
+
+function subscribeSharedTick(fn) {
+  sharedTickListeners.add(fn);
+  if (!sharedTickTimer) {
+    sharedTickTimer = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      for (const l of sharedTickListeners) {
+        try { l(); } catch {}
+      }
+    }, 1000);
+  }
+  return () => {
+    sharedTickListeners.delete(fn);
+    if (sharedTickListeners.size === 0 && sharedTickTimer) {
+      clearInterval(sharedTickTimer);
+      sharedTickTimer = null;
+    }
+  };
+}
+
 // Auto-update time display every second without re-rendering parent
 function TimeAgo({ timestamp }) {
   const [, setTick] = useState(0);
-  
-  useEffect(() => {
-    const timer = setInterval(() => setTick(t => t + 1), 1000);
-    return () => clearInterval(timer);
-  }, []);
-  
+
+  useEffect(() => subscribeSharedTick(() => setTick(t => t + 1)), []);
+
   return <>{timeAgo(timestamp)}</>;
 }
 
@@ -255,8 +277,11 @@ export default function UsageStats({ period: periodProp, setPeriod: setPeriodPro
       .catch(() => {});
   }, []);
 
-  // Fetch filtered stats via REST when period changes
-  useEffect(() => {
+  // Fetch filtered stats via REST when period changes. Only the latest request counts: a new one aborts
+  // the one in flight, and a late answer for a previous period is ignored.
+  const [statsRequest] = useState(() => createLatestRequest());
+  useEffect(() => () => statsRequest.cancel(), [statsRequest]);
+  const fetchStats = useCallback(() => {
     // First load: show full spinner; subsequent: show subtle fetching indicator
     if (isInitialLoad.current) {
       isInitialLoad.current = false;
@@ -265,26 +290,29 @@ export default function UsageStats({ period: periodProp, setPeriod: setPeriodPro
       setFetching(true);
     }
 
-    fetch(`/api/usage/stats?period=${period}`)
-      .then((r) => r.ok ? r.json() : null)
-      .then((data) => {
-        if (data) {
-          hasLoadedStats.current = true;
-          setStats((prev) => ({ ...prev, ...data }));
-        }
-      })
-      .catch(() => {})
-      .finally(() => {
-        setLoading(false);
-        setFetching(false);
-      });
-  }, [period]);
+    statsRequest.json(`/api/usage/stats?period=${period}`).then(({ current, data }) => {
+      if (!current) return; // a newer request owns the state and the spinners
+      if (data) {
+        hasLoadedStats.current = true;
+        setStats((prev) => ({ ...prev, ...data }));
+      }
+      setLoading(false);
+      setFetching(false);
+    });
+  }, [period, statsRequest]);
+
+  useEffect(() => {
+    fetchStats();
+  }, [fetchStats]);
+
+  // Live stream: the tick moves on every usage event, and when the tab is shown again or the stream reconnects
+  const { tick: usageLiveVersion } = useLiveTopic("usage", { throttleMs: 5000 });
 
   // SSE connection - real-time updates for activeRequests + recentRequests only
   useEffect(() => {
-    const es = new EventSource("/api/usage/stream");
+    let es = new EventSource("/api/usage/stream");
 
-    es.onmessage = (e) => {
+    const handleMessage = (e) => {
       try {
         const data = JSON.parse(e.data);
         // Always merge only real-time fields, never overwrite full stats from REST
@@ -304,10 +332,46 @@ export default function UsageStats({ period: periodProp, setPeriod: setPeriodPro
       }
     };
 
-    es.onerror = () => setLoading(false);
+    const handleError = () => setLoading(false);
 
-    return () => es.close();
+    const attachHandlers = () => {
+      if (!es) return;
+      es.onmessage = handleMessage;
+      es.onerror = handleError;
+    };
+
+    attachHandlers();
+
+    // Close the stream in hidden tabs; reopen when visible again. The stats are not fetched here: the live
+    // tick below moves when the tab is shown, and that is the one refetch.
+    const onVisibility = () => {
+      if (typeof document === "undefined") return;
+      if (document.hidden) {
+        if (es) { es.close(); es = null; }
+      } else {
+        if (!es) {
+          es = new EventSource("/api/usage/stream");
+          attachHandlers();
+        }
+      }
+    };
+
+    document?.addEventListener?.("visibilitychange", onVisibility);
+
+    return () => {
+      document?.removeEventListener?.("visibilitychange", onVisibility);
+      if (es) es.close();
+    };
+    // Independent of the period: changing it must not close and reopen the stream.
   }, []);
+
+  // Refetch full stats when the usage tick moves (a usage event, the tab shown again, a reconnect).
+  // The current fetch is read from a ref, so this runs on a tick only, not on a period change.
+  const fetchStatsRef = useRef(fetchStats);
+  useEffect(() => { fetchStatsRef.current = fetchStats; });
+  useEffect(() => {
+    if (usageLiveVersion > 0 && hasLoadedStats.current) fetchStatsRef.current();
+  }, [usageLiveVersion]);
 
   const toggleSort = useCallback((tableType, field) => {
     const params = new URLSearchParams(searchParams.toString());

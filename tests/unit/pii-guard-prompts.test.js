@@ -288,6 +288,7 @@ describe("metadata validation and routing updates", () => {
     P.flush();
     expect(P.search({ requestId: "r1" }).rows[0]).toMatchObject({ provider: "first", combo: "daily", account: "work" });
     P.updateRouting("r1", { provider: "last", combo: "daily", account: "name@example.test" }, detector);
+    P.flush(); // persisted rows are updated by the next batch, not on the caller's thread
     expect(P.search({ requestId: "r1" }).rows[0]).toMatchObject({ provider: "last", combo: "daily", account: null });
   });
 

@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { sanitizeDashboardSync, syncSecondsFor, syncLabel, SYNC_DEFAULTS } from "../../src/lib/dashboardSync.js";
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { sanitizeDashboardSync, syncSecondsFor, syncLabel, SYNC_DEFAULTS, createCountdown } from "../../src/lib/dashboardSync.js";
 
 describe("dashboardSync", () => {
   it("keeps known pages with allowed values", () => {
@@ -24,5 +24,102 @@ describe("dashboardSync", () => {
     expect(syncLabel(0)).toBe("Off");
     expect(syncLabel(30)).toBe("30 s");
     expect(syncLabel(300)).toBe("5 min");
+  });
+});
+
+describe("auto-sync countdown", () => {
+  // A hand-driven clock and tab: the countdown takes both as inputs.
+  const setup = (seconds) => {
+    vi.useFakeTimers();
+    const state = { hidden: false, fired: 0, notified: 0 };
+    const countdown = createCountdown({ onFire: () => { state.fired++; }, hidden: () => state.hidden });
+    countdown.subscribe(() => { state.notified++; });
+    countdown.setSeconds(seconds);
+    return { countdown, state };
+  };
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("counts down once a second, fires at zero and starts over", () => {
+    const { countdown, state } = setup(10);
+    expect(countdown.getLeft()).toBe(10);
+    vi.advanceTimersByTime(3000);
+    expect(countdown.getLeft()).toBe(7);
+    expect(state.fired).toBe(0);
+    vi.advanceTimersByTime(7000);
+    expect(state.fired).toBe(1);
+    expect(countdown.getLeft()).toBe(10);
+    countdown.stop();
+  });
+
+  it("tells only its subscribers, once per changed second", () => {
+    const { countdown, state } = setup(10);
+    const before = state.notified;
+    vi.advanceTimersByTime(4000);
+    expect(state.notified - before).toBe(4);
+    countdown.stop();
+  });
+
+  it("runs no timer while the tab is hidden and syncs at once when a stale tab returns", () => {
+    const { countdown, state } = setup(30);
+    state.hidden = true; countdown.visibility();
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(120_000);
+    expect(state.fired).toBe(0);
+    state.hidden = false; countdown.visibility();
+    expect(state.fired).toBe(1);
+    expect(countdown.getLeft()).toBe(30);
+    expect(vi.getTimerCount()).toBe(1);
+    countdown.stop();
+  });
+
+  it("carries on without a sync when the tab returns before the deadline", () => {
+    const { countdown, state } = setup(60);
+    vi.advanceTimersByTime(10_000);
+    state.hidden = true; countdown.visibility();
+    vi.advanceTimersByTime(20_000);
+    state.hidden = false; countdown.visibility();
+    expect(state.fired).toBe(0);
+    expect(countdown.getLeft()).toBe(30);
+    countdown.stop();
+  });
+
+  it("a manual sync restarts the interval, and 0 turns it off", () => {
+    const { countdown, state } = setup(10);
+    vi.advanceTimersByTime(6000);
+    countdown.restart();
+    expect(countdown.getLeft()).toBe(10);
+    countdown.setSeconds(0);
+    expect(countdown.getLeft()).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(60_000);
+    expect(state.fired).toBe(0);
+  });
+});
+
+describe("defaults", () => {
+  it("agents falls back to a 60 s timer: live data comes from the stream", () => {
+    expect(SYNC_DEFAULTS).toEqual({ agents: 60, spend: 0, piiGuard: 0, quota: 0 });
+  });
+});
+
+describe("sync signal", () => {
+  it("syncHeaders sends x-9r-sync only for a sync", async () => {
+    const { SYNC_HEADER, syncHeaders } = await import("../../src/lib/dashboardSync.js");
+    expect(SYNC_HEADER).toBe("x-9r-sync");
+    expect(syncHeaders(true)).toEqual({ "x-9r-sync": "1" });
+    expect(syncHeaders(false)).toBeUndefined();
+    expect(syncHeaders()).toBeUndefined();
+  });
+
+  it("isSyncRequest reads the header and nothing else", async () => {
+    const { isSyncRequest } = await import("../../src/lib/dashboardSync.js");
+    const req = (headers) => new Request("http://localhost/api/x?x-9r-sync=1", { headers });
+    expect(isSyncRequest(req({ "x-9r-sync": "1" }))).toBe(true);
+    expect(isSyncRequest(req({ "X-9R-Sync": "1" }))).toBe(true);
+    expect(isSyncRequest(req({}))).toBe(false);
+    expect(isSyncRequest(req({ "x-9r-sync": "0" }))).toBe(false);
+    expect(isSyncRequest(req({ "x-9r-sync": "true" }))).toBe(false);
+    expect(isSyncRequest(null)).toBe(false);
+    expect(isSyncRequest({})).toBe(false);
   });
 });
