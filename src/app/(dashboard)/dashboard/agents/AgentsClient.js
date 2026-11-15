@@ -157,25 +157,22 @@ export default function AgentsClient() {
   // One batch request for every live session. `live` changes far more often than the request takes:
   // the poller runs one request at a time and follows a change that arrived meanwhile with a trailing
   // run, so the newest session list is never left waiting for a later change.
-  const overridePoller = useRef(null);
-  if (!overridePoller.current) {
-    overridePoller.current = createTrailingPoller({
-      gapMs: OVERRIDES_GAP_MS,
-      run: (ids) => {
-        const reqIds = Object.fromEntries(ids.map((sid) => [sid, nextOverrideRequestId(sid)]));
-        return getJson(`/api/agents/overrides?ids=${ids.map(encodeURIComponent).join(",")}`).then((d) => {
-          const got = d.sessions || {};
-          const fresh = ids.filter((sid) => got[sid.toLowerCase()] && overrideRequestIds.get(sid) === reqIds[sid]);
-          setOverridesBySession((old) => ({ ...old, ...Object.fromEntries(fresh.map((sid) => { const v = got[sid.toLowerCase()]; return [sid, { overrides: v.overrides || [], revisions: v.revisions || {} }]; })) }));
-        });
-      },
-    });
-  }
-  useEffect(() => () => overridePoller.current.cancel(), []);
+  const [overridePoller] = useState(() => createTrailingPoller({
+    gapMs: OVERRIDES_GAP_MS,
+    run: (ids) => {
+      const reqIds = Object.fromEntries(ids.map((sid) => [sid, nextOverrideRequestId(sid)]));
+      return getJson(`/api/agents/overrides?ids=${ids.map(encodeURIComponent).join(",")}`).then((d) => {
+        const got = d.sessions || {};
+        const fresh = ids.filter((sid) => got[sid.toLowerCase()] && overrideRequestIds.get(sid) === reqIds[sid]);
+        setOverridesBySession((old) => ({ ...old, ...Object.fromEntries(fresh.map((sid) => { const v = got[sid.toLowerCase()]; return [sid, { overrides: v.overrides || [], revisions: v.revisions || {} }]; })) }));
+      });
+    },
+  }));
+  useEffect(() => () => overridePoller.cancel(), [overridePoller]);
   useEffect(() => {
     const ids = (live?.sessions || []).map((s) => s.session).filter(Boolean);
-    if (ids.length) overridePoller.current.request(ids);
-  }, [live]);
+    if (ids.length) overridePoller.request(ids);
+  }, [live, overridePoller]);
 
   useEffect(() => {
     const el = document.documentElement, sync = () => setTheme(el.classList.contains("dark") ? "dark" : "light");

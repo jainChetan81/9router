@@ -279,9 +279,8 @@ export default function UsageStats({ period: periodProp, setPeriod: setPeriodPro
 
   // Fetch filtered stats via REST when period changes. Only the latest request counts: a new one aborts
   // the one in flight, and a late answer for a previous period is ignored.
-  const statsRequest = useRef(null);
-  if (!statsRequest.current) statsRequest.current = createLatestRequest();
-  useEffect(() => () => statsRequest.current.cancel(), []);
+  const [statsRequest] = useState(() => createLatestRequest());
+  useEffect(() => () => statsRequest.cancel(), [statsRequest]);
   const fetchStats = useCallback(() => {
     // First load: show full spinner; subsequent: show subtle fetching indicator
     if (isInitialLoad.current) {
@@ -291,7 +290,7 @@ export default function UsageStats({ period: periodProp, setPeriod: setPeriodPro
       setFetching(true);
     }
 
-    statsRequest.current.json(`/api/usage/stats?period=${period}`).then(({ current, data }) => {
+    statsRequest.json(`/api/usage/stats?period=${period}`).then(({ current, data }) => {
       if (!current) return; // a newer request owns the state and the spinners
       if (data) {
         hasLoadedStats.current = true;
@@ -300,7 +299,7 @@ export default function UsageStats({ period: periodProp, setPeriod: setPeriodPro
       setLoading(false);
       setFetching(false);
     });
-  }, [period]);
+  }, [period, statsRequest]);
 
   useEffect(() => {
     fetchStats();

@@ -68,7 +68,7 @@ describe("UsageStats wiring", () => {
     expect(source).toMatch(/fetchStatsRef\.current\(\)/);
   });
   it("stats go through the latest-request guard", () => {
-    expect(source).toMatch(/statsRequest\.current\.json\(`\/api\/usage\/stats\?period=\$\{period\}`\)/);
+    expect(source).toMatch(/statsRequest\.json\(`\/api\/usage\/stats\?period=\$\{period\}`\)/);
     expect(source).not.toMatch(/\bfetch\(`\/api\/usage\/stats/);
   });
 });
