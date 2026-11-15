@@ -149,4 +149,29 @@ describe("/api/usage/stream", () => {
     }).not.toThrow();
     await new Promise((r) => setTimeout(r, 1100));
   });
+  it("gives a new client a fresh snapshot, not an old broadcast", async () => {
+    const parse = (text) => JSON.parse(text.split("data: ")[1].split("\n")[0]);
+    await new Promise((r) => setTimeout(r, 1100));
+    const a = openStream();
+    const readerA = (await route.GET(a.request)).body.getReader();
+    await readEvent(readerA);
+
+    // A request starts while client A watches: the broadcast is cached.
+    usageRepo.trackPendingRequest("phantom-model", "phantom", "conn-phantom", true);
+    const during = parse((await readEvent(readerA)).text);
+    expect(during.pending.byModel["phantom-model (phantom)"]).toBe(1);
+
+    // A leaves, then the request ends with nobody connected: no broadcast.
+    a.controller.abort();
+    await new Promise((r) => setTimeout(r, 10));
+    usageRepo.trackPendingRequest("phantom-model", "phantom", "conn-phantom", false);
+    await new Promise((r) => setTimeout(r, 1100));
+
+    const b = openStream();
+    const readerB = (await route.GET(b.request)).body.getReader();
+    const fresh = parse((await readEvent(readerB)).text);
+    expect(fresh.pending.byModel["phantom-model (phantom)"]).toBeUndefined();
+    expect(fresh.activeRequests).toEqual([]);
+    b.controller.abort();
+  });
 });

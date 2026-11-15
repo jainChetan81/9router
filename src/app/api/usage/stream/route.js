@@ -9,6 +9,11 @@ const MAX_CONNECTIONS = 20;
 let lastBroadcastTime = 0;
 let broadcastTimer = null;
 let cachedPayload = null;
+let cachedAt = 0;
+// A connecting client may reuse the last broadcast only this long. Without
+// traffic the last broadcast can be hours old and still list requests that
+// were in flight back then.
+const CONNECT_REUSE_MS = 1000;
 let isBroadcasting = false;
 let keepaliveTimer = null;
 
@@ -19,6 +24,7 @@ async function doBroadcast() {
   try {
     const slim = await getSlimUsageStats();
     cachedPayload = encoder.encode(`data: ${JSON.stringify(slim)}\n\n`);
+    cachedAt = Date.now();
     for (const client of clients) {
       try {
         client.controller.enqueue(cachedPayload);
@@ -110,9 +116,12 @@ export async function GET(request) {
       clients.add(client);
 
       try {
-        if (!cachedPayload) {
+        // The slim payload is built from memory (pending counters and the
+        // recent ring), so a fresh one per connect is cheap.
+        if (!cachedPayload || Date.now() - cachedAt > CONNECT_REUSE_MS) {
           const slim = await getSlimUsageStats();
           cachedPayload = encoder.encode(`data: ${JSON.stringify(slim)}\n\n`);
+          cachedAt = Date.now();
         }
         controller.enqueue(cachedPayload);
       } catch {
