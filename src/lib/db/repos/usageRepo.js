@@ -108,7 +108,8 @@ function scheduleDailyFlush() {
 
 // Highest usageHistory id folded into usageDaily, stored in _meta inside the
 // same transaction as the merged rows. A crash between flushes loses only the
-// in-memory buffer; rows past this marker are re-aggregated at startup.
+// in-memory buffer; rows past this marker are re-aggregated before the next
+// process's first flush or daily read (reconcileUsageDailySync).
 const FLUSHED_MAX_ID_KEY = "usageDailyFlushedMaxId";
 
 // Merge one rollup delta into usageDaily and record the history marker. Runs
@@ -137,6 +138,8 @@ async function flushDailyBuffer() {
   usageDailyBuffer.days = new Map();
   try {
     const db = getAdapterSync();
+    // Before the marker moves: fold what a crash lost (once per process).
+    reconcileUsageDailySync(db);
     db.transaction(() => mergeSnapshotIntoDaily(db, snapshot));
   } catch (err) {
     // Roll the failed snapshot back into the buffer so nothing is lost.
@@ -486,6 +489,8 @@ function mergeUnflushedDailyRows(rows, maxDays) {
 }
 
 function loadDaysInRange(adapter, maxDays) {
+  // The first daily read of a process must see rows a crash lost.
+  reconcileUsageDailySync(adapter);
   let rows;
   if (maxDays == null) {
     rows = adapter.all(`SELECT dateKey, data FROM usageDaily ORDER BY dateKey ASC`);
@@ -512,6 +517,7 @@ const _shutdownUsageFlush = () => {
     }
     if (usageDailyBuffer.days.size > 0) {
       const db = getAdapterSync();
+      reconcileUsageDailySync(db);
       db.transaction(() => mergeSnapshotIntoDaily(db, usageDailyBuffer.days));
       usageDailyBuffer.days.clear();
     }
@@ -530,27 +536,29 @@ if (!global._usageFlushListeners) {
 // Crash recovery: a SIGKILL/OOM loses only the unflushed in-memory buffer.
 // usageHistory rows past the last flush marker are re-aggregated into
 // usageDaily with the same aggregation code path, so daily totals stay
-// exact. Runs once per process, after migrations (the adapter already ran
-// them when it opened the database).
-export async function reconcileUsageDaily() {
+// exact.
+//
+// Runs once per process and is fully synchronous. It is called lazily before
+// the first flush and before the first usageDaily read (and from bootstrap),
+// so it always runs before a flush of this process can move the marker past
+// the lost rows.
+function reconcileUsageDailySync(db) {
   if (global._usageDailyReconciled) return;
   global._usageDailyReconciled = true;
   try {
-    const db = await getAdapter();
-    // Everything below is synchronous, so no save or flush interleaves with it.
     const markerRow = db.get(`SELECT value FROM _meta WHERE key = ?`, [FLUSHED_MAX_ID_KEY]);
     const maxId = Number(db.get(`SELECT MAX(id) AS m FROM usageHistory`)?.m) || 0;
+    // Rows this process saved are in the buffer already; stop before them.
+    const firstSaved = Number(global._usageFirstSavedId) || 0;
+    const upper = firstSaved ? firstSaved - 1 : maxId;
     if (!markerRow) {
       // No marker yet: this is the first start with the buffered rollup.
       // Earlier builds wrote usageDaily on every save, so the table is already
       // complete. Folding history in now would count every row twice.
-      if (maxId) db.transaction(() => setMetaSync(db, FLUSHED_MAX_ID_KEY, maxId));
+      if (upper > 0) db.transaction(() => setMetaSync(db, FLUSHED_MAX_ID_KEY, upper));
       return;
     }
     const marker = Number(markerRow.value) || 0;
-    // Rows this process saved are in the buffer already; stop before them.
-    const firstSaved = Number(global._usageFirstSavedId) || 0;
-    const upper = firstSaved ? firstSaved - 1 : maxId;
     if (upper <= marker) return;
     const rows = db.all(
       `SELECT timestamp, provider, model, connectionId, apiKey, endpoint, cost, tokens
@@ -559,32 +567,65 @@ export async function reconcileUsageDaily() {
     );
     if (!rows.length) return;
     const days = new Map();
+    const tailCount = new Map();
     for (const r of rows) {
       const dateKey = getLocalDateKey(r.timestamp);
       let day = days.get(dateKey);
       if (!day) days.set(dateKey, day = getEmptyDay());
+      tailCount.set(dateKey, (tailCount.get(dateKey) || 0) + 1);
       aggregateEntryToDay(day, {
         timestamp: r.timestamp, provider: r.provider, model: r.model,
         connectionId: r.connectionId, apiKey: r.apiKey, endpoint: r.endpoint,
         cost: r.cost, tokens: parseJson(r.tokens, {}),
       });
     }
-    // Merge the lost tail. The marker moves to `upper` only if no buffered
-    // flush has moved it further already.
+    let folded = 0;
+    // The marker moves to `upper` for every outcome, so a skipped day is
+    // judged once and never re-examined with a longer tail.
     db.transaction(() => {
       for (const [dateKey, delta] of days) {
         const row = db.get(`SELECT data FROM usageDaily WHERE dateKey = ?`, [dateKey]);
         const day = row ? parseJson(row.data, getEmptyDay()) : getEmptyDay();
+        // Per-day guard. A build without the marker (a rollback) writes
+        // usageDaily on every save and leaves the marker behind, so the tail
+        // may be counted already. Fold a day only when exactly the tail is
+        // missing from it; an undercount is the safe failure.
+        const have = Number(day.requests) || 0;
+        const tail = tailCount.get(dateKey);
+        const history = countHistoryForDay(db, dateKey, upper);
+        if (have >= history) continue;
+        if (have + tail !== history) {
+          console.warn(`[usageRepo] usageDaily ${dateKey} has ${have} requests, history has ${history}, tail is ${tail}; not folding (totals for that day may be low)`);
+          continue;
+        }
         mergeDay(day, delta);
         db.run(`INSERT INTO usageDaily(dateKey, data) VALUES(?, ?) ON CONFLICT(dateKey) DO UPDATE SET data = excluded.data`, [dateKey, stringifyJson(day)]);
+        folded += tail;
       }
-      const cur = Number(db.get(`SELECT value FROM _meta WHERE key = ?`, [FLUSHED_MAX_ID_KEY])?.value) || 0;
-      if (upper > cur) setMetaSync(db, FLUSHED_MAX_ID_KEY, upper);
+      setMetaSync(db, FLUSHED_MAX_ID_KEY, upper);
     });
-    console.log(`[usageRepo] reconciled ${rows.length} usageHistory rows into usageDaily after restart (marker ${marker})`);
+    console.log(`[usageRepo] reconciled ${folded} of ${rows.length} usageHistory rows into usageDaily after restart (marker ${marker})`);
   } catch (err) {
     console.error("[usageRepo] usageDaily reconcile failed:", err?.message || err);
   }
+}
+
+// usageHistory rows of one IST day with id <= upper, counted with the rollup's
+// own day-key function. The SQL window is a day wider on each side, so the
+// timestamp's exact text format does not decide which day a row belongs to.
+function countHistoryForDay(db, dateKey, upper) {
+  const start = istDayKeyToMs(dateKey);
+  const rows = db.all(
+    `SELECT timestamp FROM usageHistory WHERE id <= ? AND timestamp >= ? AND timestamp < ?`,
+    [upper, new Date(start - DAY_MS).toISOString(), new Date(start + 2 * DAY_MS).toISOString()]
+  );
+  let n = 0;
+  for (const r of rows) if (getLocalDateKey(r.timestamp) === dateKey) n++;
+  return n;
+}
+
+export async function reconcileUsageDaily() {
+  reconcileUsageDailySync(await getAdapter());
 }
 
 export async function getUsageStats(period = "all") {
