@@ -230,7 +230,7 @@ export default function PiiGuardClient() {
   const live = useLiveTopic("pii", { throttleMs: 15_000 });
   const liveLoad = useRef(load);
   useEffect(() => { liveLoad.current = load; });
-  useEffect(() => { if (live.version > 0) liveLoad.current("poll"); }, [live.version]);
+  useEffect(() => { if (live.tick > 0) liveLoad.current("poll"); }, [live.tick]);
   const manualSync = useCallback(() => load("manual"), [load]);
 
   // Event log: 50 events per page, newest first, flattened to one row per hit. The server applies the

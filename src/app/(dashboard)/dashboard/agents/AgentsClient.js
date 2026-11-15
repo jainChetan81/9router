@@ -388,7 +388,8 @@ export default function AgentsClient() {
   // "usage" moves when a usage row is saved. Either one can change this page.
   const agentsTopic = useLiveTopic("agents", { throttleMs: LIVE_THROTTLE_MS });
   const usageTopic = useLiveTopic("usage", { throttleMs: LIVE_THROTTLE_MS });
-  const liveVersion = `${agentsTopic.version}.${usageTopic.version}`;
+  // `tick` also moves when the tab is shown again or the stream reconnects.
+  const liveVersion = `${agentsTopic.tick}.${usageTopic.tick}`;
   const loadLiveRef = useRef(loadLive);
   const refreshRangeRef = useRef(refreshRange);
   useEffect(() => { loadLiveRef.current = loadLive; refreshRangeRef.current = refreshRange; });
