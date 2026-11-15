@@ -2,7 +2,7 @@
 // the thread that streams /v1 never waits on the disk. Messages are { id, method, file, args }; replies
 // are { id, result } or { id, error }.
 import { parentPort } from "node:worker_threads";
-import { READS, closeDb, digestsFor, openDb, sweep, textBytes, usedBytes, writeOps } from "./promptDb.mjs";
+import { READS, closeDb, digestsFor, openDb, openRetryMs, sweep, textBytes, usedBytes, writeOps } from "./promptDb.mjs";
 
 const emit = process.emit;
 process.emit = function (name, data, ...rest) {
@@ -11,15 +11,19 @@ process.emit = function (name, data, ...rest) {
 };
 
 const HOUR = 36e5, SWEEP_AFTER_BYTES = 8 * 1024 * 1024, SLICE_MS = 100;
-let handle = null, failedFile = null, sinceSweep = 0, sweeping = false;
+let handle = null, failed = null, sinceSweep = 0, sweeping = false;
 
 function open(file) {
   if (handle && handle.file !== file) { closeDb(handle); handle = null; }
-  if (handle || failedFile === file) return handle;
+  if (handle) return handle;
+  // After a failed open the store stays off only until the next retry time.
+  if (failed?.file === file && Date.now() < failed.retryAt) return null;
   // The gateway is the only writer; a short wait covers a dashboard read on another connection.
   handle = openDb(file, { busyTimeout: 2000 });
-  if (!handle) failedFile = file;
-  else { failedFile = null; startSweep(); }
+  if (!handle) {
+    const count = failed?.file === file ? failed.count + 1 : 1;
+    failed = { file, count, retryAt: Date.now() + openRetryMs(count) };
+  } else { failed = null; startSweep(); }
   return handle;
 }
 
@@ -58,11 +62,16 @@ const methods = {
     const h = open(file);
     return h ? { textBytes: textBytes(h), usedBytes: usedBytes(h) } : null;
   },
-  close() { closeDb(handle); handle = null; failedFile = null; return true; },
+  close() { closeDb(handle); handle = null; failed = null; return true; },
 };
 for (const [name, read] of Object.entries(READS)) methods[name] = ({ file, args }) => read(open(file), args);
 
-parentPort.on("message", (message) => {
+// One call per turn of the event loop, writes first: a long read (a large session, a search) is followed by
+// the writes that arrived while it ran, not by the reads queued before them, so a write waits for at most
+// the one read in progress.
+const writes = [], others = [];
+let pumping = false;
+function run(message) {
   const { id, method } = message || {};
   try {
     if (!Object.hasOwn(methods, method)) throw new Error("unknown method");
@@ -70,4 +79,14 @@ parentPort.on("message", (message) => {
   } catch (error) {
     parentPort.postMessage({ id, error: String(error?.message || error) });
   }
+}
+function pump() {
+  const next = writes.shift() || others.shift();
+  if (!next) { pumping = false; return; }
+  run(next);
+  setImmediate(pump);
+}
+parentPort.on("message", (message) => {
+  (message?.method === "write" ? writes : others).push(message);
+  if (!pumping) { pumping = true; setImmediate(pump); }
 });

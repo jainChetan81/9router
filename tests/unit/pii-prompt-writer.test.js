@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
@@ -262,5 +262,89 @@ describeIfLibrary("prompt store shutdown flush", () => {
     P.flushOnShutdown();
     await sent;
     expect(stored().filter((r) => r === "w1:in flight")).toHaveLength(1);
+  });
+
+  it("a sessionless batch in flight is written on shutdown, once", async () => {
+    process.env.PII_GUARD_PROMPTS_WORKER = "on";
+    capture(["warm up"], null, "n0");
+    await P.flush();
+    capture(["no session in flight"], null, "n1");
+    const sent = P.flush();
+    await new Promise((r) => setImmediate(r));
+    P.flushOnShutdown();
+    await sent;
+    expect(stored().filter((r) => r === "n1:no session in flight")).toHaveLength(1);
+  });
+});
+
+describeIfLibrary("prompt store write that times out", () => {
+  afterEach(() => P._setRpcTimeout());
+
+  // A stand-in for the writer thread: it answers when the test says so.
+  function slowWorker() {
+    const posted = [];
+    globalThis.__nineRouterPiiPromptStore.worker = { postMessage: (m) => posted.push(m), terminate: async () => {} };
+    return posted;
+  }
+
+  it("is not forgotten: its messages are not selected again, and the late reply stores them once", async () => {
+    process.env.PII_GUARD_PROMPTS_WORKER = "on";
+    const posted = slowWorker();
+    P._setRpcTimeout(30);
+    capture(["slow one", "slow two"], "late-s", "q1");
+    expect(posted.map((m) => m.method)).toEqual(["seed"]);
+    P._workerReply({ id: posted[0].id, result: [] });
+    await P.flush(); // resolves at the timeout: the thread is busy with a long read
+    expect(posted.map((m) => m.method)).toEqual(["seed", "write"]);
+    expect(posted[1].args.ops).toHaveLength(2);
+    expect(P.stats).toMatchObject({ stored: 0, dropped: 0, errors: 1 });
+    // The client sends the same conversation again before the thread gets to the write.
+    expect(capture(["slow one", "slow two"], "late-s", "q2")).toBe(0);
+    // The thread writes the batch after all.
+    P._workerReply({ id: posted[1].id, result: { stored: 2, bytes: 16 } });
+    expect(P.stats).toMatchObject({ stored: 2, dropped: 0 });
+    expect(capture(["slow one", "slow two", "slow three"], "late-s", "q3")).toBe(1);
+  });
+
+  it("counts the batch as dropped only when the late reply is a failure", async () => {
+    process.env.PII_GUARD_PROMPTS_WORKER = "on";
+    const posted = slowWorker();
+    P._setRpcTimeout(30);
+    capture(["lost row"], null, "x1");
+    await P.flush();
+    expect(P.stats).toMatchObject({ stored: 0, dropped: 0 });
+    P._workerReply({ id: posted[0].id, error: "database is locked" });
+    expect(P.stats).toMatchObject({ stored: 0, dropped: 1 });
+  });
+});
+
+describeIfLibrary("prompt store open retry", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("waits 30 s, 2 min, then 10 min between tries", () => {
+    expect([1, 2, 3, 4, 9].map(D.openRetryMs)).toEqual([30_000, 120_000, 600_000, 600_000, 600_000]);
+  });
+
+  it("a failed open is tried again after the backoff instead of staying off until a restart", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const blocker = join(dir, "blocker"); // a file where the store's directory should be
+    await writeFile(blocker, "");
+    process.env.PII_GUARD_PROMPTS = join(blocker, "prompts.db");
+    expect(P.search({}).unavailable).toBe(true);
+    await rm(blocker);
+    // Not on every call: the next try is 30 s later.
+    vi.advanceTimersByTime(29_000);
+    expect(P.search({}).unavailable).toBe(true);
+    vi.advanceTimersByTime(2_000);
+    expect(P.search({})).toEqual({ rows: [], next: null });
+    capture(["after the retry"], null, "b1");
+    P.flush();
+    expect(P.search({ q: "retry" }).rows).toHaveLength(1);
+  });
+
+  it("this thread's connection waits for a lock instead of failing at once", () => {
+    P.search({});
+    const h = globalThis.__nineRouterPiiPromptStore.inline;
+    expect(h.db.prepare("PRAGMA busy_timeout").get().timeout).toBe(1000);
   });
 });

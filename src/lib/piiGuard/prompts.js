@@ -23,6 +23,10 @@ const QUEUE_MAX = 5000, QUEUE_BYTES = 64 * 1024 * 1024, SEEN_MAX = 200_000, SEEN
 // A batch goes out after FLUSH_MS, or at once when it is this large.
 const FLUSH_MS = 1000, FLUSH_ROWS = 256, FLUSH_BYTES = 4 * 1024 * 1024;
 const INLINE_SLICE = 16, PARK_MAX = 500, CAPTURED_MAX = 5000, RPC_TIMEOUT_MS = 30_000, WORKER_FAILURES_MAX = 3, HOUR = 36e5;
+// This thread's connection waits this long for a lock instead of failing (and dropping the batch) at once.
+const INLINE_BUSY_MS = 1000;
+// A constant in normal use; tests shorten it.
+let rpcTimeoutMs = RPC_TIMEOUT_MS;
 
 // One store per process, even when the bundler loads this module more than once.
 function fresh() {
@@ -36,7 +40,7 @@ function fresh() {
     parked: new Map(), parkedJobs: 0, parkedBytes: 0, seedWait: new Map(),
     captured: new Map(),
     worker: null, rpcs: new Map(), nextId: 1, workerFailures: 0,
-    inline: null, inlineFile: null, inlineFailed: false, sweepTimer: null, lastSweep: 0,
+    inline: null, inlineFile: null, inlineFails: 0, inlineRetryAt: 0, sweepTimer: null, lastSweep: 0,
   };
 }
 const S = (globalThis.__nineRouterPiiPromptStore ||= fresh());
@@ -65,7 +69,14 @@ function settle(id, error, result) {
   if (!call) return;
   S.rpcs.delete(id);
   clearTimeout(call.timer);
+  // The caller stopped waiting at the timeout; the outcome goes to its `late` handler.
+  if (call.timedOut) return void call.late(error, result);
   if (error) call.reject(error); else call.resolve(result);
+}
+// The writer thread answered, or is gone: `gone` settles every call with its error.
+function onReply(m) {
+  S.workerFailures = 0;
+  settle(m?.id, m?.error ? new Error(m.error) : null, m?.result);
 }
 function worker() {
   if (S.worker) return S.worker;
@@ -76,30 +87,41 @@ function worker() {
     S.worker = null; S.workerFailures++;
     for (const id of [...S.rpcs.keys()]) settle(id, error);
   };
-  w.on("message", (m) => { S.workerFailures = 0; settle(m?.id, m?.error ? new Error(m.error) : null, m?.result); });
+  w.on("message", onReply);
   w.on("error", (error) => gone(error));
   w.on("exit", () => gone(new Error("prompt store worker exited")));
   return (S.worker = w);
 }
-function rpc(method, args, file = promptsFile()) {
+// `late(error, result)`: for a call whose effect matters after the caller stopped waiting (a write). A timeout
+// then rejects with `timedOut` set but keeps the call open: the thread may still do the work, and `late`
+// gets the real outcome when the reply arrives or the thread is gone. Without `late` a timeout ends the call.
+function rpc(method, args, file = promptsFile(), late = null) {
   return new Promise((resolve, reject) => {
     let w;
     try { w = worker(); } catch (error) { S.workerFailures++; return reject(error); }
     const id = S.nextId++;
-    const timer = setTimeout(() => settle(id, new Error("prompt store worker timed out")), RPC_TIMEOUT_MS);
+    const timer = setTimeout(() => {
+      const error = Object.assign(new Error("prompt store worker timed out"), { timedOut: true });
+      const call = S.rpcs.get(id);
+      if (!call || !late) return settle(id, error);
+      call.timedOut = true;
+      reject(error);
+    }, rpcTimeoutMs);
     timer.unref?.();
-    S.rpcs.set(id, { resolve, reject, timer });
+    S.rpcs.set(id, { resolve, reject, timer, late });
     w.postMessage({ id, method, file, args });
   });
 }
 
 // Main-thread connection: the fallback writer, and the synchronous reads below.
 function inline(file = promptsFile()) {
-  if (S.inline && S.inlineFile !== file) { store.closeDb(S.inline); S.inline = null; S.inlineFailed = false; }
-  if (S.inline || S.inlineFailed) return S.inline;
+  if (S.inlineFile !== file) { store.closeDb(S.inline); S.inline = null; S.inlineFails = 0; S.inlineRetryAt = 0; }
+  // After a failed open the store stays off only until the next retry time (30 s, 2 min, then 10 min).
+  if (S.inline || Date.now() < S.inlineRetryAt) return S.inline;
   S.inlineFile = file;
-  S.inline = store.openDb(file);
-  if (!S.inline) { S.inlineFailed = true; return null; }
+  S.inline = store.openDb(file, { busyTimeout: INLINE_BUSY_MS });
+  if (!S.inline) { S.inlineRetryAt = Date.now() + store.openRetryMs(++S.inlineFails); return null; }
+  S.inlineFails = 0; S.inlineRetryAt = 0;
   // Retention runs on a timer too, so it never depends on traffic. The writer thread has its own.
   if (!workerMode()) {
     if (!S.sweepTimer) { S.sweepTimer = setInterval(sweepSlice, HOUR); S.sweepTimer.unref(); }
@@ -363,9 +385,13 @@ async function flushWorker() {
     const bytes = ops.reduce((sum, op) => sum + (op.row ? op.row.text.length : 0), 0);
     const sent = { file, ops };
     S.inflightBytes += bytes; S.inflight.add(sent);
-    try { await rpc("write", { ops: ops.map(({ row, route }) => (row ? { row } : { route })) }, file); settled(ops, true); }
-    catch { S.stats.errors++; settled(ops, false); }
-    finally { S.inflightBytes -= bytes; S.inflight.delete(sent); }
+    const done = (ok) => { settled(ops, ok); S.inflightBytes -= bytes; S.inflight.delete(sent); };
+    // A write that timed out is neither stored nor dropped yet: the thread may write it after the read
+    // that held it up. Its digests stay pending (so the next request of the session does not select the
+    // same messages again) and it stays in flight (so a shutdown writes it) until the real outcome arrives.
+    const late = (error) => { if (error) S.stats.errors++; done(!error); };
+    try { await rpc("write", { ops: ops.map(({ row, route }) => (row ? { row } : { route })) }, file, late); done(true); }
+    catch (error) { S.stats.errors++; if (!error?.timedOut) done(false); }
   }
 }
 // Fallback writer on this thread. The timers pass `limit`: a batch is then written a slice at a time, with
@@ -439,6 +465,10 @@ export const sessionsAsync = read("sessions", sessions);
 export const conversationAsync = read("conversation", conversation);
 export const messageAsync = read("message", message);
 
+/** Test helper: the RPC timeout in ms (no argument: back to the default). */
+export function _setRpcTimeout(ms) { rpcTimeoutMs = Number.isFinite(ms) && ms > 0 ? ms : RPC_TIMEOUT_MS; }
+/** Test helper: a reply from the writer thread, as its message handler receives it. */
+export const _workerReply = onReply;
 /** Test helper: forget in-memory dedupe, as a restart does. */
 export function _forget() { S.seen.clear(); }
 /** Test helper: back to a cold start. Resolves when the writer thread, if any, has stopped. */
