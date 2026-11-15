@@ -2,7 +2,7 @@
 
 import { Fragment, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { occurrences, parseUrlState, serialiseUrlState, buildRangeKey, rangeBounds, RANGE_LABELS, buildEventsFilterKey, buildEventsRequestKey, nextHitLookupCursor, clearPromptLandingOnNavigation, shouldSyncSearchInput, shouldDropMissingDetail } from "./urlState";
+import { occurrences, parseUrlState, serialiseUrlState, buildRangeKey, rangeBounds, liveReloadWanted, RANGE_LABELS, buildEventsFilterKey, buildEventsRequestKey, nextHitLookupCursor, clearPromptLandingOnNavigation, shouldSyncSearchInput, shouldDropMissingDetail } from "./urlState";
 import RangeBar from "../spend/RangeBar";
 import { applyIgnoreToSummary } from "@/lib/piiGuard/summary";
 import { buildView, isRefreshingState, place, PAGE, buildPromptFilterKey, buildPromptRequestKey, canLandOnPrompt, buildSessionFilterKey, buildSessionRequestKey, findingMarkers, groupMessages, toolFormat, collapseDefault, PROSE_LINES, ALABEL, stamp, age } from "./view";
@@ -130,7 +130,7 @@ export default function PiiGuardClient() {
   }, [sessFilterKey, range]);
   const sessReady = sessData.key === sessFilterKey && sessData.status !== "loading" && sessData.status !== "idle";
   const eventRowsAll = useMemo(() => (sessFilterKey && sessReady ? { sessionRows: sessData.rows } : {}), [sessFilterKey, sessReady, sessData]);
-  const evNext = eventsReady ? eventData.next : null;
+  const evNext = eventsReady ? eventData.next : null, evTruncated = eventsReady && !!eventData.truncated;
   const hitCacheKey = urlState.detailHit ? `${rangeKey}:${urlState.detailHit}` : null;
   const pageHit = rawEvents.find((e) => `${e.requestId}:${e.fullHash}` === urlState.detailHit) || (hitCacheKey && hitCache.current.get(hitCacheKey));
   const currentHitLookup = hitCacheKey && hitLookup.key === hitCacheKey ? hitLookup : null;
@@ -230,9 +230,14 @@ export default function PiiGuardClient() {
   const autoSync = useAutoSync("piiGuard", () => load("poll", true));
   // The live stream says when the event log grew; the timer above stays as the manual and fallback control.
   const live = useLiveTopic("pii", { throttleMs: 15_000 });
-  const liveLoad = useRef(load);
-  useEffect(() => { liveLoad.current = load; });
-  useEffect(() => { if (live.tick > 0) liveLoad.current("poll"); }, [live.tick]);
+  const liveLoad = useRef(load), liveRange = useRef(range), seenTick = useRef(live.tick);
+  useEffect(() => { liveLoad.current = load; liveRange.current = range; });
+  // Only a tick later than the one seen at mount is a change, and only a range that is still open can show it.
+  useEffect(() => {
+    const seen = seenTick.current;
+    seenTick.current = live.tick;
+    if (liveReloadWanted({ tick: live.tick, seen, to: bounds(liveRange.current).to })) liveLoad.current("poll");
+  }, [live.tick]);
   const manualSync = useCallback(() => load("manual", true), [load]);
 
   // Event log: 50 events per page, newest first, flattened to one row per hit. The server applies the
@@ -241,8 +246,8 @@ export default function PiiGuardClient() {
   const fetchEvents = useCallback(async (cursor, signal) => {
     const { from, to } = bounds(range);
     const cur = cursor ? `&before=${cursor.before}&skip=${cursor.skip}` : "";
-    const { events = [], next = null } = await call(`/api/pii-guard?events=1&limit=50&from=${Math.round(from)}&to=${Math.round(to)}${cur}${evFilter}`, null, signal);
-    return { rows: eventRows(events), next };
+    const { events = [], next = null, truncated = false } = await call(`/api/pii-guard?events=1&limit=50&from=${Math.round(from)}&to=${Math.round(to)}${cur}${evFilter}`, null, signal);
+    return { rows: eventRows(events), next, truncated };
   }, [range, evFilter]);
   // The newest page follows `pollSeq` (background polls / range loads), not config-only updates; older pages load once.
   const evTick = evNewest ? pollSeq : null;
@@ -251,7 +256,7 @@ export default function PiiGuardClient() {
     const ctl = new AbortController();
     const key = evRequestKey;
     setEventData({ key, status: "loading", rows: [], next: null });
-    fetchEvents(evCursor, ctl.signal).then(({ rows, next }) => setEventData({ key, status: "success", rows, next }))
+    fetchEvents(evCursor, ctl.signal).then(({ rows, next, truncated }) => setEventData({ key, status: "success", rows, next, truncated }))
       .catch(() => { if (!ctl.signal.aborted) setEventData({ key, status: "error", rows: [], next: null }); });
     return () => ctl.abort();
   }, [ui.tab, ui.view, urlState.detailHit, evTick, evCursor, fetchEvents, evRequestKey]);
@@ -764,7 +769,8 @@ export default function PiiGuardClient() {
                 <button onClick={e.view} style={btn}>View</button>
               </div>
             </Fragment>))}
-            {(noHits && !evBusy) && (<div style={{ padding: "32px 0", textAlign: "center", color: "var(--tx3)" }}>No hits match these filters.</div>)}
+            {(noHits && !evBusy && !evTruncated) && (<div style={{ padding: "32px 0", textAlign: "center", color: "var(--tx3)" }}>No hits match these filters.</div>)}
+            {(evTruncated && !evBusy) && (<div style={{ padding: "12px 0", textAlign: "center", color: "var(--amber)", fontSize: "12px" }}>Older events not scanned: the log for this range is too large to read in one page. Pick a shorter range.</div>)}
             <div style={{ display: "flex", gap: "8px", justifyContent: "center" }}>
               {(loadNewest) && (<button onClick={loadNewest} style={moreBtn}>Newest</button>)}
               {(loadNewer) && (<button onClick={loadNewer} style={moreBtn}>Newer 50</button>)}

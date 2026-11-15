@@ -44,6 +44,13 @@ export function rangeBounds(r, now = Date.now()) {
   return { from: hour - DAY, to: hour };
 }
 
+/** Whether a live "pii" tick reloads the summary. `seen` is the tick already handled: the one at mount
+ *  (ticks are kept while the page is away, so a mount is not a change), then each later one. A range
+ *  that ended before now cannot change with the log, so it is not reloaded. */
+export function liveReloadWanted({ tick, seen, to, now = Date.now() }) {
+  return tick !== seen && !(to < now);
+}
+
 export function buildRangeKey(range) {
   return JSON.stringify([range?.preset || "", range?.from || "", range?.to || ""]);
 }

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseUrlState, serialiseUrlState, dropMissingDetail, validDate, rangeLabel, buildRangeKey, buildEventsFilterKey, buildEventsRequestKey, nextHitLookupCursor, HIT_LOOKUP_PAGE_LIMIT, clearPromptLandingOnNavigation, shouldSyncSearchInput, shouldDropMissingDetail, DEFAULT_RANGE, occurrences } from "../../src/app/(dashboard)/dashboard/pii-guard/urlState.js";
+import { parseUrlState, serialiseUrlState, dropMissingDetail, validDate, rangeLabel, buildRangeKey, buildEventsFilterKey, buildEventsRequestKey, nextHitLookupCursor, HIT_LOOKUP_PAGE_LIMIT, clearPromptLandingOnNavigation, shouldSyncSearchInput, shouldDropMissingDetail, DEFAULT_RANGE, occurrences, liveReloadWanted, rangeBounds } from "../../src/app/(dashboard)/dashboard/pii-guard/urlState.js";
 
 describe("masked preview matches", () => {
   it("finds every non-overlapping occurrence", () => {
@@ -240,5 +240,22 @@ describe("range bounds", () => {
     expect(rangeBounds({ preset: "Custom", from: "2026-11-10", to: "2026-11-14" }, now).to).toBe(midnight + DAY);
     const long = rangeBounds({ preset: "Custom", from: "2026-01-01", to: "2026-11-14" }, now);
     expect(long.to - long.from).toBe(90 * DAY);
+  });
+});
+
+describe("live reload of the summary", () => {
+  const now = Date.parse("2026-11-15T10:00:00Z");
+  it("a mount is not a change: only a tick later than the one seen reloads", () => {
+    const to = rangeBounds({ preset: "24h" }, now).to;
+    expect(liveReloadWanted({ tick: 7, seen: 7, to, now })).toBe(false); // ticks kept from before the mount
+    expect(liveReloadWanted({ tick: 8, seen: 7, to, now })).toBe(true);
+    expect(liveReloadWanted({ tick: 0, seen: 0, to, now })).toBe(false);
+  });
+  it("a range that ended in the past is not reloaded on a tick", () => {
+    const past = rangeBounds({ preset: "Custom", from: "2026-11-01", to: "2026-11-10" }, now);
+    expect(past.to).toBeLessThan(now);
+    expect(liveReloadWanted({ tick: 8, seen: 7, to: past.to, now })).toBe(false);
+    const today = rangeBounds({ preset: "Custom", from: "2026-11-01", to: "2026-11-15" }, now);
+    expect(liveReloadWanted({ tick: 8, seen: 7, to: today.to, now })).toBe(true);
   });
 });
