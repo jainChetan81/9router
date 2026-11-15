@@ -15,6 +15,7 @@ import SyncButton from "./SyncButton";
 import useAutoSync from "./useAutoSync";
 import { cacheGet, cacheSet, cacheInvalidate, isFresh, updatedAgo } from "@/lib/clientCache";
 import { fDT } from "@/lib/spend/uiHelpers";
+import { syncHeaders } from "@/lib/dashboardSync";
 import "./shared-page.css";
 
 async function getJson(url, opts) {
@@ -64,13 +65,14 @@ export default function SpendClient() {
     document.addEventListener("visibilitychange", vis);
     return () => { clearInterval(t); document.removeEventListener("visibilitychange", vis); };
   }, []);
-  const load = useCallback(async () => {
+  const load = useCallback(async ({ sync: fresh = false } = {}) => {
     const id = ++loadId.current; // ignore responses from superseded ranges
     const q = new URLSearchParams({ preset: range.preset });
     if (range.preset === "Custom") { q.set("from", range.from); q.set("to", range.to); }
     const url = `/api/spend?${q}`;
     // Spend changes slowly: show cached data at once; refetch only when older than SPEND_TTL.
-    const hit = cacheGet(url);
+    // A sync never reads the cached copy and tells the server to skip its caches too.
+    const hit = fresh ? null : cacheGet(url);
     if (hit) {
       setData(hit.data);
       setLoadedAt(hit.at);
@@ -81,7 +83,7 @@ export default function SpendClient() {
     }
     setRefreshing(true);
     try {
-      const d = await getJson(url);
+      const d = await getJson(url, { headers: syncHeaders(fresh) });
       if (id !== loadId.current) return;
       cacheSet(url, d);
       setData(d);
@@ -96,8 +98,15 @@ export default function SpendClient() {
       setMode("error");
     }
   }, [range]);
+  // A changed syncNonce means the Sync button or the auto-sync timer asked; a
+  // range change or the first load is an ordinary, cacheable read.
+  const syncSeen = useRef(0);
   useEffect(() => {
-    const t = setTimeout(load, 0);
+    const t = setTimeout(() => {
+      const fresh = syncNonce !== syncSeen.current;
+      syncSeen.current = syncNonce;
+      load({ sync: fresh });
+    }, 0);
     return () => clearTimeout(t);
   }, [load, syncNonce]);
 
@@ -161,7 +170,7 @@ export default function SpendClient() {
   const onRange = (r) => { setRange(r); set({ hover: null, agFilter: null, agOpen: null }); };
   const todayKey = data ? new Date(data.now + 5.5 * 3600e3).toISOString().slice(0, 10) : null;
   const showLast30 = () => onRange({ preset: "30D" });
-  const retry = () => load();
+  const retry = () => load({ sync: true });
   const openConsole = () => router.push("/dashboard/console-log");
   const emptyText = `9Router logged no calls in this range (${data?.range?.first ?? ""} – ${data?.range?.last ?? ""} IST). Real spend is $0.00. Allowance and fees still apply.`;
   const ready = mode === "ready" && v;

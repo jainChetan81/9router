@@ -12,14 +12,16 @@ import SyncButton from "../spend/SyncButton";
 import useAutoSync from "../spend/useAutoSync";
 import { useLiveTopic } from "@/shared/hooks/useLive";
 import { cacheGet, cacheSet, cacheInvalidate } from "@/lib/clientCache";
+import { syncHeaders } from "@/lib/dashboardSync";
 
 const summaryKey = (rk) => `/api/pii-guard?range=${rk}`;
 
 const IST = 5.5 * 3600e3;
 const bounds = rangeBounds;
 // The summary is revalidated, not refetched: the server answers 304 while nothing was logged.
-async function call(url, body, signal, cache = "no-store") {
-  const res = await fetch(url, { cache, signal, ...(body && { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }) });
+// A sync ("Sync now", the auto-sync timer) is not revalidated: no conditional request, plus the sync header.
+async function call(url, body, signal, cache = "no-store", sync = false) {
+  const res = await fetch(url, { cache: sync ? "no-store" : cache, signal, ...(sync && { headers: syncHeaders(true) }), ...(body && { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }) });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data;
@@ -191,7 +193,7 @@ export default function PiiGuardClient() {
   useEffect(() => () => clearTimeout(toastTimerRef.current), []);
 
   // A new load aborts the one in flight, so a slow old range never overwrites a newer one.
-  const load = useCallback(async (reason = "poll") => {
+  const load = useCallback(async (reason = "poll", sync = false) => {
     loadCtl.current?.abort();
     const ctl = (loadCtl.current = new AbortController());
     const seq = ++loadSeqRef.current;
@@ -202,7 +204,7 @@ export default function PiiGuardClient() {
     setRefreshReason(reason);
     const { from, to } = bounds(range);
     try {
-      const d = await call(`/api/pii-guard?from=${Math.round(from)}&to=${Math.round(to)}`, null, ctl.signal, "no-cache");
+      const d = await call(`/api/pii-guard?from=${Math.round(from)}&to=${Math.round(to)}`, null, ctl.signal, "no-cache", sync);
       if (ctl.signal.aborted || seq !== loadSeqRef.current) return;
       loadedKeyRef.current = rangeKey;
       cacheSet(summaryKey(rangeKey), d);
@@ -225,13 +227,13 @@ export default function PiiGuardClient() {
     const t = setTimeout(() => load(reason), 0);
     return () => { clearTimeout(t); loadCtl.current?.abort(); };
   }, [load, rangeKey]);
-  const autoSync = useAutoSync("piiGuard", () => load("poll"));
+  const autoSync = useAutoSync("piiGuard", () => load("poll", true));
   // The live stream says when the event log grew; the timer above stays as the manual and fallback control.
   const live = useLiveTopic("pii", { throttleMs: 15_000 });
   const liveLoad = useRef(load);
   useEffect(() => { liveLoad.current = load; });
   useEffect(() => { if (live.tick > 0) liveLoad.current("poll"); }, [live.tick]);
-  const manualSync = useCallback(() => load("manual"), [load]);
+  const manualSync = useCallback(() => load("manual", true), [load]);
 
   // Event log: 50 events per page, newest first, flattened to one row per hit. The server applies the
   // client, model, source and action filters. The 30 s refresh reloads only the newest page.
@@ -411,7 +413,7 @@ export default function PiiGuardClient() {
   const preset = range.preset, customLabel = range.label || "";
   const onRange = (r) => set({ range: r, sel: {}, detail: null, pending: null, page: 0, leakPage: 0 });
   const todayKey = new Date(Date.now() + IST).toISOString().slice(0, 10);
-  const retry = () => { setMode("loading"); load(data ? "manual" : "initial"); };
+  const retry = () => { setMode("loading"); load(data ? "manual" : "initial", true); };
   const openConsole = () => router.push("/dashboard/console-log");
   const toast = toastState?.text;
   const undo = async () => {
