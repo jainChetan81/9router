@@ -124,7 +124,9 @@ function mergeSnapshotIntoDaily(db, snapshot) {
     mergeDay(day, delta);
     db.run(`INSERT INTO usageDaily(dateKey, data) VALUES(?, ?) ON CONFLICT(dateKey) DO UPDATE SET data = excluded.data`, [dateKey, stringifyJson(day)]);
   }
-  if (maxId) setMetaSync(db, FLUSHED_MAX_ID_KEY, maxId);
+  // Move the marker only after a successful reconcile; otherwise it would skip
+  // rows a crash left out of usageDaily.
+  if (maxId && global._usageDailyReconciled && !global._usageDailyReconcileFailed) setMetaSync(db, FLUSHED_MAX_ID_KEY, maxId);
 }
 
 async function flushDailyBuffer() {
@@ -538,10 +540,28 @@ onBeforeDbClose("usageDaily", _shutdownUsageFlush);
 // the first flush and before the first usageDaily read (and from bootstrap),
 // so it always runs before a flush of this process can move the marker past
 // the lost rows.
+const RECONCILE_MAX_ATTEMPTS = 5;
+
+// Runs the tail reconcile once per process. A failure is retried on the next
+// call, and until it succeeds no flush moves the marker, so a later start can
+// still fold the lost rows (the per-day guard skips days already counted).
 function reconcileUsageDailySync(db) {
   if (global._usageDailyReconciled) return;
-  global._usageDailyReconciled = true;
   try {
+    reconcileTailSync(db);
+    global._usageDailyReconciled = true;
+    global._usageDailyReconcileFailed = false;
+  } catch (err) {
+    global._usageDailyReconcileFailed = true;
+    global._usageDailyReconcileAttempts = (global._usageDailyReconcileAttempts || 0) + 1;
+    // Stop retrying after a few attempts; the marker stays frozen for this process.
+    if (global._usageDailyReconcileAttempts >= RECONCILE_MAX_ATTEMPTS) global._usageDailyReconciled = true;
+    console.error("[usageRepo] usageDaily reconcile failed:", err?.message || err);
+  }
+}
+
+function reconcileTailSync(db) {
+  {
     const markerRow = db.get(`SELECT value FROM _meta WHERE key = ?`, [FLUSHED_MAX_ID_KEY]);
     const maxId = Number(db.get(`SELECT MAX(id) AS m FROM usageHistory`)?.m) || 0;
     // Rows this process saved are in the buffer already; stop before them.
@@ -601,8 +621,6 @@ function reconcileUsageDailySync(db) {
       setMetaSync(db, FLUSHED_MAX_ID_KEY, upper);
     });
     console.log(`[usageRepo] reconciled ${folded} of ${rows.length} usageHistory rows into usageDaily after restart (marker ${marker})`);
-  } catch (err) {
-    console.error("[usageRepo] usageDaily reconcile failed:", err?.message || err);
   }
 }
 

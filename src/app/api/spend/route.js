@@ -67,7 +67,7 @@ export async function GET(request) {
     // "Sync now" reads fresh: no body cache and no throttle on today's slice.
     // Closed IST days and the what-if price list stay cached.
     const sync = isSyncRequest(request);
-    const payload = await aggregateOffThread(db, { params: Object.fromEntries(params), now: Date.now(), fees, skipCache: sync });
+    const payload = await aggregateOffThread(db, { params: Object.fromEntries(params), now: Date.now(), fees, skipCache: sync, usageVersion: usageVersion("usage") });
     const whatIfTargets = await resolveWhatIfTargets(db);
     // No ETag: the page keeps its own copy (clientCache) and never sends a
     // conditional request.

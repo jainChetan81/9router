@@ -145,8 +145,24 @@ describe("usageDaily crash reconcile", () => {
   const marker = () => adapterSync().get(`SELECT value FROM _meta WHERE key = 'usageDailyFlushedMaxId'`);
   const newProcess = () => {
     global._usageDailyReconciled = false;
+    global._usageDailyReconcileFailed = false;
+    global._usageDailyReconcileAttempts = 0;
     global._usageFirstSavedId = null;
   };
+
+  it("keeps the marker still while the reconcile has failed", async () => {
+    usageRepo.runShutdownFlush();
+    const held = Number(marker().value);
+    // A failed reconcile: the flush may merge the buffer, but the marker must
+    // not move past rows a crash left out.
+    global._usageDailyReconciled = true;
+    global._usageDailyReconcileFailed = true;
+    await save("frozen-test", 1, 1);
+    usageRepo.runShutdownFlush();
+    expect(Number(marker().value)).toBe(held);
+    expect(today().byProvider["frozen-test"].requests).toBe(1);
+    newProcess();
+  });
 
   it("seeds the marker on first start and folds nothing", async () => {
     await save("seed-test", 1, 1);
@@ -236,6 +252,8 @@ describe("usageDaily reconcile per-day guard", () => {
   const marker = () => Number(adapterSync().get(`SELECT value FROM _meta WHERE key = 'usageDailyFlushedMaxId'`).value);
   const newProcess = () => {
     global._usageDailyReconciled = false;
+    global._usageDailyReconcileFailed = false;
+    global._usageDailyReconcileAttempts = 0;
     global._usageFirstSavedId = null;
   };
 
