@@ -1,6 +1,7 @@
 import { getAdapter } from "@/lib/db/driver.js";
 import { getLive } from "@/lib/agents/queries.js";
 import { etagFor, liveVersionTag, notModified, responseHeaders, cacheHeaders, cachedResult, busyResponse } from "@/lib/agents/httpCache.js";
+import { isSyncRequest } from "@/lib/dashboardSync.js";
 import { scheduleSessionBackfill } from "@/lib/agents/sessionBackfill.js";
 
 export const dynamic = "force-dynamic";
@@ -33,6 +34,7 @@ export async function GET(request) {
     // flight are shared by the read worker.
     const result = await cachedResult("live", etag, {
       ttlMs: 60_000,
+      fresh: isSyncRequest(request),
       // Name the answer by what it turned out to be, so the first poll after
       // the feed goes idle (or wakes up) already holds the right ETag.
       etagOf: (data) => { hot.value = isHot(data); return etagWhen(hot.value); },

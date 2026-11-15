@@ -1,6 +1,23 @@
 // Per-page auto-sync settings for the dashboard (seconds; 0 = off).
 // Stored in settings.dashboardSync and shared by every browser.
 
+// "Sync now" (and the auto-sync timer) asks for fresh data with this request
+// header. Cached data is the default everywhere; a request that carries the
+// header skips every cache on its way: no conditional request from the
+// client, no 304, no server result cache, no stale-while-revalidate answer.
+// Background refetches (live topics, page load) never send it.
+export const SYNC_HEADER = "x-9r-sync";
+
+/** Fetch headers for a load: the sync header when `sync`, else none. */
+export function syncHeaders(sync) {
+  return sync ? { [SYNC_HEADER]: "1" } : undefined;
+}
+
+/** True when the request was made by "Sync now" or the auto-sync timer. */
+export function isSyncRequest(request) {
+  try { return request?.headers?.get?.(SYNC_HEADER) === "1"; } catch { return false; }
+}
+
 export const SYNC_PAGES = ["agents", "spend", "piiGuard", "quota"];
 export const SYNC_CHOICES = [0, 10, 30, 60, 300, 900];
 // Agents gets its live data from the /api/live stream; the timer is only a fallback.

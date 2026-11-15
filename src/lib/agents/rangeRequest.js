@@ -1,9 +1,11 @@
 // Shared request handling for the range routes (sessions, analytics, tools):
 // resolve the range, answer 304 from the ETag before any SQL, otherwise
-// compute once per live version and share the result between clients.
+// compute once per live version and share the result between clients. A sync
+// request (x-9r-sync) skips the 304, the stored result and the floor.
 import { getAdapter } from "../db/driver.js";
 import { resolveRange, distinctFirstMs, cachedFirstMs } from "./range.js";
 import { etagFor, notModified, responseHeaders, cacheHeaders, cachedResult, busyResponse } from "./httpCache.js";
+import { isSyncRequest } from "../dashboardSync.js";
 import { scheduleSessionBackfill } from "./sessionBackfill.js";
 
 /**
@@ -34,7 +36,7 @@ export async function handleRangeGet(request, name, { floorMs, ttlMs, keyOf = ()
     scheduleSessionBackfill(db);
     const fromIso = new Date(range.from).toISOString();
     const toIso = new Date(range.to).toISOString();
-    const result = await cachedResult(queryKey, etag, { floorMs, ttlMs }, () => compute(db, fromIso, toIso, params));
+    const result = await cachedResult(queryKey, etag, { floorMs, ttlMs, fresh: isSyncRequest(request) }, () => compute(db, fromIso, toIso, params));
     return Response.json(
       shape({ preset: range.preset, from: range.from, to: range.to }, result.data),
       { headers: cacheHeaders(result) }

@@ -7,6 +7,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { version } from "../live/bus.js";
 import { cacheGet, cacheSet } from "./cache.js";
+import { isSyncRequest } from "../dashboardSync.js";
 
 // Bus versions restart at 0 with the process, so a per-boot id keeps an old
 // tab's ETag from matching after a restart.
@@ -35,8 +36,10 @@ function matches(header, etag) {
   return header.split(",").some((tag) => tag.trim() === "*" || bare(tag) === bare(etag));
 }
 
-/** 304 response when the client already holds `etag`, else null. */
+/** 304 response when the client already holds `etag`, else null. A sync
+ *  request is never answered 304: it asked for a fresh body. */
 export function notModified(request, etag) {
+  if (isSyncRequest(request)) return null;
   let header = null;
   try { header = request?.headers?.get?.("if-none-match") || null; } catch { header = null; }
   if (!matches(header, etag)) return null;
@@ -54,10 +57,11 @@ export function responseHeaders(etag) {
  * after it was computed whatever the version, so a burst of bumps does not
  * turn into a burst of identical SQL. Returns { data, etag }; the ETag is the
  * one the data was computed under; `etagOf(data)` may refine it once the data
- * is known.
+ * is known. `fresh` (a sync request) skips the stored result and the floor:
+ * the answer is computed now and stored for everyone else.
  */
-export async function cachedResult(queryKey, etag, { floorMs = 0, ttlMs = 60_000, etagOf = null }, compute) {
-  const hit = cacheGet(queryKey);
+export async function cachedResult(queryKey, etag, { floorMs = 0, ttlMs = 60_000, etagOf = null, fresh = false }, compute) {
+  const hit = fresh ? null : cacheGet(queryKey);
   if (hit) {
     if (hit.etag === etag) return hit;
     if (Date.now() - hit.at < floorMs) {

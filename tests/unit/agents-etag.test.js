@@ -145,4 +145,44 @@ describe("agents routes ETag", () => {
       expect(minReads).toBe(1);
     } finally { fakeDb.get = original; }
   });
+  it("a sync request skips the 304, the stored result and the floor", async () => {
+    const url = "/api/agents/analytics?preset=7D";
+    const sync = (etag) => analytics.GET(new Request(`http://localhost${url}`, { headers: { "x-9r-sync": "1", ...(etag && { "If-None-Match": etag }) } }));
+    const first = await get(analytics, url);
+    const etag = first.headers.get("etag");
+    const calls = sql.calls;
+    expect(calls).toBeGreaterThan(0);
+
+    // Header absent: 304 from the tag, and the stored result without the tag. No SQL either way.
+    expect((await get(analytics, url, etag)).status).toBe(304);
+    expect((await get(analytics, url)).status).toBe(200);
+    expect(sql.calls).toBe(calls);
+
+    // Header present: a full answer, computed again, even with a matching tag.
+    const fresh = await sync(etag);
+    expect(fresh.status).toBe(200);
+    expect(sql.calls).toBeGreaterThan(calls);
+
+    // Inside the floor window after a bump: a plain request reuses the stored
+    // body and asks for a trailing refetch; a sync request computes now.
+    bump("usage");
+    const reused = await get(analytics, url);
+    expect(reused.headers.get("x-9r-retry-after-ms")).not.toBeNull();
+    const again = sql.calls;
+    const synced = await sync();
+    expect(synced.status).toBe(200);
+    expect(synced.headers.get("x-9r-retry-after-ms")).toBeNull();
+    expect(sql.calls).toBeGreaterThan(again);
+  });
+
+  it("a sync request to /live is computed again under the same version", async () => {
+    const first = await get(live, "/api/agents/live");
+    const etag = first.headers.get("etag");
+    expect((await get(live, "/api/agents/live", etag)).status).toBe(304);
+    const calls = sql.calls;
+    const synced = await live.GET(new Request("http://localhost/api/agents/live", { headers: { "x-9r-sync": "1", "If-None-Match": etag } }));
+    expect(synced.status).toBe(200);
+    expect(await synced.json()).toHaveProperty("sessions");
+    expect(sql.calls).toBeGreaterThan(calls);
+  });
 });

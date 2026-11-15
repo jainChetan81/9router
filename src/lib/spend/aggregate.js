@@ -200,10 +200,12 @@ function queryDaySlice(db, dayFrom) {
 // Closed IST days are immutable: cache each day's slice per adapter and merge
 // it into any daily range that contains it. Today's partial slice recomputes
 // when the usage topic version changes (throttled) or new rows land.
-function daySlice(db, st, dayFrom, { today = false, maxId = null } = {}) {
+// `fresh` (a sync request) recomputes today's partial day whatever its age.
+// Closed days stay cached either way: they cannot change.
+function daySlice(db, st, dayFrom, { today = false, maxId = null, fresh = false } = {}) {
   if (today) {
     const topicVersion = liveVersion("usage");
-    if (st.today && st.today.dayFrom === dayFrom && st.today.topicVersion === topicVersion
+    if (!fresh && st.today && st.today.dayFrom === dayFrom && st.today.topicVersion === topicVersion
       && st.today.maxId === maxId && (Date.now() - st.todayAt) < TODAY_REFRESH_MIN_MS) return st.today;
     const slice = queryDaySlice(db, dayFrom);
     st.today = { ...slice, dayFrom, topicVersion, maxId };
@@ -225,6 +227,9 @@ function daySlice(db, st, dayFrom, { today = false, maxId = null } = {}) {
   return slice;
 }
 
+// `skipCache` (a sync request, and tests): no body cache, no cached range
+// metadata, and today's slice is recomputed. Closed-day slices are still
+// reused; an IST day that has ended is immutable.
 export function aggregateSpend(db, { params, now = Date.now(), fees = {}, skipCache = false } = {}) {
   const st = getState(db);
   const maxRow = db.get(`SELECT MAX(id) AS maxId FROM usageHistory`);
@@ -433,7 +438,7 @@ export function aggregateSpend(db, { params, now = Date.now(), fees = {}, skipCa
       allTicks.push(...slice.ticks);
     }
     if (today0 < range.to) {
-      const slice = daySlice(db, st, today0, { today: true, maxId });
+      const slice = daySlice(db, st, today0, { today: true, maxId, fresh: skipCache });
       processRows(slice.rows, () => today0);
       mergeClock(slice.dayClock);
       outlierRawVal.push(...slice.topVal);

@@ -165,6 +165,19 @@ describe("GET /api/pii-guard summary", () => {
     expect(moved.headers.get("etag")).not.toBe(etag);
   });
 
+  it("a sync request is never answered 304 and reads the log again", async () => {
+    await writeFile(paths.file, log(5, Date.now()).join("\n") + "\n");
+    const now = Date.now(), from = now - DAY, to = now + 3600e3;
+    const first = await GET(new Request(url(from, to)));
+    const etag = first.headers.get("etag");
+    const before = (await first.json()).summary.requests;
+    // Without the sync header the tag still answers 304.
+    expect((await GET(new Request(url(from, to), { headers: { "if-none-match": etag } }))).status).toBe(304);
+    const synced = await GET(new Request(url(from, to), { headers: { "if-none-match": etag, "x-9r-sync": "1" } }));
+    expect(synced.status).toBe(200);
+    expect((await synced.json()).summary.requests).toBe(before);
+  });
+
   it("a settings save moves the tag too", async () => {
     await writeFile(paths.file, log(2, Date.now()).join("\n") + "\n");
     const now = Date.now(), from = now - DAY, to = now + 3600e3;

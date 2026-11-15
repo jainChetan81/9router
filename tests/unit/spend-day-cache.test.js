@@ -63,7 +63,7 @@ describe("closed-day slice cache (WP3)", () => {
     };
 
     const params = { preset: "Custom", from: "2026-10-29", to: "2026-11-09" };
-    // Uncached baseline: skipCache bypasses both body cache and day cache.
+    // Baseline: skipCache bypasses the body cache; no day slice is cached yet.
     const base = aggregateSpend(wrapped, { params: new URLSearchParams(params), now: NOW, skipCache: true });
     // Cached: warm run (day slices cached, body cache populated) then a later
     // run past the body TTL (day slices hit, only today recomputed).
@@ -81,5 +81,31 @@ describe("closed-day slice cache (WP3)", () => {
     // Outliers: per-day top lists re-ranked; values equal, order may differ on ties.
     const norm = (o) => ({ ...o, when: undefined });
     expect(warm.outliers.value.map(norm)).toEqual(base.outliers.value.map(norm));
+  }, 60_000);
+  it("a sync read recomputes today's slice; closed days stay cached", async () => {
+    const a = await driver.getAdapter();
+    const wrapped = { get: (sql, p = []) => a.get(sql, p), all: (sql, p = []) => a.all(sql, p) };
+    const params = () => new URLSearchParams({ preset: "30D" });
+    // One row today (IST Nov 10) and one on a closed day (IST Nov 5).
+    const TODAY_TS = "2026-11-09T19:00:00.000Z", CLOSED_TS = "2026-11-05T10:00:00.000Z";
+    for (const timestamp of [TODAY_TS, CLOSED_TS]) {
+      await sqliteDb.saveRequestUsage({ timestamp, provider: "openrouter", model: "or/m1", apiKey: "k1", tokens: TOK, status: "ok", meta: { ua: "T3 Code/1.0" } });
+    }
+    const before = aggregateSpend(wrapped, { params: params(), now: NOW });
+
+    // Change both rows. No row is added, so nothing else tells the caches
+    // that the data moved.
+    const todayRow = a.get(`SELECT id FROM usageHistory WHERE timestamp = ?`, [TODAY_TS]);
+    const closedRow = a.get(`SELECT id FROM usageHistory WHERE timestamp = ?`, [CLOSED_TS]);
+    a.run(`UPDATE usageHistory SET cost = cost + 5 WHERE id = ?`, [todayRow.id]);
+    a.run(`UPDATE usageHistory SET cost = cost + 7 WHERE id = ?`, [closedRow.id]);
+
+    // Without the sync signal: the cached answer.
+    const cached = aggregateSpend(wrapped, { params: params(), now: NOW + 1000 });
+    expect(cached.totals).toEqual(before.totals);
+
+    // With it: today's change shows, the closed day's does not.
+    const synced = aggregateSpend(wrapped, { params: params(), now: NOW + 1000, skipCache: true });
+    expect(synced.totals.list).toBeCloseTo(before.totals.list + 5, 6);
   }, 60_000);
 });

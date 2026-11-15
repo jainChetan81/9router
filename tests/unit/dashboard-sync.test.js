@@ -101,3 +101,25 @@ describe("defaults", () => {
     expect(SYNC_DEFAULTS).toEqual({ agents: 60, spend: 0, piiGuard: 0, quota: 0 });
   });
 });
+
+describe("sync signal", () => {
+  it("syncHeaders sends x-9r-sync only for a sync", async () => {
+    const { SYNC_HEADER, syncHeaders } = await import("../../src/lib/dashboardSync.js");
+    expect(SYNC_HEADER).toBe("x-9r-sync");
+    expect(syncHeaders(true)).toEqual({ "x-9r-sync": "1" });
+    expect(syncHeaders(false)).toBeUndefined();
+    expect(syncHeaders()).toBeUndefined();
+  });
+
+  it("isSyncRequest reads the header and nothing else", async () => {
+    const { isSyncRequest } = await import("../../src/lib/dashboardSync.js");
+    const req = (headers) => new Request("http://localhost/api/x?x-9r-sync=1", { headers });
+    expect(isSyncRequest(req({ "x-9r-sync": "1" }))).toBe(true);
+    expect(isSyncRequest(req({ "X-9R-Sync": "1" }))).toBe(true);
+    expect(isSyncRequest(req({}))).toBe(false);
+    expect(isSyncRequest(req({ "x-9r-sync": "0" }))).toBe(false);
+    expect(isSyncRequest(req({ "x-9r-sync": "true" }))).toBe(false);
+    expect(isSyncRequest(null)).toBe(false);
+    expect(isSyncRequest({})).toBe(false);
+  });
+});

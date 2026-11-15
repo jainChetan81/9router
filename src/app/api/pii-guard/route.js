@@ -8,6 +8,7 @@ import { ready, rules, groups, testText, testImage, eventsFile, health } from "@
 import { summarize, createSummarizer, applyIgnoreToSummary } from "@/lib/piiGuard/summary.js";
 import { rangeStart, scanBackward, scanForward, withLog } from "@/lib/piiGuard/eventLog.js";
 import { bump, version } from "@/lib/live/bus.js";
+import { isSyncRequest } from "@/lib/dashboardSync.js";
 
 export const dynamic = "force-dynamic";
 const MODES = ["off", "observe", "redact", "block"];
@@ -182,10 +183,10 @@ async function rangeSummary(handle, st, from, to, step, origin) {
   return { ...summarizer.finish(), truncated, step, origin };
 }
 // Calls run one at a time: polls and two tabs share the live state.
-function loadBaseSummary(file, from, to, step, origin) {
+function loadBaseSummary(file, from, to, step, origin, fresh = false) {
   const run = queue.then(() => withLog(file, async (handle, st) => {
     const key = baseSummaryKey(file, from, to, step, origin, st);
-    const cached = getCachedBaseSummary(key);
+    const cached = fresh ? null : getCachedBaseSummary(key);
     if (cached) return cached;
     const summary = to >= Date.now() ? await liveSummary(handle, st, file, from, to, step, origin) : await rangeSummary(handle, st, from, to, step, origin);
     setCachedBaseSummary(key, summary);
@@ -209,7 +210,8 @@ function validateRange(from, to) {
   return { from: fMs, to: tMs };
 }
 
-async function state(fromMs, toMs) {
+// `fresh` (a sync request): the summary is read from the log now, not taken from the summary cache.
+async function state(fromMs, toMs, fresh = false) {
   const file = eventsFile();
   const [settings, available, st] = await Promise.all([getSettings(), ready(), stat(file).catch(() => null)]);
   const rawPii = validStoredPiiGuard(settings);
@@ -223,9 +225,9 @@ async function state(fromMs, toMs) {
   const origin = step === DAY ? Math.floor((from + IST) / DAY) * DAY - IST : Math.floor(from / 3600e3) * 3600e3;
   // Separate parsed-event/base summary caching from config.ignore so config changes re-project in memory.
   const key = baseSummaryKey(file, from, to, step, origin, st);
-  let baseSummary = getCachedBaseSummary(key);
+  let baseSummary = fresh ? null : getCachedBaseSummary(key);
   if (!baseSummary) {
-    baseSummary = await loadBaseSummary(file, from, to, step, origin);
+    baseSummary = await loadBaseSummary(file, from, to, step, origin, fresh);
   }
   const summary = applyIgnoreToSummary(baseSummary, config.ignore);
   return { enabled: !!process.env.PII_GUARD_MODULE, available, config, rules: available ? rules() : [], groups: available ? groups() : [], health: health(config), summary };
@@ -296,8 +298,10 @@ export async function GET(request) {
     // (which move without a log append) at most a minute old.
     const etag = `W/"pii-${BOOT}-${version("pii")}-${vr.from}-${vr.to}-${Math.floor(Date.now() / 6e4)}"`;
     const headers = { ETag: etag, "Cache-Control": "private, no-cache" };
-    if (request.headers.get("if-none-match") === etag) return new Response(null, { status: 304, headers });
-    const s = await state(vr.from, vr.to);
+    // "Sync now" asked for a fresh body: no 304 and no cached summary.
+    const sync = isSyncRequest(request);
+    if (!sync && request.headers.get("if-none-match") === etag) return new Response(null, { status: 304, headers });
+    const s = await state(vr.from, vr.to, sync);
     return NextResponse.json(s, { headers });
   }
   // default last 24h
