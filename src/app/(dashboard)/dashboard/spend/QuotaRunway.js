@@ -1,12 +1,15 @@
 "use client";
 
 // Quota runway, ported from Spend.dc.html (round 2). Live data from /api/spend/quota; not affected by range.
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { dur, fDT, fTime, mapQuotaRows, quotaTotal, sameDayIST, sortQuotaRunway } from "@/lib/spend/uiHelpers";
 import useWidth from "./useWidth";
 import { cacheGet, cacheSet, isFresh } from "@/lib/clientCache";
+import { syncHeaders } from "@/lib/dashboardSync";
 
 const QUOTA_URL = "/api/spend/quota", QUOTA_TTL = 15 * 60_000;
+// While the server refreshes behind an old snapshot: ask again this often, this many times.
+const FOLLOW_UP_MS = 2000, FOLLOW_UP_MAX = 3;
 const fromCache = () => { const h = cacheGet(QUOTA_URL); if (!h) return null; const rows = h.data; return { state: rows.length ? "live" : "empty", rows, at: h.at, stale: false }; };
 
 const MS = { fontFamily: "'Material Symbols Outlined'", lineHeight: 1 };
@@ -20,29 +23,48 @@ export default function QuotaRunway({ syncNonce = 0 }) {
   const [ref, w] = useWidth();
   const narrow = w < 640;
 
-  const load = useCallback(async ({ quiet = false, useCache = false } = {}) => {
+  const loadSeq = useRef(0), followUp = useRef(null), loadRef = useRef(null);
+  // Drops a pending follow-up and makes any answer still in flight a no-op.
+  const stopLoads = useCallback(() => { clearTimeout(followUp.current); loadSeq.current++; }, []);
+  const load = useCallback(async ({ quiet = false, useCache = false, sync = false, attempt = 0 } = {}) => {
     // Quota is the slowest call (provider APIs). Reuse a recent result across page visits.
     if (useCache) {
       const c = fromCache(); // read after mount, so server and client render the same first frame
       if (c) setRes(c);
       if (isFresh(cacheGet(QUOTA_URL), QUOTA_TTL)) return;
     }
-    // A quiet refresh (sync button, stale data) keeps the current rows on
-    // screen and only marks the header as refreshing; the SWR server path
-    // also returns instantly, so "as of" stays truthful while upstreams are
-    // still being polled.
+    const seq = ++loadSeq.current; // a newer load wins over this one and over its follow-up
+    clearTimeout(followUp.current);
+    // A quiet refresh (stale data, follow-up) keeps the current rows on screen.
+    // A sync also marks the header as refreshing: the server then waits for
+    // the providers, which can take several seconds.
     if (!quiet) setRes((r) => (r.state === "live" ? r : { ...r, state: "loading" }));
+    else if (sync) setRes((r) => ({ ...r, refreshing: true }));
     try {
-      const r = await fetch("/api/spend/quota", { cache: "no-store" });
+      const r = await fetch(QUOTA_URL, { cache: "no-store", headers: syncHeaders(sync) });
       const body = await r.json().catch(() => ({}));
+      if (seq !== loadSeq.current) return;
       if (!r.ok) throw new Error(body.error || r.statusText);
       const rows = Array.isArray(body.rows) ? body.rows : [];
-      cacheSet(QUOTA_URL, rows);
       // asOf is the server's snapshot time; fall back to the fetch time.
-      setRes({ state: rows.length ? "live" : "empty", rows, at: body.asOf || Date.now(), stale: false, refreshing: false });
-    } catch { setRes((r) => (quiet && r.state === "live" ? { ...r, stale: true } : { state: "error", rows: [], at: null })); }
+      const at = body.asOf || Date.now();
+      // Stored with the snapshot's own age, so an old snapshot is never taken for a fresh one.
+      cacheSet(QUOTA_URL, rows, at);
+      // `refreshing`: this is the previous snapshot and the server is reading the providers now.
+      // Ask again shortly, a few times at most, until the new snapshot is there.
+      const refreshing = body.refreshing === true && attempt < FOLLOW_UP_MAX;
+      setRes({ state: rows.length ? "live" : "empty", rows, at, stale: false, refreshing });
+      if (refreshing) followUp.current = setTimeout(() => loadRef.current?.({ quiet: true, attempt: attempt + 1 }), FOLLOW_UP_MS);
+    } catch {
+      if (seq !== loadSeq.current) return;
+      setRes((r) => (quiet && r.state === "live" ? { ...r, stale: true, refreshing: false } : { state: "error", rows: [], at: null }));
+    }
   }, []);
-  useEffect(() => { const t = setTimeout(() => load({ quiet: !!cacheGet(QUOTA_URL), useCache: true }), 0); return () => clearTimeout(t); }, [load]);
+  useEffect(() => { loadRef.current = load; });
+  useEffect(() => {
+    const t = setTimeout(() => load({ quiet: !!cacheGet(QUOTA_URL), useCache: true }), 0);
+    return () => { clearTimeout(t); stopLoads(); };
+  }, [load, stopLoads]);
   // "Resets in" ticks every 30 s, but only while the tab is visible.
   useEffect(() => {
     const iv = setInterval(() => { if (!document.hidden) setNow(Date.now()); }, 30000);
@@ -50,10 +72,10 @@ export default function QuotaRunway({ syncNonce = 0 }) {
     document.addEventListener("visibilitychange", vis);
     return () => { clearInterval(iv); document.removeEventListener("visibilitychange", vis); };
   }, []);
-  // No polling: the page Sync button bumps syncNonce for a fresh read.
+  // No polling: the page Sync button bumps syncNonce, and that read waits for fresh provider data.
   useEffect(() => {
     if (!syncNonce) return;
-    const t = setTimeout(() => load({ quiet: true }), 0);
+    const t = setTimeout(() => load({ quiet: true, sync: true }), 0);
     return () => clearTimeout(t);
   }, [syncNonce, load]);
 
@@ -94,7 +116,7 @@ export default function QuotaRunway({ syncNonce = 0 }) {
             {res.stale ? "Refresh failed, showing data from " + fTime(res.at) + " IST"
               : res.refreshing ? "Refreshing… data as of " + (res.at ? fTime(res.at) + " IST" : "—")
               : "Live, not affected by range" + (res.at ? " · updated " + fTime(res.at) + " IST" : "")}
-            {res.stale && <button onClick={() => load()} style={{ border: "0", background: "transparent", color: "var(--acc)", fontSize: "11px", cursor: "pointer", padding: "0" }}>Retry</button>}
+            {res.stale && <button onClick={() => load({ sync: true })} style={{ border: "0", background: "transparent", color: "var(--acc)", fontSize: "11px", cursor: "pointer", padding: "0" }}>Retry</button>}
           </span>
         </div>
         <a href="/dashboard/quota" style={{ fontSize: "12px", display: "inline-flex", alignItems: "center", gap: "2px" }}>Details in Quota Tracker<span style={{ ...MS, fontSize: "15px" }}>arrow_forward</span></a>
@@ -123,7 +145,7 @@ export default function QuotaRunway({ syncNonce = 0 }) {
               {r.isErr ? (
                 <div style={{ flex: "4 1 420px", minWidth: "0", display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px", background: "var(--redbg)", color: "var(--red)", borderRadius: "7px", padding: "6px 10px", fontSize: "12px" }}>
                   <span style={{ display: "flex", alignItems: "center", gap: "6px" }}><span style={{ ...MS, fontSize: "16px" }}>error</span>{r.err}</span>
-                  <button onClick={() => load()} style={{ border: "0", background: "transparent", color: "var(--red)", fontWeight: "600", fontSize: "12px", cursor: "pointer", padding: "0" }}>Retry</button>
+                  <button onClick={() => load({ sync: true })} style={{ border: "0", background: "transparent", color: "var(--red)", fontWeight: "600", fontSize: "12px", cursor: "pointer", padding: "0" }}>Retry</button>
                 </div>
               ) : (
                 <>
@@ -186,7 +208,7 @@ export default function QuotaRunway({ syncNonce = 0 }) {
           <span style={{ ...MS, fontSize: "24px", color: "var(--red)" }}>error</span>
           <div style={{ fontWeight: "600" }}>Couldn&apos;t load quota windows</div>
           <div style={{ fontSize: "11.5px", color: "var(--tx3)" }}>The quota service did not answer.</div>
-          <button onClick={() => load()} style={BTN}>Retry</button>
+          <button onClick={() => load({ sync: true })} style={BTN}>Retry</button>
         </div>
       )}
     </section>
