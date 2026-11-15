@@ -14,9 +14,13 @@ import { cacheGet, cacheSet } from "@/lib/clientCache";
 import { AGENTS_SYNC_FALLBACK_S, agentsSyncSeconds, freshnessOf, istClock } from "./liveSync";
 
 const SETTINGS_KEY = "/api/settings#dashboardSync";
+const isSaved = (dashboardSync) => SYNC_CHOICES.includes(dashboardSync?.agents);
 
 export function AgentsSyncControl({ onAuto, onManual, paused = false, busy = false }) {
   const [seconds, setSecondsState] = useState(AGENTS_SYNC_FALLBACK_S);
+  // True once the user has saved an interval. Only then is the timer a real
+  // sync that asks for fresh data; the unsaved fallback is a plain poll.
+  const savedRef = useRef(false);
   const [left, setLeft] = useState(0);
   const [saving, setSaving] = useState(false);
   const onAutoRef = useRef(onAuto);
@@ -26,10 +30,11 @@ export function AgentsSyncControl({ onAuto, onManual, paused = false, busy = fal
   useEffect(() => {
     let off = false;
     const hit = cacheGet(SETTINGS_KEY);
-    if (hit) setTimeout(() => { if (!off) setSecondsState(agentsSyncSeconds(hit.data, SYNC_CHOICES)); }, 0);
+    if (hit) setTimeout(() => { if (!off) { savedRef.current = isSaved(hit.data); setSecondsState(agentsSyncSeconds(hit.data, SYNC_CHOICES)); } }, 0);
     fetch("/api/settings", { cache: "no-store" }).then((r) => (r.ok ? r.json() : null)).then((s) => {
       if (off || !s) return;
       cacheSet(SETTINGS_KEY, s.dashboardSync || {});
+      savedRef.current = isSaved(s.dashboardSync);
       setSecondsState(agentsSyncSeconds(s.dashboardSync, SYNC_CHOICES));
     }).catch(() => {});
     return () => { off = true; };
@@ -47,7 +52,7 @@ export function AgentsSyncControl({ onAuto, onManual, paused = false, busy = fal
       if (next > 0) { leftRef.current = next; setLeft(next); return; }
       leftRef.current = seconds;
       setLeft(seconds);
-      onAutoRef.current?.();
+      onAutoRef.current?.(savedRef.current);
     }, 1000);
     return () => { clearTimeout(t0); clearInterval(iv); };
   }, [seconds, paused]);
@@ -59,6 +64,7 @@ export function AgentsSyncControl({ onAuto, onManual, paused = false, busy = fal
 
   const setSeconds = useCallback(async (next) => {
     setSecondsState(next);
+    savedRef.current = true;
     leftRef.current = next;
     setLeft(next);
     setSaving(true);

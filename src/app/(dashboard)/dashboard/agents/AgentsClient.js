@@ -11,6 +11,7 @@ import RefreshBar from "../spend/RefreshBar";
 import { AgentsSyncControl, Freshness } from "./AgentsSync";
 import { createRefetcher, autoAllowed, liveAutoAllowed, rangeNeeds, LIVE_THROTTLE_MS, RANGE_THROTTLE_MS } from "./liveSync";
 import { useLiveTopic } from "@/shared/hooks/useLive";
+import { createEtagFetcher } from "./etagFetch";
 import { cacheInvalidate } from "@/lib/clientCache";
 import { cacheGet, cacheSet, isFresh } from "@/lib/clientCache";
 
@@ -31,44 +32,9 @@ function nextOverrideRequestId(sid) {
   return requestId;
 }
 
-// Last answer per URL with its ETag. The Agents GET routes reply 304 when the
-// data did not change; the stored answer is then reused as it is.
-const etagStore = new Map();
-const ETAG_STORE_MAX = 24;
-
-// A floor window can serve an older body under a moved ETag; the route then
-// answers with `x-9r-retry-after-ms` and the client refetches once after it.
-const retryTimers = new Map();
-
-function scheduleRetry(url, delayMs, refetch) {
-  clearTimeout(retryTimers.get(url));
-  retryTimers.set(url, setTimeout(() => { retryTimers.delete(url); refetch(); }, delayMs));
-}
-
-export function cancelRetries() {
-  for (const t of retryTimers.values()) clearTimeout(t);
-  retryTimers.clear();
-}
-
-async function getJson(url) {
-  clearTimeout(retryTimers.get(url)); retryTimers.delete(url);
-  const known = etagStore.get(url);
-  const res = await fetch(url, { cache: "no-store", headers: known ? { "If-None-Match": known.etag } : undefined });
-  if (res.status === 304 && known) return known.body;
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error || res.statusText);
-  const etag = res.headers.get("etag");
-  if (etag) {
-    etagStore.delete(url);
-    etagStore.set(url, { etag, body });
-    while (etagStore.size > ETAG_STORE_MAX) etagStore.delete(etagStore.keys().next().value);
-  }
-  const retryAfter = parseInt(res.headers.get("x-9r-retry-after-ms"), 10);
-  if (Number.isFinite(retryAfter) && retryAfter > 0) {
-    scheduleRetry(url, retryAfter, () => getJson(url).catch(() => {}));
-  }
-  return body;
-}
+// Last answer per URL with its ETag, 304 reuse, the sync signal and the
+// trailing refetch after a server floor window: see etagFetch.js.
+const { getJson, cancelRetries } = createEtagFetcher();
 
 // Live data is pushed: the "agents" and "usage" live topics tell the page when
 // to refetch /api/agents/live (at most every 2 s, Live tab only). Sessions,
@@ -240,10 +206,19 @@ export default function AgentsClient() {
   const liveSeen = useRef(null);
   const uiRef = useRef(ui);
   useEffect(() => { uiRef.current = ui; });
+  // Set only while "Sync now" (or a saved auto-sync interval) starts its loads.
+  // A load reads it before its first await, so only those loads carry the
+  // sync signal; live-topic refetches and page loads never do.
+  const syncFlag = useRef(false);
+  // The loaders as they are now, for a trailing refetch (see etagFetch.js).
+  const reloadRef = useRef({ live: null, range: null });
+  const reloadLive = useCallback(() => reloadRef.current.live?.(), []);
+  const reloadRange = useCallback(() => reloadRef.current.range?.(), []);
   const loadLive = useCallback(async () => {
     const id = ++liveId.current;
+    const sync = syncFlag.current;
     try {
-      const d = await getJson("/api/agents/live");
+      const d = await getJson("/api/agents/live", { sync, reload: reloadLive });
       if (id !== liveId.current) return;
       // A 304 hands back the same object: skip the re-render when the feed did not change (N5).
       if (d !== liveSeen.current) { liveSeen.current = d; setLive(d); setClock(Date.now()); }
@@ -254,7 +229,7 @@ export default function AgentsClient() {
       markFeed("live", false);
       setMode((m) => (m === "ready" || m === "stale" ? "stale" : m));
     }
-  }, [markFeed]);
+  }, [markFeed, reloadLive]);
 
   // ---- range data: sessions, analytics (roles) and tools, each only while shown ----
   const rangeQs = useMemo(() => {
@@ -278,6 +253,7 @@ export default function AgentsClient() {
   const sessionsSeen = useRef(null);
   const loadSessions = useCallback(async ({ background = false, busy = false } = {}) => {
     const id = ++sessionsId.current;
+    const sync = syncFlag.current;
     const key = `/api/agents/sessions?${rangeQs}`;
     // Show the cached copy at once, refetch only when it is older than RANGE_TTL.
     if (!background) {
@@ -295,7 +271,7 @@ export default function AgentsClient() {
     }
     if (!background || busy) setKindBusy("sessions", true); // automatic refreshes stay silent
     try {
-      const s = await getJson(key);
+      const s = await getJson(key, { sync, reload: reloadRange });
       if (id !== sessionsId.current) return;
       setKindBusy("sessions", false);
       // A 304 hands back the same object: nothing changed, keep the list as it is.
@@ -318,12 +294,13 @@ export default function AgentsClient() {
       if (id !== sessionsId.current) return;
       rangeFail("sessions", e);
     }
-  }, [rangeQs, setKindBusy, markFeed, rangeFail]);
+  }, [rangeQs, setKindBusy, markFeed, rangeFail, reloadRange]);
 
   const analyticsId = useRef(0);
   const analyticsSeen = useRef(null);
   const loadAnalytics = useCallback(async ({ background = false, busy = false } = {}) => {
     const id = ++analyticsId.current;
+    const sync = syncFlag.current;
     const key = `/api/agents/analytics?${rangeQs}`;
     if (!background) {
       const hit = cacheGet(key);
@@ -336,7 +313,7 @@ export default function AgentsClient() {
     }
     if (!background || busy) setKindBusy("analytics", true);
     try {
-      const a = await getJson(key);
+      const a = await getJson(key, { sync, reload: reloadRange });
       if (id !== analyticsId.current) return;
       setKindBusy("analytics", false);
       if (a !== analyticsSeen.current) { analyticsSeen.current = a; cacheSet(key, a); setAnalytics(a); }
@@ -346,11 +323,12 @@ export default function AgentsClient() {
       if (id !== analyticsId.current) return;
       rangeFail("analytics", e);
     }
-  }, [rangeQs, setKindBusy, markFeed, rangeFail]);
+  }, [rangeQs, setKindBusy, markFeed, rangeFail, reloadRange]);
 
   const toolsId = useRef(0);
   const loadTools = useCallback(async ({ background = false } = {}) => {
     const id = ++toolsId.current;
+    const sync = syncFlag.current;
     const key = `/api/agents/tools?${rangeQs}`;
     if (!background) {
       const hit = cacheGet(key);
@@ -358,7 +336,7 @@ export default function AgentsClient() {
       if (isFresh(hit, RANGE_TTL)) return;
     }
     try {
-      const data = await getJson(key);
+      const data = await getJson(key, { sync, reload: reloadRange });
       if (id !== toolsId.current) return;
       cacheSet(key, data);
       setTools(data); setToolsError("");
@@ -369,7 +347,7 @@ export default function AgentsClient() {
       // A failed background refresh keeps the table that is on screen.
       if (!background) { setTools(null); setToolsError(error.message || "Request failed"); }
     }
-  }, [rangeQs, markFeed]);
+  }, [rangeQs, markFeed, reloadRange]);
 
   // Load each kind when its view opens and when the range changes.
   useEffect(() => { if (!needs.sessions) return; const t = setTimeout(() => loadSessions(), 0); return () => clearTimeout(t); }, [needs.sessions, loadSessions, rangeNonce]);
@@ -392,7 +370,11 @@ export default function AgentsClient() {
   const liveVersion = `${agentsTopic.tick}.${usageTopic.tick}`;
   const loadLiveRef = useRef(loadLive);
   const refreshRangeRef = useRef(refreshRange);
-  useEffect(() => { loadLiveRef.current = loadLive; refreshRangeRef.current = refreshRange; });
+  useEffect(() => {
+    loadLiveRef.current = loadLive; refreshRangeRef.current = refreshRange;
+    // Trailing refetch: the same loaders, in the background, for the view that is open now.
+    reloadRef.current = { live: loadLive, range: () => refreshRange(false) };
+  });
   const refetchers = useRef(null);
   useEffect(() => {
     const view = () => ({ paused: uiRef.current.paused, hidden: document.hidden, tab: uiRef.current.tab });
@@ -428,17 +410,28 @@ export default function AgentsClient() {
 
   // Fallback timer. It keeps the header's live count roughly right on every
   // tab (one small request, usually a 304) and refreshes the open range view.
-  const autoSync = useCallback(() => {
+  // `fresh` is true when the user saved an auto-sync interval: that timer is
+  // a sync like the button and skips every cache. The unsaved 60 s fallback
+  // stays an ordinary, cacheable poll.
+  const autoSync = useCallback((fresh = false) => {
     if (!autoAllowed({ paused: uiRef.current.paused, hidden: document.hidden })) return;
-    refetchers.current?.live.force();
-    refetchers.current?.range.request();
+    if (fresh) cacheInvalidate("/api/agents");
+    syncFlag.current = !!fresh;
+    try {
+      refetchers.current?.live.force();
+      refetchers.current?.range.request();
+    } finally { syncFlag.current = false; }
     setTick((x) => x + 1);
   }, []);
-  // "Sync now" works while paused too.
+  // "Sync now" works while paused too. Every load it starts carries the sync
+  // signal: no cached copy, no 304, no server result cache.
   const manualSync = useCallback(() => {
     cacheInvalidate("/api/agents");
-    refetchers.current?.live.force();
-    refetchers.current?.range.force();
+    syncFlag.current = true;
+    try {
+      refetchers.current?.live.force();
+      refetchers.current?.range.force();
+    } finally { syncFlag.current = false; }
     setTick((x) => x + 1);
   }, []);
 
