@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { getSettings, updateSettings } from "@/lib/localDb";
 import { ready, rules, groups, testText, testImage, eventsFile, health } from "@/lib/piiGuard/observe.js";
 import { summarize, createSummarizer, applyIgnoreToSummary } from "@/lib/piiGuard/summary.js";
-import { rangeStart, scanBackward, scanForward, withLog } from "@/lib/piiGuard/eventLog.js";
+import { endOffset, rangeStart, scanBackward, scanForward, withLog } from "@/lib/piiGuard/eventLog.js";
 import { bump, version } from "@/lib/live/bus.js";
 import { isSyncRequest } from "@/lib/dashboardSync.js";
 
@@ -79,6 +79,12 @@ const MAX_LIVE = 3;
 const LIVE_IDLE_MS = 10 * 60_000;
 // ETags are only comparable within one process: the pii version restarts with it.
 const BOOT = randomBytes(4).toString("hex");
+// A routing record follows its event in the log, by seconds at most. A range that ended longer ago than
+// this is closed: no later append can change it, so nothing about it depends on the end of the file.
+const CLOSED_AFTER_MS = 5 * 60_000;
+const isClosed = (to, now = Date.now()) => to + CLOSED_AFTER_MS < now;
+// Moves on every settings save here; the tag of a closed range uses it in place of the pii version.
+let settingsRev = 0;
 
 // The log is never held in memory. A summary of a past range is cached by its exact range and the file's
 // state. A range that ends now or later keeps its folded summary and the offset it has read to, so a poll
@@ -102,10 +108,14 @@ function withSettingsLock(fn) {
 
 // Returns { events (newest first, ts >= fromMs), truncated }. truncated: the scan cap stopped the read before `fromMs`.
 // `visit(e, ts)`, if given, sees events newest first and returns false to stop; no copy of the range is made
-// and only the chunks it needed are read.
-export async function loadEvents(fromMs, visit) {
+// and only the chunks it needed are read. `untilMs`: nothing later is wanted, so the read starts at that
+// point of the file (found by bisection) instead of at its end, and the scan cap counts from there.
+export async function loadEvents(fromMs, visit, untilMs = Infinity) {
   const events = [];
-  const { truncated } = await withLog(eventsFile(), (handle, st) => scanBackward(handle, st.size, fromMs, visit || ((e) => { events.push(e); })), { truncated: false });
+  const { truncated } = await withLog(eventsFile(), async (handle, st) => {
+    const end = Number.isFinite(untilMs) && isClosed(untilMs) ? await endOffset(handle, st.size, untilMs + CLOSED_AFTER_MS) : st.size;
+    return scanBackward(handle, end, fromMs, visit || ((e) => { events.push(e); }));
+  }, { truncated: false });
   return { events, truncated };
 }
 
@@ -139,8 +149,10 @@ function findRecentNewHashes(minutes) {
   }, { hashes: [], truncated: false });
 }
 
+// A closed range is keyed on its bounds and the file's identity only: appends do not change it.
 function baseSummaryKey(file, from, to, step, origin, st) {
-  return `${file}|${Math.floor(from / 6e4)}|${Math.floor(to / 6e4)}|${step}|${origin}|${st?.ino ?? ""}|${st?.birthtimeMs ?? ""}|${st?.size ?? 0}|${st?.mtimeMs ?? 0}`;
+  const id = `${file}|${Math.floor(from / 6e4)}|${Math.floor(to / 6e4)}|${step}|${origin}|${st?.ino ?? ""}|${st?.birthtimeMs ?? ""}`;
+  return isClosed(to) ? `${id}|closed` : `${id}|${st?.size ?? 0}|${st?.mtimeMs ?? 0}`;
 }
 function getCachedBaseSummary(key) {
   const hit = summaryCache.get(key);
@@ -176,10 +188,11 @@ async function liveSummary(handle, st, file, from, to, step, origin) {
   return { ...entry.summarizer.finish({ until: to }), truncated: entry.truncated, step, origin };
 }
 async function rangeSummary(handle, st, from, to, step, origin) {
-  const { start, truncated } = await rangeStart(handle, st.size, from);
+  // A little past `to`, not to the end of the file: a routing record follows its event, possibly after `to`.
+  const end = isClosed(to) ? await endOffset(handle, st.size, to + CLOSED_AFTER_MS) : st.size;
+  const { start, truncated } = await rangeStart(handle, end, from);
   const summarizer = createSummarizer({ since: from, until: to, step, origin });
-  // To the end of the file: a routing record follows its event, possibly after `to`.
-  await scanForward(handle, start, st.size, fold(summarizer));
+  await scanForward(handle, start, end, fold(summarizer));
   return { ...summarizer.finish(), truncated, step, origin };
 }
 // Calls run one at a time: polls and two tabs share the live state.
@@ -267,7 +280,7 @@ export async function GET(request) {
     const page = [];
     // `seen`: events visited at timestamp `seenTs`, kept or filtered out, so the cursor skips exactly those.
     let skipped = 0, seenTs = NaN, seen = 0, lastSeen = 0;
-    await loadEvents(range.from, (e, ts) => {
+    const { truncated } = await loadEvents(range.from, (e, ts) => {
       if (!(ts <= range.to) || ts > before) return;
       if (ts === before && skipped < skip) { skipped++; return; }
       if (ts !== seenTs) { seenTs = ts; seen = 0; }
@@ -278,14 +291,15 @@ export async function GET(request) {
       page.push({ ...e, hits, client: clientOf(e.ua || "") });
       lastSeen = seen;
       return page.length < limit;
-    });
+    }, Math.min(range.to, before));
     const last = page.at(-1);
     let next = null;
     if (page.length === limit) {
       const ts = Date.parse(last.ts);
       next = { before: ts, skip: lastSeen + (ts === before ? skip : 0) };
     }
-    return NextResponse.json({ events: page, next });
+    // `truncated`: the scan cap stopped this page before the range start, so "no next page" is not the end.
+    return NextResponse.json({ events: page, next, truncated: !next && truncated });
   }
 
   const fromRaw = url.searchParams.get("from");
@@ -295,8 +309,10 @@ export async function GET(request) {
     if (vr === "bad") return NextResponse.json({ error: "Invalid range" }, { status: 400 });
     // The pii topic version moves on every log append and settings save. An unchanged version for the same
     // range answers 304 before the log or the settings are read. The minute keeps the health counters
-    // (which move without a log append) at most a minute old.
-    const etag = `W/"pii-${BOOT}-${version("pii")}-${vr.from}-${vr.to}-${Math.floor(Date.now() / 6e4)}"`;
+    // (which move without a log append) at most a minute old. A closed range does not change with the
+    // log, so its tag moves with settings saves only.
+    const rev = isClosed(vr.to) ? `c${settingsRev}` : version("pii");
+    const etag = `W/"pii-${BOOT}-${rev}-${vr.from}-${vr.to}-${Math.floor(Date.now() / 6e4)}"`;
     const headers = { ETag: etag, "Cache-Control": "private, no-cache" };
     // "Sync now" asked for a fresh body: no 304 and no cached summary.
     const sync = isSyncRequest(request);
@@ -435,6 +451,7 @@ export async function POST(request) {
       }
     }
     await updateSettings({ piiGuard: next });
+    settingsRev++;
     bump("pii");
     console.info(`[pii-guard] Settings changed: ${formatSettingsDiff(current, next)}`);
     // The UI updates config/ignore in place from this response; no summary is built here.

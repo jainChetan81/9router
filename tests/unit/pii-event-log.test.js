@@ -9,7 +9,7 @@ vi.mock("@/lib/localDb", () => ({ getSettings: async () => settings, updateSetti
 vi.mock("@/lib/piiGuard/observe.js", () => ({ ready: async () => true, rules: () => [], groups: () => [], testText: async () => null, testImage: async () => null, eventsFile: () => paths.file, health: () => ({}) }));
 
 import { GET, POST, loadEvents } from "../../src/app/api/pii-guard/route.js";
-import { CHUNK, findOffset, scanBackward, scanForward } from "../../src/lib/piiGuard/eventLog.js";
+import { CHUNK, endOffset, findOffset, scanBackward, scanForward, setScanCap } from "../../src/lib/piiGuard/eventLog.js";
 import { createSummarizer, summarize } from "../../src/lib/piiGuard/summary.js";
 import { bump } from "../../src/lib/live/bus.js";
 
@@ -187,5 +187,76 @@ describe("GET /api/pii-guard summary", () => {
     const after = await GET(new Request(url(from, to), { headers: { "if-none-match": etag } }));
     expect(after.status).toBe(200);
     expect((await after.json()).config.mode).toBe("redact");
+  });
+});
+
+describe("ranges that ended", () => {
+  const url = (from, to) => `http://localhost/api/pii-guard?from=${from}&to=${to}`;
+  const hit = (ts, id) => JSON.stringify({ ts: new Date(ts).toISOString(), requestId: id, hits: [{ hash: "eeeeeeeeeeee", rule: "email", action: "redact" }] });
+  afterEach(() => setScanCap());
+
+  it("finds where a range ends, so a scan stops there instead of at the end of the file", async () => {
+    const now = Date.now(), lines = log(6000, now);
+    await writeFile(paths.file, lines.join("\n") + "\n");
+    const to = now - 3000 * 60_000;
+    const handle = await open(paths.file, "r");
+    try {
+      const { size } = await handle.stat();
+      const end = await endOffset(handle, size, to);
+      expect(end).toBeLessThan(size * 0.6);
+      // Every event up to `to` is before the offset, and the offset is a line start.
+      const seen = [];
+      expect(await scanForward(handle, 0, end, (e, ts) => { if (e.kind !== "routing") seen.push(ts); })).toBe(end);
+      expect(seen.filter((ts) => ts <= to)).toHaveLength(3001); // minutes 3000 to 6000 before now
+      expect(await endOffset(handle, size, now + DAY)).toBe(size);
+    } finally { await handle.close(); }
+  });
+
+  it("a closed range is summarised once: appends change neither its tag nor its summary", async () => {
+    const now = Date.now(), lines = log(3000, now);
+    await writeFile(paths.file, lines.join("\n") + "\n");
+    const from = now - 5 * DAY, to = now - 1000 * 60_000;
+    const first = await GET(new Request(url(from, to)));
+    const etag = first.headers.get("etag"), body = await first.json();
+    expect(body.summary.requests).toBe(2001); // minutes 1000 to 3000 before now
+    expect(body.summary.requests).toBe(summarize(parseAll(lines), { since: from, until: to }).requests);
+    // Routing records after the range end are still read.
+    expect(body.summary.groups.every((g) => /^p\d$/.test(g.provider))).toBe(true);
+    // An append moves the pii topic. A line dated inside the range is used here only to show that the
+    // cached summary is returned without reading the log again.
+    await appendFile(paths.file, hit(to - 60_000, "inside") + "\n");
+    bump("pii");
+    expect((await GET(new Request(url(from, to), { headers: { "if-none-match": etag } }))).status).toBe(304);
+    expect((await (await GET(new Request(url(from, to)))).json()).summary.requests).toBe(2001);
+    // Sync reads the log again.
+    const synced = await GET(new Request(url(from, to), { headers: { "if-none-match": etag, "x-9r-sync": "1" } }));
+    expect(synced.status).toBe(200);
+    // A settings save still moves the tag of a closed range.
+    await POST(new Request("http://localhost/api/pii-guard", { method: "POST", body: JSON.stringify({ mode: "block" }) }));
+    const saved = await GET(new Request(url(from, to), { headers: { "if-none-match": etag } }));
+    expect(saved.status).toBe(200);
+    expect((await saved.json()).config.mode).toBe("block");
+  });
+
+  it("a deep events page starts at its cursor, and a page cut by the scan cap says so", async () => {
+    const now = Date.now(), lines = log(6000, now);
+    await writeFile(paths.file, lines.join("\n") + "\n");
+    setScanCap(4 * CHUNK); // about 1,300 of the 6,000 events
+    const events = (q) => GET(new Request(`http://localhost/api/pii-guard?events=1&limit=50&from=${now - 5 * DAY}&to=${now}${q}`)).then((r) => r.json());
+    // Far beyond the cap when counted from the end of the file; inside it when counted from the cursor.
+    const before = now - 5000 * 60_000;
+    const deep = await events(`&before=${before}&skip=0`);
+    expect(deep.events).toHaveLength(50);
+    expect(Date.parse(deep.events[0].ts)).toBe(before);
+    expect(deep.events[0].provider).toMatch(/^p\d$/);
+    expect(deep.next).toEqual({ before: before - 49 * 60_000, skip: 1 });
+    expect(deep.truncated).toBe(false);
+    // A filter that matches nothing reads until the cap: not the end of the log.
+    const cut = await events(`&before=${now - 3000 * 60_000}&skip=0&model=none`);
+    expect(cut).toEqual({ events: [], next: null, truncated: true });
+    // The real end of the range is not reported as truncated.
+    const last = await events(`&before=${now - 5990 * 60_000}&skip=0`);
+    expect(last.events.length).toBeGreaterThan(0);
+    expect(last).toMatchObject({ next: null, truncated: false });
   });
 });

@@ -7,6 +7,9 @@ import { open } from "node:fs/promises";
 export const CHUNK = 256 * 1024;
 // One call reads at most this far back; older than that reports `truncated`.
 export const SCAN_CAP = 256 * 1024 * 1024;
+// A constant in normal use; tests set it lower to reach the cap without a 256 MiB fixture.
+let scanCap = SCAN_CAP;
+export function setScanCap(n) { scanCap = Number.isInteger(n) && n > 0 ? n : SCAN_CAP; }
 const PROBE = 64 * 1024, MAX_LINE = 16 * 1024 * 1024;
 // Appends are asynchronous, so two lines may be a moment out of order: start a little early.
 const ORDER_SLACK_MS = 60_000;
@@ -61,9 +64,19 @@ export async function findOffset(handle, size, fromMs) {
 /** Where a scan for `fromMs` starts. `truncated`: the range begins further back than one call reads. */
 export async function rangeStart(handle, size, fromMs) {
   const start = await findOffset(handle, size, fromMs);
-  if (size - start <= SCAN_CAP) return { start, truncated: false };
-  const line = await probe(handle, size - SCAN_CAP, size);
+  if (size - start <= scanCap) return { start, truncated: false };
+  const line = await probe(handle, size - scanCap, size);
   return { start: line ? line.start : size, truncated: true };
+}
+
+/** Offset of a line start after the last line with `ts <= toMs` (or `size`): a scan for a range that has
+ *  ended can stop here instead of at the end of the file. */
+export async function endOffset(handle, size, toMs) {
+  // findOffset stops within one chunk before the first line later than `toMs` plus the ordering slack.
+  const at = Math.min(size, (await findOffset(handle, size, toMs + 2 * ORDER_SLACK_MS)) + CHUNK);
+  if (at >= size) return size;
+  const line = await probe(handle, at, size);
+  return line ? line.start : size;
 }
 
 /** Feeds every complete line in [start, size) to `onEvent(event, ts)`, oldest first, a chunk at a time.
@@ -110,7 +123,7 @@ export async function scanBackward(handle, size, fromMs, visit) {
   const routing = new Map();
   let end = size, want = CHUNK, first = true;
   while (end > 0) {
-    if (size - end >= SCAN_CAP) return { truncated: true };
+    if (size - end >= scanCap) return { truncated: true };
     const start = Math.max(0, end - want);
     const buf = await readRange(handle, start, end);
     // The first line of a chunk may be partial: it belongs to the next (older) chunk.
