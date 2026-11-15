@@ -9,7 +9,7 @@ import "../spend/shared-page.css";
 import "./agents.css";
 import RefreshBar from "../spend/RefreshBar";
 import { AgentsSyncControl, Freshness } from "./AgentsSync";
-import { createRefetcher, autoAllowed, liveAutoAllowed, rangeNeeds, LIVE_THROTTLE_MS, RANGE_THROTTLE_MS } from "./liveSync";
+import { createRefetcher, createTrailingPoller, autoAllowed, liveAutoAllowed, rangeNeeds, LIVE_THROTTLE_MS, RANGE_THROTTLE_MS, OVERRIDES_GAP_MS } from "./liveSync";
 import { useLiveTopic } from "@/shared/hooks/useLive";
 import { createEtagFetcher } from "./etagFetch";
 import { cacheInvalidate } from "@/lib/clientCache";
@@ -154,23 +154,27 @@ export default function AgentsClient() {
     const timer = setTimeout(() => refreshOverrides(ui.drawer).catch(() => setToast("Unable to load routing overrides.")), 0);
     return () => clearTimeout(timer);
   }, [ui.drawer, refreshOverrides]);
-  const lastOverridePoll = useRef(0);
+  // One batch request for every live session. `live` changes far more often than the request takes:
+  // the poller runs one request at a time and follows a change that arrived meanwhile with a trailing
+  // run, so the newest session list is never left waiting for a later change.
+  const overridePoller = useRef(null);
+  if (!overridePoller.current) {
+    overridePoller.current = createTrailingPoller({
+      gapMs: OVERRIDES_GAP_MS,
+      run: (ids) => {
+        const reqIds = Object.fromEntries(ids.map((sid) => [sid, nextOverrideRequestId(sid)]));
+        return getJson(`/api/agents/overrides?ids=${ids.map(encodeURIComponent).join(",")}`).then((d) => {
+          const got = d.sessions || {};
+          const fresh = ids.filter((sid) => got[sid.toLowerCase()] && overrideRequestIds.get(sid) === reqIds[sid]);
+          setOverridesBySession((old) => ({ ...old, ...Object.fromEntries(fresh.map((sid) => { const v = got[sid.toLowerCase()]; return [sid, { overrides: v.overrides || [], revisions: v.revisions || {} }]; })) }));
+        });
+      },
+    });
+  }
+  useEffect(() => () => overridePoller.current.cancel(), []);
   useEffect(() => {
     const ids = (live?.sessions || []).map((s) => s.session).filter(Boolean);
-    if (!ids.length) return;
-    const now = Date.now();
-    if (now - lastOverridePoll.current < 10000) return;
-    lastOverridePoll.current = now;
-    let cancelled = false;
-    const reqIds = Object.fromEntries(ids.map((sid) => [sid, nextOverrideRequestId(sid)]));
-    // One batch request for every live session (was one request per session).
-    getJson(`/api/agents/overrides?ids=${ids.map(encodeURIComponent).join(",")}`).then((d) => {
-      if (cancelled) return;
-      const got = d.sessions || {};
-      const fresh = ids.filter((sid) => got[sid.toLowerCase()] && overrideRequestIds.get(sid) === reqIds[sid]);
-      setOverridesBySession((old) => ({ ...old, ...Object.fromEntries(fresh.map((sid) => { const v = got[sid.toLowerCase()]; return [sid, { overrides: v.overrides || [], revisions: v.revisions || {} }]; })) }));
-    }).catch(() => {});
-    return () => { cancelled = true; };
+    if (ids.length) overridePoller.current.request(ids);
   }, [live]);
 
   useEffect(() => {

@@ -8,6 +8,8 @@
 export const AGENTS_SYNC_FALLBACK_S = 60;
 /** Minimum gap between two automatic /live fetches. */
 export const LIVE_THROTTLE_MS = 2000;
+/** Minimum gap between two routing-override batch requests, from the end of one to the start of the next. */
+export const OVERRIDES_GAP_MS = 10_000;
 /** Minimum gap between two automatic range (sessions, analytics, tools) fetches. */
 export const RANGE_THROTTLE_MS = 60_000;
 
@@ -57,6 +59,46 @@ export function createRefetcher({ run, throttleMs = 0, allowed = () => true, now
     force() { cancel(); fire(); },
     cancel,
     pending: () => timer !== null,
+  };
+}
+
+/**
+ * Poller for data that follows a value which changes often (the live session
+ * list). One request at a time, and at most one per `gapMs`, counted from the
+ * END of the previous request. A request() that arrives while one is in
+ * flight, or inside the gap, is never lost: one trailing run follows with the
+ * newest argument.
+ *   request(arg)  ask for a run with `arg`; a later call replaces the argument.
+ *   cancel()      drop a waiting run (a request in flight still finishes).
+ */
+export function createTrailingPoller({ run, gapMs = 0, now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout }) {
+  let busy = false;
+  let doneAt = -Infinity;
+  let timer = null;
+  let wanted = null; // { arg } while a run is owed
+  const start = () => {
+    const { arg } = wanted;
+    wanted = null;
+    busy = true;
+    Promise.resolve().then(() => run(arg)).catch(() => {}).finally(() => {
+      busy = false;
+      doneAt = now();
+      if (wanted) schedule();
+    });
+  };
+  function schedule() {
+    if (busy || timer !== null) return;
+    const wait = gapMs - (now() - doneAt);
+    if (wait <= 0) { start(); return; }
+    timer = setTimer(() => { timer = null; if (wanted) start(); }, wait);
+  }
+  return {
+    request(arg) { wanted = { arg }; schedule(); },
+    cancel() {
+      if (timer !== null) { clearTimer(timer); timer = null; }
+      wanted = null;
+    },
+    pending: () => busy || wanted !== null,
   };
 }
 

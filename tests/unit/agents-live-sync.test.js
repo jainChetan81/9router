@@ -1,7 +1,7 @@
 // Refetch policy of the Agents page: pause, tab gating, throttle, freshness.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  AGENTS_SYNC_FALLBACK_S, LIVE_THROTTLE_MS, agentsSyncSeconds, autoAllowed, createRefetcher,
+  AGENTS_SYNC_FALLBACK_S, LIVE_THROTTLE_MS, OVERRIDES_GAP_MS, agentsSyncSeconds, autoAllowed, createRefetcher, createTrailingPoller,
   freshnessOf, istClock, liveAutoAllowed, rangeNeeds,
 } from "../../src/app/(dashboard)/dashboard/agents/liveSync.js";
 import { SYNC_CHOICES } from "../../src/lib/dashboardSync.js";
@@ -103,5 +103,66 @@ describe("agents refetch policy", () => {
   it("shows clock times in IST", () => {
     expect(istClock(Date.parse("2026-11-14T13:17:05Z"))).toBe("18:47:05 IST");
     expect(istClock(NaN)).toBe("");
+  });
+});
+
+// The routing-override batch follows the live session list, which changes more often than a request takes.
+describe("agents overrides poller", () => {
+  beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(new Date("2026-11-14T12:00:00Z")); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  // Requests the test completes by hand.
+  function poller() {
+    const calls = [];
+    const p = createTrailingPoller({ gapMs: OVERRIDES_GAP_MS, run: (ids) => new Promise((resolve) => calls.push({ ids, resolve })) });
+    return { p, calls };
+  }
+  const settle = async (call) => { call.resolve(); await vi.advanceTimersByTimeAsync(0); };
+
+  it("a change while the request is in flight gets a trailing run with the newest list", async () => {
+    const { p, calls } = poller();
+    p.request(["a"]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls.map((c) => c.ids)).toEqual([["a"]]);
+    // `live` changes twice during the request: nothing is cancelled, nothing starts twice.
+    p.request(["a", "b"]);
+    p.request(["a", "b", "c"]);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(calls).toHaveLength(1);
+    await settle(calls[0]);
+    // The gap counts from the end of the request, then the trailing run goes without a further change.
+    await vi.advanceTimersByTimeAsync(OVERRIDES_GAP_MS - 1);
+    expect(calls).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(calls.map((c) => c.ids)).toEqual([["a"], ["a", "b", "c"]]);
+    await settle(calls[1]);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(calls).toHaveLength(2); // nothing owed, nothing runs
+    expect(p.pending()).toBe(false);
+  });
+
+  it("runs at once when the last request ended long ago, and survives a failed request", async () => {
+    const calls = [];
+    const p = createTrailingPoller({ gapMs: OVERRIDES_GAP_MS, run: (ids) => { calls.push(ids); return Promise.reject(new Error("offline")); } });
+    p.request(["a"]);
+    await vi.advanceTimersByTimeAsync(0);
+    p.request(["b"]);
+    await vi.advanceTimersByTimeAsync(OVERRIDES_GAP_MS);
+    expect(calls).toEqual([["a"], ["b"]]);
+    await vi.advanceTimersByTimeAsync(OVERRIDES_GAP_MS + 1);
+    p.request(["c"]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls).toEqual([["a"], ["b"], ["c"]]);
+  });
+
+  it("cancel drops a waiting run", async () => {
+    const { p, calls } = poller();
+    p.request(["a"]);
+    await vi.advanceTimersByTimeAsync(0);
+    await settle(calls[0]);
+    p.request(["b"]);
+    p.cancel();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(calls).toHaveLength(1);
   });
 });
