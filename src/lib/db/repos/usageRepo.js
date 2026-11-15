@@ -1,5 +1,5 @@
 import { EventEmitter } from "events";
-import { getAdapter, getAdapterSync } from "../driver.js";
+import { getAdapter, getAdapterSync, onBeforeDbClose } from "../driver.js";
 import { parseJson, stringifyJson } from "../helpers/jsonCol.js";
 import { getMeta, setMeta, setMetaSync } from "../helpers/metaStore.js";
 import { DAY_MS, fmtIstDay, fmtIstHhmm, istDayKey, istDayKeyOffset, istDayKeyToMs, istMidnightMs } from "../../spend/time.js";
@@ -524,14 +524,10 @@ const _shutdownUsageFlush = () => {
   } catch {}
 };
 
-// HMR re-imports this module; guard so the listeners never stack.
-if (!global._usageFlushListeners) {
-  global._usageFlushListeners = true;
-  process.on("beforeExit", _shutdownUsageFlush);
-  process.on("SIGINT", _shutdownUsageFlush);
-  process.on("SIGTERM", _shutdownUsageFlush);
-  process.on("exit", _shutdownUsageFlush);
-}
+// Runs before the adapter closes the database on SIGINT/SIGTERM/beforeExit,
+// and on "exit". The adapters own those signals; a listener of our own would
+// run after the close whenever the adapter loaded first.
+onBeforeDbClose("usageDaily", _shutdownUsageFlush);
 
 // Crash recovery: a SIGKILL/OOM loses only the unflushed in-memory buffer.
 // usageHistory rows past the last flush marker are re-aggregated into

@@ -1,6 +1,9 @@
 import { ensureDirs, DATA_FILE } from "./paths.js";
 import { stripNullBytes } from "./helpers/nullBytes.js";
 
+// Buffers that must reach the database before it closes register here.
+export { onBeforeDbClose } from "./shutdownHooks.js";
+
 // Use global to survive Next.js dev hot-reload (module state resets on reload)
 if (!global._dbAdapter) global._dbAdapter = { instance: null, initPromise: null, logged: false };
 const state = global._dbAdapter;
