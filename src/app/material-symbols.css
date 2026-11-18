@@ -1,5 +1,6 @@
 /* Material Symbols Outlined, self-hosted and cut down to the icons the app uses: about 130 KB instead of
-   the package's 3.9 MB file. Built by `node scripts/subset-icons.mjs` from the material-symbols package;
+   the package's 3.9 MB file. Built by `node scripts/subset-icons.mjs` from the material-symbols package
+   (the package's index.d.ts names plus the alias ligatures in scripts/material-symbols-aliases.json);
    src/app/fonts/material-symbols-subset.json lists the icons it holds. An icon that is not in the subset
    shows as its name in plain letters, so after using a new icon run the script again
    (tests/unit/icon-subset.test.js and `node scripts/subset-icons.mjs --check` fail until then). */

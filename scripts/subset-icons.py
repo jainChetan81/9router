@@ -9,6 +9,10 @@ named icons, the letters that spell them and the ligature rules between the two.
 off on purpose: with every letter present it would pull every icon back in. The GRAD axis is pinned to
 its default (the app never sets it); FILL, wght and opsz stay, so icons render as before.
 Prints a JSON object: the names kept, and the names the font does not have.
+
+With --ligatures IN.woff2 it prints every ligature name the font supports instead. The .mjs caller
+diffs that against the package's index.d.ts to refresh scripts/material-symbols-aliases.json, because
+index.d.ts omits alias ligatures the font still supports (expand_more, done, ...).
 """
 import json
 import string
@@ -73,6 +77,9 @@ def main(names_file, source, target):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 4:
+    if len(sys.argv) == 3 and sys.argv[1] == "--ligatures":
+        print("\n".join(sorted(ligatures(TTFont(sys.argv[2])))))
+    elif len(sys.argv) == 4:
+        main(*sys.argv[1:])
+    else:
         sys.exit(__doc__)
-    main(*sys.argv[1:])

@@ -8,7 +8,8 @@
 //
 // Icons are written as ligature text (<span class="material-symbols-outlined">home</span>), often through
 // a variable or a prop, so "used" means: any quoted string or JSX text in the scanned folders that is
-// exactly a Material Symbols icon name. That over-collects (a string "error" keeps the error icon), which
+// exactly a known icon name (the package's index.d.ts plus scripts/material-symbols-aliases.json, which
+// holds the alias ligatures index.d.ts omits). That over-collects (a string "error" keeps the error icon), which
 // only costs a few bytes, and never misses a name that is written out in the source.
 // A name built at run time (`"arrow_" + dir`) is not seen: write the full names somewhere in the source.
 import { createHash } from "node:crypto";
@@ -22,6 +23,7 @@ export const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 export const SCAN_DIRS = ["src", "open-sse"];
 export const SOURCE_FONT = join(ROOT, "node_modules/material-symbols/material-symbols-outlined.woff2");
 export const NAMES_FILE = join(ROOT, "node_modules/material-symbols/index.d.ts");
+export const ALIASES_FILE = join(ROOT, "scripts/material-symbols-aliases.json");
 export const SUBSET_FONT = join(ROOT, "src/app/fonts/material-symbols-outlined.subset.woff2");
 export const MANIFEST = join(ROOT, "src/app/fonts/material-symbols-subset.json");
 const EXTENSIONS = new Set([".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".json", ".css", ".md", ".mdx"]);
@@ -29,9 +31,22 @@ const SKIP_DIRS = new Set(["node_modules", ".next", ".git", "fonts"]);
 const QUOTED = /(["'`])([a-z0-9_]{2,40})\1/g;
 const JSX_TEXT = />\s*([a-z0-9_]{2,40})\s*</g;
 
-/** Every icon name the installed material-symbols package knows. */
-export function knownIcons(file = NAMES_FILE) {
-  return new Set([...readFileSync(file, "utf8").matchAll(/"([a-z0-9_]+)"/g)].map((m) => m[1]));
+/** Every icon name the installed material-symbols package supports: index.d.ts names plus the alias
+    ligatures that file omits (font supports them, e.g. expand_more, done). The aliases live in a
+    committed JSON file refreshed on every rebuild; --check reads it, so it needs no python. */
+export function knownIcons(file = NAMES_FILE, aliasesFile = ALIASES_FILE) {
+  const names = new Set([...readFileSync(file, "utf8").matchAll(/"([a-z0-9_]+)"/g)].map((m) => m[1]));
+  for (const name of JSON.parse(readFileSync(aliasesFile, "utf8"))) names.add(name);
+  return names;
+}
+
+/** Ligature names the source font supports beyond what index.d.ts lists; refreshed on every rebuild. */
+export function refreshAliases() {
+  const ligatures = new Set(python([join(ROOT, "scripts/subset-icons.py"), "--ligatures", SOURCE_FONT]).trim().split("\n"));
+  const declared = new Set([...readFileSync(NAMES_FILE, "utf8").matchAll(/"([a-z0-9_]+)"/g)].map((m) => m[1]));
+  const aliases = [...ligatures].filter((name) => !declared.has(name)).sort();
+  writeFileSync(ALIASES_FILE, JSON.stringify(aliases, null, 2) + "\n");
+  return aliases;
 }
 
 function* files(dir) {
@@ -85,6 +100,7 @@ function python(args) {
 }
 
 function build() {
+  refreshAliases();
   const used = [...usedIcons().keys()].sort();
   const work = mkdtempSync(join(tmpdir(), "icon-subset-"));
   try {
