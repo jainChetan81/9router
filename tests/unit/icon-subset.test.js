@@ -45,4 +45,10 @@ describe("icon font subset", () => {
     const used = new Map([["home", "a.js"], ["rocket_launch", "b.js"]]);
     expect(missingIcons(used, { icons: ["home"] })).toEqual([["rocket_launch", "b.js"]]);
   });
+
+  it("counts an alias ligature the font supports as known", () => {
+    // expand_more is used in the dashboard but missing from the package's index.d.ts.
+    expect(known.has("expand_more")).toBe(true);
+    expect(iconsInText(`<span class="material-symbols-outlined">expand_more</span>`, known).has("expand_more")).toBe(true);
+  });
 });
