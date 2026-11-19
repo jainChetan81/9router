@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { getSettings } from "@/lib/localDb";
 import { extractApiKey, isValidApiKey } from "./auth.js";
 import { saveFailureUsage } from "open-sse/handlers/chatCore/requestDetail.js";
+import { takeTraceHeaders } from "open-sse/utils/traceMeta.js";
 import { resolveSessionIdentity } from "open-sse/utils/sessionManager.js";
 
 export function readRequestHeaders(request) {
@@ -43,7 +44,7 @@ export function createMediaUsageContext(request) {
 }
 
 export function createMediaRawRequest(request, fallbackEndpoint) {
-  return {
+  const clientRawRequest = {
     reqId: randomUUID(),
     endpoint: resolveRequestEndpoint(request, fallbackEndpoint),
     usageStartedAt: globalThis.performance?.now?.() ?? Date.now(),
@@ -54,6 +55,9 @@ export function createMediaRawRequest(request, fallbackEndpoint) {
     usageTarget: { provider: null, model: "invalid" },
     usageState: { responseCommitted: false, failureRecorded: false, successRecorded: false },
   };
+  // Trace headers label the usage row. Remove them so no provider receives them.
+  takeTraceHeaders(clientRawRequest);
+  return clientRawRequest;
 }
 
 export function resolveExplicitSessionId(headers, body) {

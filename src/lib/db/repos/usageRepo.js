@@ -433,6 +433,32 @@ export async function saveRequestUsage(entry) {
   }
 }
 
+/**
+ * Marks the usage row of a combo's last member as an empty answer. The combo
+ * sees the empty 200 only after that member saved its "ok" row, so the row is
+ * amended: it gets the full failed-attempt list and `meta.comboEmptyFinal`.
+ * The lookup is an exact timestamp match (idx_uh_ts). Telemetry only: never throws.
+ */
+export async function markComboEmptyFinal({ reqId, timestamp, attempts } = {}) {
+  try {
+    if (typeof reqId !== "string" || !reqId || typeof timestamp !== "string" || !timestamp) return false;
+    const db = await getAdapter();
+    db.run(
+      `UPDATE usageHistory
+       SET meta = json_set(COALESCE(meta, '{}'), '$.comboEmptyFinal', json('true'), '$.comboAttempts', json(?))
+       WHERE id = (
+         SELECT id FROM usageHistory
+         WHERE timestamp = ? AND json_extract(meta, '$.reqId') = ?
+         ORDER BY id DESC LIMIT 1
+       )`,
+      [stringifyJson(Array.isArray(attempts) ? attempts : []), timestamp, reqId]
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Request count per connection since `sinceIso` (drives "most used first" on the quota page).
 export async function getRequestCountsByConnection(sinceIso) {
   const db = await getAdapter();

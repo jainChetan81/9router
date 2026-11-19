@@ -151,7 +151,7 @@ export function buildOnStreamComplete({ provider, model, connectionId, apiKey, r
     // Persist stream usage to DB (no console line; the "📊 done" line below is authoritative)
     saveUsageStats({
       provider, model, tokens: usage, connectionId, apiKey, endpoint: clientRawRequest?.endpoint,
-      clientRawRequest, latency: buildUsageLatency(clientRawRequest, { stream: true, ttftAt }),
+      clientRawRequest, latency: buildUsageLatency(clientRawRequest, { stream: true, ttftAt, startedAt: requestStartMonotonic }),
       tools: contentObj?.tools || [],
       label: "STREAM USAGE", silent: true,
     });

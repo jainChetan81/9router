@@ -5,6 +5,7 @@ import { useSearchParams, useRouter } from "next/navigation";
 import { RequestLogger, CardSkeleton, SegmentedControl } from "@/shared/components";
 import UsageStats from "@/shared/components/UsageStats";
 import RequestDetailsTab from "./components/RequestDetailsTab";
+import InsightsTab from "./components/InsightsTab";
 
 const PERIODS = [
   { value: "today", label: "Today" },
@@ -14,6 +15,9 @@ const PERIODS = [
   { value: "60d", label: "60D" },
   { value: "all", label: "All" },
 ];
+
+// Insights read raw usage rows, so the range is always bounded (no "All").
+const INSIGHT_PERIODS = PERIODS.filter((p) => p.value !== "all");
 
 export default function UsagePage() {
   return (
@@ -28,9 +32,10 @@ function UsageContent() {
   const router = useRouter();
 
   const [period, setPeriod] = useState("today");
+  const insightPeriod = period === "all" ? "60d" : period;
 
   const tabFromUrl = searchParams.get("tab");
-  const activeTab = tabFromUrl && ["overview", "logs", "details"].includes(tabFromUrl)
+  const activeTab = tabFromUrl && ["overview", "insights", "logs", "details"].includes(tabFromUrl)
     ? tabFromUrl
     : "overview";
 
@@ -48,6 +53,7 @@ function UsageContent() {
         <SegmentedControl
           options={[
             { value: "overview", label: "Overview" },
+            { value: "insights", label: "Insights" },
             { value: "details", label: "Details" },
           ]}
           value={activeTab}
@@ -63,6 +69,15 @@ function UsageContent() {
             className="w-full sm:w-auto"
           />
         )}
+        {activeTab === "insights" && (
+          <SegmentedControl
+            options={INSIGHT_PERIODS}
+            value={insightPeriod}
+            onChange={setPeriod}
+            size="sm"
+            className="w-full sm:w-auto"
+          />
+        )}
       </div>
 
       {activeTab === "overview" && (
@@ -70,6 +85,7 @@ function UsageContent() {
           <UsageStats period={period} setPeriod={setPeriod} hidePeriodSelector />
         </Suspense>
       )}
+      {activeTab === "insights" && <InsightsTab period={insightPeriod} />}
       {activeTab === "logs" && <RequestLogger />}
       {activeTab === "details" && <RequestDetailsTab />}
     </div>

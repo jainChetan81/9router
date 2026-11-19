@@ -519,6 +519,11 @@ Runtime visibility sources:
 - textual request status log in `log.txt`
 - optional deep request/translation logs under `logs/` when `ENABLE_REQUEST_LOGS=true`
 - dashboard usage endpoints (`/api/usage/*`) for UI consumption
+- per-request metadata in the `usageHistory.meta` JSON column, shown on Usage → Insights (`/api/usage/insights`, `/api/usage/insights/rows`):
+  - `latency`: `{ ttftMs, totalMs, stream }`, timed from the start of the client request (the clock the Agents page uses); success rows also carry `attemptTtftMs` / `attemptTotalMs`, timed from the start of the upstream attempt that wrote the row, which Insights prefers
+  - `comboAttempts`: up to 10 combo members that failed before this row, each `{ model, status, reason }` with reason `rate_limit`, `timeout`, `empty` or `error`; client-caused errors that stop the combo (no fallback) are not recorded
+  - `comboEmptyFinal`: `true` on the `ok` row of a last combo member that answered with an empty 200; the row is amended after it is saved and Insights counts the request as not served
+  - `trace`: `{ name, tags }` from the optional `x-9r-trace` and `x-9r-tags` request headers (see README, "Trace Headers"); these headers are never sent upstream
 
 ## Security-Sensitive Boundaries
 

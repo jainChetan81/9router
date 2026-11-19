@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { saveRequestUsage, appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
+import { traceOf, comboAttemptsOf } from "../../utils/traceMeta.js";
 import { COLORS, canonicalizeUsage } from "../../utils/usageTracking.js";
 import { collectToolErrors } from "@/lib/agents/toolErrors.js";
 import { sanitizeToolName } from "../../utils/toolTelemetry.js";
@@ -138,16 +139,26 @@ export function spendMeta(clientRawRequest, tokens, telemetry = null) {
   }
   if (clientRawRequest?.session) meta.session = createHash("sha256").update(String(clientRawRequest.session)).digest("hex").slice(0, 12);
   if (clientRawRequest?.combo) meta.combo = clientRawRequest.combo;
+  // Failed combo members tried before this row was written (bounded).
+  const comboAttempts = comboAttemptsOf(clientRawRequest);
+  if (comboAttempts) meta.comboAttempts = comboAttempts;
+  const trace = traceOf(clientRawRequest);
+  if (trace) meta.trace = trace;
   if (Number.isFinite(tokens?.cost)) meta.realCost = tokens.cost;
   if (telemetry && typeof telemetry === "object") {
     if (typeof clientRawRequest?.reqId === "string") meta.reqId = clientRawRequest.reqId;
     if (telemetry.latency && typeof telemetry.latency === "object") {
-      const { ttftMs, totalMs, stream } = telemetry.latency;
+      const { ttftMs, totalMs, stream, attemptTtftMs, attemptTotalMs } = telemetry.latency;
       meta.latency = {
         ttftMs: Number.isFinite(ttftMs) ? Math.max(0, Math.round(ttftMs)) : null,
         totalMs: Number.isFinite(totalMs) ? Math.max(0, Math.round(totalMs)) : 0,
         stream: Boolean(stream),
       };
+      // Attempt-scoped values exist only when the upstream attempt start is known.
+      if (Number.isFinite(attemptTotalMs)) {
+        meta.latency.attemptTtftMs = Number.isFinite(attemptTtftMs) ? Math.max(0, Math.round(attemptTtftMs)) : null;
+        meta.latency.attemptTotalMs = Math.max(0, Math.round(attemptTotalMs));
+      }
     }
     if (["ok", "error", "aborted"].includes(telemetry.status)) meta.status = telemetry.status;
   }
@@ -165,17 +176,30 @@ function monotonicNow() {
   return globalThis.performance?.now?.() ?? Date.now();
 }
 
-export function buildUsageLatency(clientRawRequest, { stream = false, ttftAt = null } = {}) {
+// `ttftMs` / `totalMs` are request-scoped: timed from `usageStartedAt`, the same
+// clock as the live registry and the failure rows, so they include earlier
+// combo members and account retries. `startedAt` is the monotonic start of the
+// upstream attempt that produced the row (chatCore); when given, the row also
+// gets `attemptTtftMs` / `attemptTotalMs` timed from it.
+export function buildUsageLatency(clientRawRequest, { stream = false, ttftAt = null, startedAt: attemptStartedAt = null } = {}) {
   try {
     const now = monotonicNow();
-    const startedAt = Number.isFinite(clientRawRequest?.usageStartedAt)
+    const since = (start) => ({
+      ttftMs: stream && Number.isFinite(ttftAt) ? Math.max(0, Math.round(ttftAt - start)) : null,
+      totalMs: Math.max(0, Math.round(now - start)),
+    });
+    const hasAttempt = Number.isFinite(attemptStartedAt);
+    // Calls with no request clock (no usageStartedAt) fall back to the attempt start.
+    const requestStartedAt = Number.isFinite(clientRawRequest?.usageStartedAt)
       ? clientRawRequest.usageStartedAt
-      : now;
-    return {
-      ttftMs: stream && Number.isFinite(ttftAt) ? Math.max(0, Math.round(ttftAt - startedAt)) : null,
-      totalMs: Math.max(0, Math.round(now - startedAt)),
-      stream: Boolean(stream),
-    };
+      : hasAttempt ? attemptStartedAt : now;
+    const latency = { ...since(requestStartedAt), stream: Boolean(stream) };
+    if (hasAttempt) {
+      const attempt = since(attemptStartedAt);
+      latency.attemptTtftMs = attempt.ttftMs;
+      latency.attemptTotalMs = attempt.totalMs;
+    }
+    return latency;
   } catch {
     return { ttftMs: null, totalMs: 0, stream: Boolean(stream) };
   }
@@ -260,7 +284,7 @@ export function saveFailureUsage({ provider, model, tokens, connectionId, apiKey
   }
 }
 
-export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, endpoint, clientRawRequest, latency = null, tools = [], label = "USAGE", silent = false }) {
+export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, endpoint, clientRawRequest, latency = null, startedAt = null, tools = [], label = "USAGE", silent = false }) {
   try {
     // Each physical upstream call writes its own row, including fusion panels and judge.
     // The shared success flag only blocks a later abort/failure row for the logical request.
@@ -286,19 +310,25 @@ export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, 
     };
     const usageLatency = latency || buildUsageLatency(clientRawRequest, {
       stream: clientRawRequest?.body?.stream === true,
+      startedAt,
     });
 
-    return Promise.resolve(saveRequestUsage({
+    const timestamp = new Date().toISOString();
+    const saved = Promise.resolve(saveRequestUsage({
       provider: provider || "unknown",
       model: model || "unknown",
       tokens: normalized,
-      timestamp: new Date().toISOString(),
+      timestamp,
       connectionId: connectionId || undefined,
       apiKey: apiKey || undefined,
       endpoint: endpoint || null,
       status: "ok",
       meta: spendMeta(clientRawRequest, safeTokens, { latency: usageLatency, status: "ok", tools })
     })).then(() => true, () => false);
+    // A combo can learn that this answer was empty only after the row is saved.
+    // Keep the row's key so that case can still be marked on it (see chat.js).
+    if (clientRawRequest && !clientRawRequest.isFusionPanel) clientRawRequest.lastUsageRow = { timestamp, saved };
+    return saved;
   } catch {
     return Promise.resolve(false);
   }

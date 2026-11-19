@@ -1,7 +1,7 @@
 {
   "source": "material-symbols@0.44.12 (outlined)",
-  "sha256": "dfea4ea4089f6240ef59b244a3517bda893ad003ef56ad02870f2b48bc435cf0",
-  "bytes": 136452,
+  "sha256": "fa7a348878000a1e25f1f02f34528b299bb005f6888a2a688dc8901e0fe44010",
+  "bytes": 136924,
   "icons": [
     "1k",
     "2d",
@@ -142,6 +142,7 @@
     "image_search",
     "info",
     "input",
+    "insights",
     "keep",
     "key",
     "keyboard_arrow_down",
