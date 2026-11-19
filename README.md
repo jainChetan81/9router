@@ -1516,6 +1516,29 @@ Authorization: Bearer your-api-key
 → Returns all models + combos in OpenAI format
 ```
 
+### Trace Headers (optional)
+
+Label your requests so you can find them on the Usage page. Send these headers with any `/v1` request:
+
+| Header | Value | Limits |
+| --- | --- | --- |
+| `x-9r-trace` | A trace name, for example `nightly-eval` | 128 characters |
+| `x-9r-tags` | Comma-separated tags, for example `prod,batch` | 10 tags, 32 characters each |
+
+```bash
+curl http://localhost:20128/v1/chat/completions \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -H "x-9r-trace: nightly-eval" \
+  -H "x-9r-tags: prod,batch" \
+  -d '{"model": "cc/claude-opus-4-6", "messages": [{"role": "user", "content": "Hi"}]}'
+```
+
+- 9Router trims each value, removes control characters, cuts values that are too long, and ignores extra or repeated tags.
+- 9Router stores the trace with the usage row and never sends these headers to a provider.
+- Open **Usage → Insights** to filter requests by trace or tag. The same tab shows latency (p50/p95) and combo fallbacks.
+- Do not put secrets in these headers. Anyone who can open the dashboard can read them.
+
 ## 📧 Support
 
 - **Website**: [9router.com](https://9router.com)

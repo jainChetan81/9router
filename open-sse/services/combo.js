@@ -6,6 +6,7 @@ import { checkFallbackError, formatRetryAfter } from "./accountFallback.js";
 import { unavailableResponse } from "../utils/error.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { parseModel } from "./model.js";
+import { classifyAttempt } from "../utils/traceMeta.js";
 import { extractTextContent } from "../translator/formats/gemini.js";
 import { peekStreamForContent, reconstructStream, isNoRetryFinish } from "./emptyFailover.js";
 import {
@@ -381,6 +382,7 @@ export function isZeroContentResponse(data) {
  * @param {boolean} [options.sessionSticky=true] - Keep chosen model across session requests to retain prompt cache
  * @param {number} [options.confidenceThreshold=0.8] - Minimum confidence required for model switch (0-1)
  * @param {Function|null} [options.resolveSmartChoice=null] - Smart router resolver callback: (body, models) => Promise<{ choice, probabilities, confidence } | null>
+ * @param {Function|null} [options.onMemberFailed=null] - Called when a member does not serve the request: ({ model, status, reason, final })
  * @returns {Promise<Response>}
  */
 export async function handleComboChat({
@@ -400,7 +402,14 @@ export async function handleComboChat({
   rawSession = null,
   keyAccess = null,
   ua = "",
+  onMemberFailed = null,
 }) {
+  // Reports a member that did not serve the request. Telemetry only: fail open.
+  // `final` marks an empty answer that is returned to the client as-is because no member is left.
+  const noteFailed = async (model, status, errorText = "", empty = false, final = false) => {
+    if (typeof onMemberFailed !== "function") return;
+    try { await onMemberFailed({ model, status, reason: classifyAttempt(status, errorText, empty), final }); } catch { /* ignore */ }
+  };
   let rotatedModels = models;
   let activeStickyModel = null;
   let sessionOverride = null;
@@ -579,6 +588,7 @@ export async function handleComboChat({
               if (isZeroContentResponse(peekBody)) {
                 if (isLastModel) {
                   log.warn("COMBO", `Model ${modelStr} returned HTTP 200 with zero usable content as the final candidate, returning as-is`);
+                  await noteFailed(modelStr, result.status, "", true, true);
                   if (sessionId) clearStickyComboSession(comboName, sessionId, modelStr);
                   return result;
                 }
@@ -587,6 +597,7 @@ export async function handleComboChat({
                   clearStickyComboSession(comboName, sessionId, modelStr);
                 }
                 lastError = "Zero usable content";
+                await noteFailed(modelStr, result.status, "", true);
                 sawEmptyOutput = true;
                 continue;
               }
@@ -609,6 +620,7 @@ export async function handleComboChat({
         // (empty) response as-is, preserving prior behaviour rather than manufacturing a 5xx.
         const reasonLabel = peeked.finishReason || "no-content";
         const isLast = i === rotatedModels.length - 1;
+        if (!isNoRetryFinish(peeked.finishReason)) await noteFailed(modelStr, result.status, "", true, isLast);
         if (isNoRetryFinish(peeked.finishReason) || isLast) {
           log.warn("COMBO", `Model ${modelStr} returned empty (${reasonLabel}) — ${isNoRetryFinish(peeked.finishReason) ? "no-retry class" : "last candidate"}, returning as-is`);
           if (isNoRetryFinish(peeked.finishReason)) return acceptResponse(peeked.response, modelStr);
@@ -663,6 +675,8 @@ export async function handleComboChat({
       // Check if should fallback to next model
       const { provider } = parseModel(modelStr);
       const { shouldFallback, cooldownMs, requestScoped } = checkFallbackError(result.status, errorText, 0, provider);
+      // A client-caused error (400/413/499 with no fallback) is not a member failure.
+      if (shouldFallback || requestScoped) await noteFailed(modelStr, result.status, errorText);
 
       if (!shouldFallback && !requestScoped) {
         log.warn("COMBO", `Model ${modelStr} failed (no fallback)`, { status: result.status });
@@ -704,6 +718,7 @@ export async function handleComboChat({
       }
       lastError = error.message || String(error);
       if (!lastStatus) lastStatus = 500;
+      await noteFailed(modelStr, null, lastError);
       log.warn("COMBO", `Model ${modelStr} threw error, trying next`, { error: lastError });
     }
   }

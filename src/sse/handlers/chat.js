@@ -32,6 +32,8 @@ import { getKeyAccessContext, enforceKeyAccess, filterAdapterModels } from "../s
 import { resolveSmartChoice } from "../services/systemoneRouter.js";
 import { observeRequest, blockMessage } from "@/lib/piiGuard/observe.js";
 import { saveFailureUsage } from "open-sse/handlers/chatCore/requestDetail.js";
+import { takeTraceHeaders, recordComboAttempt, comboAttemptsOf } from "open-sse/utils/traceMeta.js";
+import { markComboEmptyFinal } from "@/lib/db/index.js";
 import { resolveSafeUsageTarget } from "../services/usageTarget.js";
 import { register as registerLiveRequest, unregister as unregisterLiveRequest, markFirstToken } from "@/lib/agents/liveRegistry.js";
 
@@ -227,7 +229,11 @@ export async function handleChat(request, clientRawRequest = null) {
     clientRawRequest.validatedApiKey = null;
     clientRawRequest.usageState = { responseCommitted: false, failureRecorded: false, successRecorded: false };
     clientRawRequest.liveState = { closed: false, signal: request?.signal || null, onAbort: null };
+    clientRawRequest.comboAttempts = [];
+    clientRawRequest.comboMemberNames = new Map();
   } catch { /* telemetry context is best-effort */ }
+  // Trace headers label the usage row. Remove them so no provider receives them.
+  takeTraceHeaders(clientRawRequest);
   let body;
   try {
     body = await request.json();
@@ -376,6 +382,7 @@ export async function handleChat(request, clientRawRequest = null) {
       rawSession: sessionId,
       keyAccess,
       ua: userAgent,
+      onMemberFailed: (attempt) => noteComboMemberFailed(clientRawRequest, attempt),
       smartPolicy: comboCfg.smartPolicy || "smart",
       sessionSticky: comboCfg.sessionSticky !== false,
       confidenceThreshold: typeof comboCfg.confidenceThreshold === "number" ? comboCfg.confidenceThreshold : 0.8,
@@ -419,6 +426,37 @@ export async function handleChat(request, clientRawRequest = null) {
   );
 }
 
+// Stores a failed combo member on the request, named as `provider/model` like
+// its usage row. The row that finally serves the request carries the list.
+// Synchronous on purpose: the next member must not wait for telemetry. The
+// name comes from the lookup handleSingleModelChat already did for this member.
+function noteComboMemberFailed(clientRawRequest, attempt) {
+  try {
+    const model = clientRawRequest?.comboMemberNames?.get?.(attempt.model) || attempt.model;
+    recordComboAttempt(clientRawRequest, { ...attempt, model });
+    if (attempt.final) markEmptyFinalRow(clientRawRequest);
+  } catch { /* telemetry must not break a request */ }
+}
+
+// The last combo member returned an empty 200 and its "ok" row is already
+// saved (or being saved). Amend that row in the background so Insights counts
+// the request as not served. Never awaited by the request.
+function markEmptyFinalRow(clientRawRequest) {
+  const row = clientRawRequest?.lastUsageRow;
+  const reqId = clientRawRequest?.reqId;
+  if (!row || typeof reqId !== "string") return;
+  const attempts = comboAttemptsOf(clientRawRequest);
+  Promise.resolve(row.saved)
+    .then((saved) => (saved ? markComboEmptyFinal({ reqId, timestamp: row.timestamp, attempts }) : false))
+    .catch(() => {});
+}
+
+function rememberMemberName(clientRawRequest, modelStr, modelInfo) {
+  try {
+    if (modelInfo?.provider && modelInfo?.model) clientRawRequest?.comboMemberNames?.set?.(modelStr, `${modelInfo.provider}/${modelInfo.model}`);
+  } catch { /* telemetry only */ }
+}
+
 /**
  * Handle single model chat request
  */
@@ -427,6 +465,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   // their own copy before translators and token savers mutate the body.
   if (!bodyIsolated) body = structuredClone(body);
   const modelInfo = await getModelInfo(modelStr);
+  rememberMemberName(clientRawRequest, modelStr, modelInfo);
 
   // If provider is null, this might be a combo name - check and handle
   if (!modelInfo.provider) {
@@ -484,6 +523,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         rawSession: clientRawRequest?.session || nestedSession?.sessionId || null,
         keyAccess: clientRawRequest?.keyAccess || keyAccess,
         ua: clientRawRequest?.headers?.["user-agent"] || request?.headers?.get("user-agent") || "",
+        onMemberFailed: (attempt) => noteComboMemberFailed(clientRawRequest, attempt),
         smartPolicy: comboCfg.smartPolicy || "smart",
         sessionSticky: comboCfg.sessionSticky !== false,
         confidenceThreshold: typeof comboCfg.confidenceThreshold === "number" ? comboCfg.confidenceThreshold : 0.8,
