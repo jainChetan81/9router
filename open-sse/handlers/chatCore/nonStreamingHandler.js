@@ -7,6 +7,7 @@ import { createErrorResult } from "../../utils/error.js";
 import { upstreamResponseHeaders } from "../../utils/upstreamHeaders.js";
 import { HTTP_STATUS } from "../../config/runtimeConfig.js";
 import { parseSSEToOpenAIResponse } from "./sseToJsonHandler.js";
+import { readSseTextWithContentDeadline } from "../../utils/streamHandler.js";
 import { unwrapClineEnvelope } from "../../shared/clineEnvelope.js";
 import { buildRequestDetail, extractRequestConfig, extractUsageFromResponse, saveUsageStats, buildUsageLatency, formatDoneLine, usageStatusFor } from "./requestDetail.js";
 import { extractToolNames } from "../../utils/toolTelemetry.js";
@@ -241,7 +242,13 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
   let responseBody;
 
   if (contentType.includes("text/event-stream")) {
-    const sseText = await providerResponse.text();
+    let sseText;
+    try {
+      sseText = await readSseTextWithContentDeadline(providerResponse);
+    } catch (err) {
+      appendLog({ status: `FAILED ${HTTP_STATUS.GATEWAY_TIMEOUT}` });
+      return createErrorResult(HTTP_STATUS.GATEWAY_TIMEOUT, err?.message || "upstream SSE read failed");
+    }
     const parsed = parseSSEToOpenAIResponse(sseText, model);
     if (!parsed) {
       appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });

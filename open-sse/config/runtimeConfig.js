@@ -52,6 +52,11 @@ export const SEARXNG_URL = envUrl("SEARXNG_URL", "http://localhost:8888/search")
 // slow reasoning models aren't aborted mid-stream. Env: STREAM_STALL_TIMEOUT_MS.
 export const STREAM_STALL_TIMEOUT_MS = envMs("STREAM_STALL_TIMEOUT_MS", 360 * 1000);
 
+// Content stall timeout for text/event-stream upstreams. Unlike the any-byte stall
+// timer, keepalive-only traffic (": ..." comments, ping events) does not re-arm it,
+// so a stuck upstream that keeps pinging is aborted. Env: STREAM_CONTENT_STALL_TIMEOUT_MS.
+export const STREAM_CONTENT_STALL_TIMEOUT_MS = envMs("STREAM_CONTENT_STALL_TIMEOUT_MS", 300 * 1000);
+
 // Time-to-first-token timeout (prompt prefill). Env: STREAM_FIRST_CHUNK_TIMEOUT_MS.
 export const STREAM_FIRST_CHUNK_TIMEOUT_MS = envMs("STREAM_FIRST_CHUNK_TIMEOUT_MS", 200 * 1000);
 
