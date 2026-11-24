@@ -6,6 +6,7 @@ import { checkFallbackError, formatRetryAfter } from "./accountFallback.js";
 import { unavailableResponse } from "../utils/error.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { parseModel } from "./model.js";
+import { openCodeGoPacing } from "./opencodeGoPacing.js";
 import { classifyAttempt } from "../utils/traceMeta.js";
 import { extractTextContent } from "../translator/formats/gemini.js";
 import { peekStreamForContent, reconstructStream, isNoRetryFinish } from "./emptyFailover.js";
@@ -547,6 +548,10 @@ export async function handleComboChat({
 
   for (let i = 0; i < rotatedModels.length; i++) {
     const modelStr = rotatedModels[i];
+    if (parseModel(modelStr).provider === "opencode-go" && await openCodeGoPacing.shouldSkip(log)) {
+      lastError = lastError || "opencode-go skipped: ahead of usage pace";
+      continue;
+    }
     log.info("COMBO", `Trying model ${i + 1}/${rotatedModels.length}: ${modelStr}`);
 
     try {

@@ -48,6 +48,14 @@ function envUrl(name, def) {
 // Configure this for a separate Docker service or remote SearXNG instance.
 export const SEARXNG_URL = envUrl("SEARXNG_URL", "http://localhost:8888/search");
 
+// OpenCode Go pacing: skip Go combo members when usage runs ahead of the billing period.
+// Env: OPENCODE_GO_PACING ("0" disables), OPENCODE_GO_PACING_SLACK_PCT.
+export const OPENCODE_GO_PACING = process.env.OPENCODE_GO_PACING !== "0";
+export const OPENCODE_GO_PACING_SLACK_PCT = (() => {
+  const n = Number(process.env.OPENCODE_GO_PACING_SLACK_PCT);
+  return process.env.OPENCODE_GO_PACING_SLACK_PCT && Number.isFinite(n) && n >= 0 ? n : 5;
+})();
+
 // Inter-chunk stall timeout (once tokens are flowing). Generous headroom so
 // slow reasoning models aren't aborted mid-stream. Env: STREAM_STALL_TIMEOUT_MS.
 export const STREAM_STALL_TIMEOUT_MS = envMs("STREAM_STALL_TIMEOUT_MS", 360 * 1000);
