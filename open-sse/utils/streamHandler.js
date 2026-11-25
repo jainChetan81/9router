@@ -1,10 +1,60 @@
 // Stream handler with disconnect detection - shared for all providers
-import { STREAM_STALL_TIMEOUT_MS } from "../config/runtimeConfig.js";
+import { STREAM_STALL_TIMEOUT_MS, STREAM_CONTENT_STALL_TIMEOUT_MS } from "../config/runtimeConfig.js";
 import { dbg, isDebugEnabled } from "./debugLog.js";
 
 // Get HH:MM:SS timestamp
 function getTimeString() {
   return new Date().toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+const KEEPALIVE_LINE = /^(?::.*|event:\s*ping|data:\s*\{\s*"type"\s*:\s*"ping"\s*\})$/;
+const sseDecoder = new TextDecoder();
+
+/** True if the SSE chunk carries anything beyond keepalive comments and ping events. */
+export function hasSseContent(chunk) {
+  const text = typeof chunk === "string" ? chunk : sseDecoder.decode(chunk);
+  for (const line of text.split(/\r?\n/)) {
+    const l = line.trim();
+    if (l && !KEEPALIVE_LINE.test(l)) return true;
+  }
+  return false;
+}
+
+/**
+ * Read a whole SSE body as text, rejecting if no non-keepalive content arrives
+ * within deadlineMs. Used where the client asked for JSON but upstream streams.
+ */
+export function readSseTextWithContentDeadline(response, deadlineMs = STREAM_CONTENT_STALL_TIMEOUT_MS) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  let timer = null;
+  return new Promise((resolve, reject) => {
+    const arm = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        reader.cancel().catch(() => {});
+        reject(Object.assign(new Error("stream content stall timeout"), { code: "CONTENT_STALL" }));
+      }, deadlineMs);
+    };
+    arm();
+    (async () => {
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = decoder.decode(value, { stream: true });
+          text += chunk;
+          if (hasSseContent(chunk)) arm();
+        }
+        clearTimeout(timer);
+        resolve(text + decoder.decode());
+      } catch (e) {
+        clearTimeout(timer);
+        reject(e);
+      }
+    })();
+  });
 }
 
 /**
@@ -193,8 +243,10 @@ export function createDisconnectAwareStream(transformStream, streamController, o
  * @param {TransformStream} transformStream - Transform stream for SSE
  * @param {object} streamController - Stream controller from createStreamController
  */
-export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS) {
+export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS, contentStallTimeoutMs = STREAM_CONTENT_STALL_TIMEOUT_MS) {
   let stallTimer = null;
+  let contentTimer = null;
+  const isSse = (providerResponse.headers?.get?.("content-type") || "").toLowerCase().includes("text/event-stream");
   let chunkCount = 0;
   let totalBytes = 0;
   let lastChunkAt = Date.now();
@@ -204,6 +256,21 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
   const clearStall = () => {
     if (stallTimer) { clearTimeout(stallTimer); stallTimer = null; }
   };
+  const clearContent = () => {
+    if (contentTimer) { clearTimeout(contentTimer); contentTimer = null; }
+  };
+  const armContent = () => {
+    clearContent();
+    contentTimer = setTimeout(() => {
+      contentTimer = null;
+      clearStall();
+      abortMessage = "stream content stall timeout";
+      dbg(tag, `CONTENT STALL TIMEOUT ${contentStallTimeoutMs}ms | chunks=${chunkCount} | bytes=${totalBytes}`);
+      streamController.handleError?.(new Error("stream content stall timeout"));
+      streamController.abort?.();
+    }, contentStallTimeoutMs);
+  };
+  const clearAll = () => { clearStall(); clearContent(); };
   const armStall = () => {
     clearStall();
     stallTimer = setTimeout(() => {
@@ -222,14 +289,15 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
     signal: streamController.signal,
     startTime: streamController.startTime,
     isConnected: () => streamController.isConnected(),
-    handleComplete: () => { dbg(tag, `complete | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearStall(); streamController.handleComplete(); },
-    handleError: (e) => { dbg(tag, `error: ${e?.message} | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearStall(); streamController.handleError(e); },
-    handleDisconnect: (r) => { dbg(tag, `disconnect: ${r} | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearStall(); streamController.handleDisconnect(r); },
-    abort: () => { clearStall(); streamController.abort(); }
+    handleComplete: () => { dbg(tag, `complete | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearAll(); streamController.handleComplete(); },
+    handleError: (e) => { dbg(tag, `error: ${e?.message} | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearAll(); streamController.handleError(e); },
+    handleDisconnect: (r) => { dbg(tag, `disconnect: ${r} | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearAll(); streamController.handleDisconnect(r); },
+    abort: () => { clearAll(); streamController.abort(); }
   };
 
   armStall();
-  dbg(tag, `pipe start | stallTimeout=${stallTimeoutMs}ms`);
+  if (isSse) armContent();
+  dbg(tag, `pipe start | stallTimeout=${stallTimeoutMs}ms | contentStallTimeout=${isSse ? contentStallTimeoutMs : "off"}ms`);
 
   const upstreamTap = new TransformStream({
     transform(chunk, controller) {
@@ -243,9 +311,10 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
         dbg(tag, `chunk #${chunkCount} | size=${sz}B | gap=${gap}ms | total=${totalBytes}B`);
       }
       armStall();
+      if (isSse && hasSseContent(chunk)) armContent();
       controller.enqueue(chunk);
     },
-    flush() { dbg(tag, `upstream EOF | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearStall(); }
+    flush() { dbg(tag, `upstream EOF | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearAll(); }
   });
 
   const transformedBody = providerResponse.body
