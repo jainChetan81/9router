@@ -141,6 +141,11 @@ export function createSSEStream(options = {}) {
 
   let buffer = "";
   let usage = null;
+  let stopReason = null;
+  const noteStopReason = (parsed) => {
+    const reason = parsed?.delta?.stop_reason ?? parsed?.message?.stop_reason ?? parsed?.choices?.[0]?.finish_reason;
+    if (typeof reason === "string" && reason) stopReason = reason;
+  };
 
   // Tool-call ids already sent to the client, keyed by the tool-call index.
   // A late fragment that opens a NEW index without an id must not reach the
@@ -213,6 +218,7 @@ export function createSSEStream(options = {}) {
         content: accumulatedContent,
         thinking: accumulatedThinking,
         ...(tools.length ? { tools } : {}),
+        ...(stopReason ? { stopReason } : {}),
       }, finalUsage, ttftAt);
     }
   };
@@ -265,6 +271,7 @@ export function createSSEStream(options = {}) {
             try {
               let parsed = JSON.parse(trimmed.slice(5).trim());
               collectToolNames(toolNames, parsed, currentOpenAIResponsesEvent);
+              noteStopReason(parsed);
 
               const idFixed = fixInvalidId(parsed);
 
@@ -352,6 +359,8 @@ export function createSSEStream(options = {}) {
                 totalContentLength += reasoning.length;
                 accumulatedThinking += reasoning;
               }
+
+              noteStopReason(parsed);
 
               const extracted = extractUsage(parsed);
               if (extracted) {
@@ -486,6 +495,7 @@ export function createSSEStream(options = {}) {
         }
 
         // Extract usage
+        noteStopReason(parsed);
         const extracted = extractUsage(parsed);
         if (extracted) state.usage = mergeUsage(state.usage, extracted); // Keep original usage for logging
 
@@ -606,6 +616,7 @@ export function createSSEStream(options = {}) {
           if (parsed && !isDoneSentinel) {
             // Same accumulation the transform loop does, so finalizeStream() can
             // log a tail chunk's tokens instead of falling back to null.
+            noteStopReason(parsed);
             const extracted = extractUsage(parsed);
             if (extracted) state.usage = mergeUsage(state.usage, extracted);
 
