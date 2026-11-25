@@ -143,8 +143,8 @@ export function createSSEStream(options = {}) {
   let usage = null;
   let stopReason = null;
   const noteStopReason = (parsed) => {
-    const reason = parsed?.delta?.stop_reason ?? parsed?.message?.stop_reason;
-    if (typeof reason === "string") stopReason = reason;
+    const reason = parsed?.delta?.stop_reason ?? parsed?.message?.stop_reason ?? parsed?.choices?.[0]?.finish_reason;
+    if (typeof reason === "string" && reason) stopReason = reason;
   };
 
   // Tool-call ids already sent to the client, keyed by the tool-call index.

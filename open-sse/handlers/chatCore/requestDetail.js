@@ -160,7 +160,7 @@ export function spendMeta(clientRawRequest, tokens, telemetry = null) {
         meta.latency.attemptTotalMs = Math.max(0, Math.round(attemptTotalMs));
       }
     }
-    if (["ok", "error", "aborted"].includes(telemetry.status)) meta.status = telemetry.status;
+    if (["ok", "error", "aborted", "refusal"].includes(telemetry.status)) meta.status = telemetry.status;
   }
   if (Array.isArray(telemetry?.tools) && telemetry.tools.length) {
     meta.tools = telemetry.tools.slice(0, 50).map(({ name, count }) => ({
@@ -282,6 +282,11 @@ export function saveFailureUsage({ provider, model, tokens, connectionId, apiKey
   } catch {
     return Promise.resolve(false);
   }
+}
+
+// Usage status for a finished response; translated streams report a refusal as content_filter.
+export function usageStatusFor(stopReason) {
+  return stopReason === "refusal" || stopReason === "content_filter" ? "refusal" : "ok";
 }
 
 export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, endpoint, clientRawRequest, latency = null, startedAt = null, tools = [], label = "USAGE", silent = false, status = "ok" }) {
