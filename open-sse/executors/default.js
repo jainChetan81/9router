@@ -10,6 +10,21 @@ import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { stripUnsupportedParams } from "../translator/concerns/paramSupport.js";
 import { extractClaudeSessionIdFromUserId } from "../utils/claudeCloaking.js";
 
+const CLAUDE_CLIENT_HEADER = /^(user-agent|x-app|x-stainless-.+|anthropic-version|anthropic-beta|anthropic-dangerous-direct-browser-access|x-claude-code-session-id)$/i;
+const CLAUDE_OAUTH_BETAS = "claude-code-20250219,oauth-2025-04-20";
+
+// Claude Code passthrough: replace the static identity headers with the
+// client's own, adding only the betas the OAuth token requires.
+export function applyClientClaudeHeaders(headers, rawHeaders = {}) {
+  for (const key of Object.keys(headers)) if (CLAUDE_CLIENT_HEADER.test(key)) delete headers[key];
+  for (const [key, value] of Object.entries(rawHeaders)) {
+    if (CLAUDE_CLIENT_HEADER.test(key) && typeof value === "string") headers[key.toLowerCase()] = value;
+  }
+  headers["anthropic-beta"] = mergeAnthropicBeta(CLAUDE_OAUTH_BETAS, headers["anthropic-beta"]);
+  if (!headers["anthropic-version"]) headers["anthropic-version"] = ANTHROPIC_API_VERSION;
+  return headers;
+}
+
 // Auth header descriptors — derived from registry transport.auth, fallback to hardcoded defaults.
 const BEARER = { combined: true, header: "Authorization", scheme: "bearer" };
 const XAPIKEY = { combined: true, header: "x-api-key", scheme: "raw" };
@@ -228,6 +243,7 @@ export class DefaultExecutor extends BaseExecutor {
     } else if (this.provider === "anthropic" && clientBeta) {
       headers["Anthropic-Beta"] = mergeAnthropicBeta(headers["Anthropic-Beta"], clientBeta);
     }
+    if (this.provider === "claude" && credentials?.claudeNative) applyClientClaudeHeaders(headers, credentials.rawHeaders || {});
 
     // Claude OAuth: align x-claude-code-session-id with metadata.user_id.session_id if missing
     if (this.provider === "claude" && !headers["x-claude-code-session-id"]) {

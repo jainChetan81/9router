@@ -57,12 +57,12 @@ describe("DefaultExecutor.buildHeaders() — claude provider", () => {
     expect(betaFlags).toContain("claude-code-20250219");
   });
 
-  it("omits heavy-agent beta flags for claude-fable-5", () => {
+  it("includes heavy-agent beta flags for claude-fable-5", () => {
     const executor = new DefaultExecutor("claude");
     const headers = executor.buildHeaders({ apiKey: "sk-test" }, true, undefined, "claude-fable-5");
     const betaFlags = headers["Anthropic-Beta"].split(",").map(s => s.trim());
-    expect(betaFlags).not.toContain("advanced-tool-use-2025-11-20");
-    expect(betaFlags).not.toContain("effort-2025-11-24");
+    expect(betaFlags).toContain("advanced-tool-use-2025-11-20");
+    expect(betaFlags).toContain("effort-2025-11-24");
   });
 
   it("sets x-api-key auth when apiKey is provided", () => {

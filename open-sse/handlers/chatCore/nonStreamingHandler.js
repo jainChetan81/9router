@@ -289,6 +289,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
     provider, model, tokens: usage, connectionId, apiKey, endpoint: clientRawRequest?.endpoint,
     clientRawRequest, latency: buildUsageLatency(clientRawRequest, { stream: false, startedAt: requestStartMonotonic }),
     tools: extractToolNames(responseBody), silent: true,
+    status: responseBody?.stop_reason === "refusal" ? "refusal" : "ok",
   });
   if (log?.line) log.line(reqTag, "📊", formatDoneLine({ usage, latency: { total: Date.now() - requestStartTime } }));
 

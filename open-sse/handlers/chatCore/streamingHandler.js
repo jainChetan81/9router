@@ -133,6 +133,7 @@ export function buildOnStreamComplete({ provider, model, connectionId, apiKey, r
     };
     const safeContent = contentObj?.content || "[Empty streaming response]";
     const safeThinking = contentObj?.thinking || null;
+    const refused = contentObj?.stopReason === "refusal";
 
     saveRequestDetail(buildRequestDetail({
       provider, model, connectionId,
@@ -143,7 +144,7 @@ export function buildOnStreamComplete({ provider, model, connectionId, apiKey, r
       providerResponse: safeContent,
       response: { content: safeContent, thinking: safeThinking, type: "streaming" },
       pxpipe,
-      status: "success"
+      status: refused ? "refusal" : "success"
     }, { id: streamDetailId })).catch(err => {
       console.error("[RequestDetail] Failed to update streaming content:", err.message);
     });
@@ -153,6 +154,7 @@ export function buildOnStreamComplete({ provider, model, connectionId, apiKey, r
       provider, model, tokens: usage, connectionId, apiKey, endpoint: clientRawRequest?.endpoint,
       clientRawRequest, latency: buildUsageLatency(clientRawRequest, { stream: true, ttftAt, startedAt: requestStartMonotonic }),
       tools: contentObj?.tools || [],
+      status: refused ? "refusal" : "ok",
       label: "STREAM USAGE", silent: true,
     });
     if (log?.line) log.line(reqTag, "📊", formatDoneLine({ usage, latency }));

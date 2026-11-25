@@ -61,7 +61,7 @@ const ANTHROPIC_BETA_BASE = [
 ];
 const ANTHROPIC_BETA_HEAVY_AGENT = ["advanced-tool-use-2025-11-20", "effort-2025-11-24"];
 
-// Heavy-agent beta flags are gated to opus/sonnet — cheaper models don't need them.
+// Heavy-agent beta flags are gated to opus/sonnet/fable — cheaper models don't need them.
 // `redact-thinking` asks Anthropic to return signature-only thinking blocks, which
 // is right for clients that never render thinking but blanks the summaries a
 // client explicitly requested with `thinking.display: "summarized"`.
@@ -73,7 +73,7 @@ export function wantsThinkingSummaries(body) {
 
 export function selectAnthropicBeta(model = "", body = null) {
   const flags = ANTHROPIC_BETA_BASE.filter((flag) => flag !== ANTHROPIC_BETA_REDACT_THINKING || !wantsThinkingSummaries(body));
-  if (/^claude-(opus|sonnet)/.test(model)) flags.push(...ANTHROPIC_BETA_HEAVY_AGENT);
+  if (/^claude-(opus|sonnet|fable)/.test(model)) flags.push(...ANTHROPIC_BETA_HEAVY_AGENT);
   return flags.join(",");
 }
 

@@ -284,7 +284,7 @@ export function saveFailureUsage({ provider, model, tokens, connectionId, apiKey
   }
 }
 
-export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, endpoint, clientRawRequest, latency = null, startedAt = null, tools = [], label = "USAGE", silent = false }) {
+export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, endpoint, clientRawRequest, latency = null, startedAt = null, tools = [], label = "USAGE", silent = false, status = "ok" }) {
   try {
     // Each physical upstream call writes its own row, including fusion panels and judge.
     // The shared success flag only blocks a later abort/failure row for the logical request.
@@ -322,8 +322,8 @@ export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, 
       connectionId: connectionId || undefined,
       apiKey: apiKey || undefined,
       endpoint: endpoint || null,
-      status: "ok",
-      meta: spendMeta(clientRawRequest, safeTokens, { latency: usageLatency, status: "ok", tools })
+      status,
+      meta: spendMeta(clientRawRequest, safeTokens, { latency: usageLatency, status, tools })
     })).then(() => true, () => false);
     // A combo can learn that this answer was empty only after the row is saved.
     // Keep the row's key so that case can still be marked on it (see chat.js).

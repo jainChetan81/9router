@@ -266,6 +266,10 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // Skip all translation/normalization — only model and Bearer are swapped
   const clientTool = detectClientTool(clientRawRequest?.headers || {}, body);
   const passthrough = isNativePassthrough(clientTool, provider);
+  // Claude Code to Anthropic itself: forward the body unchanged. Only auth is
+  // swapped; usage, spend and PII Guard still apply.
+  const claudeNative = passthrough && clientTool === "claude" && (provider === "claude" || provider === "anthropic");
+  if (credentials) credentials.claudeNative = claudeNative;
 
   // Expose raw client headers to translators/executors for session-id resolution
   if (credentials) credentials.rawHeaders = clientRawRequest?.headers || {};
@@ -307,9 +311,11 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       const nativeGeminiIntentIsValid = originalThinkingIntent
         && (clientTool === "gemini-cli" || clientTool === "antigravity")
         && hasValidNativeGeminiThinking(body, provider, model);
+      // Claude Code's own thinking settings pass through; only settings the
+      // owner configured in 9Router (saved effort, suffix, default) apply.
       const shouldNormalizeThinking = modelEffortOverride || fixedEffortInModelId
         || explicitSuffixIntent || providerDefaultApplied
-        || (!nativeGeminiIntentIsValid && (routedSuffix || originalThinkingIntent));
+        || (!claudeNative && !nativeGeminiIntentIsValid && (routedSuffix || originalThinkingIntent));
       if (shouldNormalizeThinking) {
         const priorOutputConfig = translatedBody.output_config && typeof translatedBody.output_config === "object"
           ? { ...translatedBody.output_config }
@@ -328,8 +334,8 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
         }
       }
     }
-    // Normalize newer Cowork/CC beta shapes (adaptive thinking, mid-conversation system) the API rejects
-    if (clientTool === "claude") normalizeClaudePassthrough(translatedBody, translatedBody.model);
+    // Third-party Anthropic-compatible gateways may reject newer Claude Code shapes.
+    if (clientTool === "claude" && !claudeNative) normalizeClaudePassthrough(translatedBody, translatedBody.model);
   } else {
     translatedBody = translateRequest(sourceFormat, targetFormat, upstreamModel, body, stream, credentials, provider, reqLogger, stripList, connectionId, clientTool, normalizedModelEffortOverride, thinkingModel);
     if (!translatedBody) {
@@ -350,7 +356,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
 
   // Tool normalization: MCP-equivalent built-in dedup (Claude clients) + same-name
   // dedup for DeepSeek models (upstream rejects duplicate tool names on all endpoints).
-  if (Array.isArray(translatedBody.tools)) {
+  if (!claudeNative && Array.isArray(translatedBody.tools)) {
     const { tools: deduped, stripped } = dedupeTools(translatedBody.tools, { clientTool, model, messages: translatedBody.messages });
     if (stripped.length > 0) {
       translatedBody.tools = deduped;
@@ -451,9 +457,8 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
 
   if (xf.length && log?.line) log.line(reqTag, "⚙", xf.join(" · "));
 
-  // Pin cache breakpoints to the final body — every saver above can reshape
-  // system/tools/messages, and a stale anchor costs a full prefix rewrite.
-  if (passthrough && clientTool === "claude") anchorClaudeCache(translatedBody);
+  // Pin cache breakpoints after savers reshape the body; Claude Code to Anthropic keeps its own.
+  if (passthrough && clientTool === "claude" && !claudeNative) anchorClaudeCache(translatedBody);
 
   const executor = getExecutor(provider);
   trackPendingRequest(model, provider, connectionId, true);
