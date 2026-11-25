@@ -2,6 +2,7 @@ import { OPENCODE_GO_PACING, OPENCODE_GO_PACING_SLACK_PCT } from "../config/runt
 import { getOpenCodeGoUsage } from "./usage/opencode-go.js";
 
 const REFRESH_MS = 10 * 60 * 1000;
+const FAILURE_BACKOFF_MS = 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MONTH_MS = 30 * DAY_MS;
 const WEEK_MS = 7 * DAY_MS;
@@ -58,6 +59,7 @@ export function createGoPacing({
 } = {}) {
   let snapshot = null; // { quotas, at }
   let inflight = null;
+  let failedAt = -Infinity;
 
   async function refresh() {
     try {
@@ -72,11 +74,14 @@ export function createGoPacing({
 
   async function getSnapshot() {
     if (snapshot && now() - snapshot.at < REFRESH_MS) return snapshot;
+    // A failed refresh backs off instead of refetching on every combo attempt.
+    if (now() - failedAt < FAILURE_BACKOFF_MS) return null;
     if (!inflight) {
       inflight = refresh().finally(() => { inflight = null; });
     }
     const fresh = await inflight;
     if (fresh) snapshot = fresh;
+    else { failedAt = now(); snapshot = null; }
     return snapshot;
   }
 

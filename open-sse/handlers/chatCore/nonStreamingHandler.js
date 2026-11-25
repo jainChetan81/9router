@@ -246,8 +246,9 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
     try {
       sseText = await readSseTextWithContentDeadline(providerResponse);
     } catch (err) {
-      appendLog({ status: `FAILED ${HTTP_STATUS.GATEWAY_TIMEOUT}` });
-      return createErrorResult(HTTP_STATUS.GATEWAY_TIMEOUT, err?.message || "upstream SSE read failed");
+      const status = err?.code === "CONTENT_STALL" ? HTTP_STATUS.GATEWAY_TIMEOUT : HTTP_STATUS.BAD_GATEWAY;
+      appendLog({ status: `FAILED ${status}` });
+      return createErrorResult(status, err?.message || "upstream SSE read failed");
     }
     const parsed = parseSSEToOpenAIResponse(sseText, model);
     if (!parsed) {

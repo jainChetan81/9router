@@ -263,6 +263,7 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
     clearContent();
     contentTimer = setTimeout(() => {
       contentTimer = null;
+      clearStall();
       abortMessage = "stream content stall timeout";
       dbg(tag, `CONTENT STALL TIMEOUT ${contentStallTimeoutMs}ms | chunks=${chunkCount} | bytes=${totalBytes}`);
       streamController.handleError?.(new Error("stream content stall timeout"));
